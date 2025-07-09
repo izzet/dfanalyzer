@@ -211,7 +211,6 @@ class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
     time_granularity: Optional[float] = 1e6
     time_resolution: Optional[float] = 1e6
-    time_sliced: Optional[bool] = True
 
 
 @dc.dataclass
