@@ -1,0 +1,136 @@
+name: Build and Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, dev]
+    tags:
+      - "v*.*.*" # Match version tags like v1.0.0, v0.1.2, etc.
+  workflow_dispatch:
+    inputs:
+      run_full_tests:
+        description: "Run full test suite"
+        type: boolean
+        default: false
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        python: ["3.8", "3.9", "3.10"]
+    name: ${{ matrix.os }}-${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      OMPI_ALLOW_RUN_AS_ROOT: 1
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            ca-certificates \
+            lsb-release \
+            wget
+          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            cmake \
+            git \
+            libarrow-dev \
+            libhdf5-dev \
+            libncurses-dev \
+            libopenmpi-dev \
+            libparquet-dev \
+            libreadline-dev \
+            meson \
+            ninja-build \
+            nlohmann-json3-dev \
+            openmpi-bin \
+            openmpi-common
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade meson-python setuptools wheel
+          pip install -r tests/requirements.txt
+
+      - name: Install DFAnalyzer
+        run: |
+          pip install .[darshan] \
+            -Csetup-args="--prefix=$HOME/.local" \
+            -Csetup-args="-Denable_tests=true" \
+            -Csetup-args="-Denable_tools=true"
+
+      - name: Determine test type
+        id: test-type
+        run: |
+          # Check if this is a tagged release (v*.*.*)
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "Run full test suite for release tag"
+            echo "run_full=true" >> $GITHUB_OUTPUT
+          # Check if this is a manual run requesting full tests
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.run_full_tests }}" == "true" ]]; then
+            echo "Run full test suite due to manual request"
+            echo "run_full=true" >> $GITHUB_OUTPUT
+          else
+            echo "Run smoke tests for regular development"
+            echo "run_full=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Python tests with coverage
+        run: |
+          if [[ "${{ steps.test-type.outputs.run_full }}" == "true" ]]; then
+            echo "Running FULL test suite"
+            pytest -m full --verbose --cov=dfanalyzer --cov-report=xml
+          else
+            echo "Running SMOKE test suite"
+            pytest -m smoke --verbose --cov=dfanalyzer --cov-report=xml
+          fi
+
+      - name: Run C++ tests
+        run: |
+          meson build --prefix=$HOME/.local --reconfigure -Denable_tests=true -Denable_tools=true
+          meson compile -C build --verbose
+          meson test -C build --verbose
+          meson test -C build --verbose --setup=mpi
+
+      - name: Run DFAnalyzer
+        run: |
+          # dfanalyzer analyzer=darshan percentile=0.99 trace_path=tests/data/extracted/darshan-raw view_types=[file_name,proc_name] metrics=[time]
+          dfanalyzer analyzer=darshan percentile=0.99 trace_path=tests/data/extracted/darshan-posix-dxt
+          dfanalyzer analyzer=dftracer analyzer/preset=dlio percentile=0.99 trace_path=tests/data/extracted/dftracer-dlio
+          dfanalyzer analyzer=recorder percentile=0.99 trace_path=tests/data/extracted/recorder-posix-parquet
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            build/meson-logs/
+            .coverage
+            coverage.xml
+          retention-days: 7

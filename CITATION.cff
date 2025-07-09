@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the software and the paper."
+title: "WisIO: Automated I/O Bottleneck Detection with Multi-Perspective Views for HPC Workflows"
+version: 0.1.0
+abstract: "Analyze, visualize, and understand I/O performance issues in HPC workflows."
+license: MIT
+url: https://github.com/grc-iit/wisio
+repository-code: https://github.com/grc-iit/wisio
+contact:
+  - name: Izzet Yildirim
+    email: izzetcyildirim@gmail.com
+authors:
+  - family-names: Yildirim
+    given-names: Izzet
+    orcid: https://orcid.org/0000-0003-3513-0764
+  - family-names: Devarajan
+    given-names: Hariharan
+    orcid: https://orcid.org/0000-0001-5625-3494
+  - family-names: Kougkas
+    given-names: Anthony
+    orcid: https://orcid.org/0000-0003-3943-663X
+  - family-names: Sun
+    given-names: Xian-He
+    orcid: https://orcid.org/0000-0002-1093-0792
+  - family-names: Mohror
+    given-names: Kathryn
+    orcid: https://orcid.org/0000-0002-1366-1655
+preferred-citation:
+  type: conference-paper
+  title: "WisIO: Automated I/O Bottleneck Detection with Multi-Perspective Views for HPC Workflows"
+  year: 2025
+  authors:
+    - family-names: Yildirim
+      given-names: Izzet
+      orcid: https://orcid.org/0000-0003-3513-0764
+    - family-names: Devarajan
+      given-names: Hariharan
+      orcid: https://orcid.org/0000-0001-5625-3494
+    - family-names: Kougkas
+      given-names: Anthony
+      orcid: https://orcid.org/0000-0003-3943-663X
+    - family-names: Sun
+      given-names: Xian-He
+      orcid: https://orcid.org/0000-0002-1093-0792
+    - family-names: Mohror
+      given-names: Kathryn
+      orcid: https://orcid.org/0000-0002-1366-1655
+  conference:
+    name: "ICS'25: 2025 International Conference on Supercomputing"
+    city: "Salt Lake City"
+    region: UT
+    country: USA
+    date-start: 2025-06-08
+    date-end: 2025-06-11
+  doi: 10.1145/3721145.3725742
+  url: https://doi.org/10.1145/3721145.3725742

@@ -1,0 +1,15 @@
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index acd8ffd..3bc8339 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -32,6 +32,10 @@ target_link_libraries(reader
+                         PUBLIC ${ZLIB_LIBRARIES}
+                     )
+ 
++file(COPY reader.h reader-private.h
++        DESTINATION ${RECORDER_INSTALL_INCLUDE_DIR}
++)
++
+ add_executable(recorder2text recorder2text.c)
+ target_link_libraries(recorder2text
+                         PUBLIC ${MPI_C_LIBRARIES}

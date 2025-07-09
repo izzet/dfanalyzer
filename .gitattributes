@@ -1,0 +1,8 @@
+.git/* export-ignore
+.github/* export-ignore
+.vscode/* export-ignore
+
+notebooks/* export-ignore
+tests/* export-ignore
+
+.wakatime-project export-ignore

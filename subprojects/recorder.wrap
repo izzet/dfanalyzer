@@ -1,0 +1,10 @@
+[wrap-git]
+directory = recorder
+method = cmake
+url = https://github.com/uiuc-hpc/Recorder.git
+revision = fdcd50435fa3f7ebba7ce97a201a3731cade1741
+clone-recursive = true
+diff_files = recorder.patch
+
+[provide]
+reader = reader_dep
