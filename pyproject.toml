@@ -53,15 +53,15 @@ dfanalyzer-cluster = "dfanalyzer.cluster:main"
 dfanalyzer-plot = "dfanalyzer.plots:main"
 
 [project.urls]
-documentation = "https://grc.iit.edu/docs/category/wisio/"
-source = "https://github.com/grc-iit/wisio"
-tracker = "https://github.com/grc-iit/wisio/issues"
+documentation = "https://dfanalyzer.readthedocs.io/en/latest/"
+source = "https://github.com/LLNL/dfanalyzer"
+tracker = "https://github.com/LLNL/dfanalyzer/issues"
 
 [tool.meson-python.args]
 install = ["--skip-subprojects"]
 
 [tool.pyright]
-exclude = ["assets/", "build/", "subprojects/", "tmp/"]
+exclude = ["build/", "subprojects/", "tmp/"]
 
 [tool.pytest.ini_options]
 markers = [
