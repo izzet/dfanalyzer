@@ -1,0 +1,36 @@
+{
+    "name": "dfanalyzer-devcontainer",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "GitHub.copilot",
+                "GitHub.copilot-chat",
+                "Tyriar.sort-lines",
+                "WakaTime.vscode-wakatime",
+                "charliermarsh.ruff",
+                "foxundermoon.shell-format",
+                "mesonbuild.mesonbuild",
+                "ms-azuretools.vscode-containers",
+                "ms-python.debugpy",
+                "ms-python.python",
+                "ms-toolsai.jupyter",
+                "ms-toolsai.jupyter-renderers",
+                "ms-toolsai.vscode-jupyter-cell-tags",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode-remote.remote-containers",
+                "redhat.vscode-yaml",
+                "tamasfe.even-better-toml",
+                "vscode-icons-team.vscode-icons"
+            ]
+        }
+    },
+    "postCreateCommand": "ulimit -c unlimited && git config --global core.autocrlf input",
+    "remoteEnv": {
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+        "PYTHONPATH": "${containerWorkspaceFolder}"
+    }
+}

@@ -1,0 +1,3 @@
+option('enable_tests', type: 'boolean', value: false, description: 'Enable building tests')
+option('enable_tools', type: 'boolean', value: false, description: 'Enable building tools')
+option('link_shared', type: 'boolean', value: false, description: 'Link dependencies as shared libraries')

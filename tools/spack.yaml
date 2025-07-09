@@ -1,0 +1,11 @@
+spack:
+  specs:
+    - arrow+parquet@16.1.0
+    - autoconf@2.69
+    - darshan-runtime@3.4.4
+    - darshan-util@3.4.4
+    - ninja
+    - nlohmann-json@3.11.2
+    - pkg-config@0.29.2
+    - python@3.11.8
+  view: true
