@@ -191,7 +191,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
 @dc.dataclass
 class AnalyzerConfig:
     checkpoint: Optional[bool] = True
-    checkpoint_dir: Optional[str] = "${hydra:runtime.output_dir}/checkpoints"
+    checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
     preset: Optional[AnalyzerPresetConfig] = MISSING
     time_approximate: Optional[bool] = True
     time_granularity: Optional[float] = MISSING
