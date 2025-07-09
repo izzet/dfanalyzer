@@ -391,7 +391,6 @@ class Config:
     output: OutputConfig = MISSING
     percentile: Optional[float] = None
     threshold: Optional[int] = None
-    time_granularity: Optional[float] = 1e6
     time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
     verbose: Optional[bool] = False
