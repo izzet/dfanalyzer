@@ -65,7 +65,9 @@ class Output(abc.ABC):
 
     def _create_summary(self, result: AnalyzerResultType, view_key: ViewKey) -> OutputSummary:
         flat_view = result.flat_views[view_key]
-        raw_stats = RawStats(**dask.compute(result.raw_stats)[0])
+        raw_stats = dask.compute(result.raw_stats)[0]
+        if isinstance(raw_stats, dict):
+            raw_stats = RawStats(**raw_stats)
         summary = OutputSummary(
             job_time=float(raw_stats.job_time),
             layer_metrics={},
