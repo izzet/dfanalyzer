@@ -134,8 +134,10 @@ def set_cross_layer_metrics(
             ):
                 continue
             compute_times = df[compute_time_metric].fillna(0)
-            df[f"u_{time_col}"] = np.maximum(df[time_col] - compute_times, 0)
-            df[f"u_{time_col}"] = df[f"u_{time_col}"].astype('double[pyarrow]')
+            time_series = df[time_col].astype('float64')
+            compute_series = compute_times.astype('float64')
+            unoverlapped_series = (time_series - compute_series).clip(lower=0)
+            df[f"u_{time_col}"] = pd.array(unoverlapped_series, dtype='double[pyarrow]')
 
     return df.replace([np.inf, -np.inf], np.nan).sort_index(axis=1)
 
