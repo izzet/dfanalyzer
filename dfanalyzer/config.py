@@ -191,7 +191,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
 @dc.dataclass
 class AnalyzerConfig:
     checkpoint: Optional[bool] = True
-    checkpoint_dir: Optional[str] = "${hydra:runtime.output_dir}/checkpoints"
+    checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
     preset: Optional[AnalyzerPresetConfig] = MISSING
     time_approximate: Optional[bool] = True
     time_granularity: Optional[float] = MISSING
@@ -391,7 +391,6 @@ class Config:
     output: OutputConfig = MISSING
     percentile: Optional[float] = None
     threshold: Optional[int] = None
-    time_granularity: Optional[float] = 1e6
     time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
     verbose: Optional[bool] = False

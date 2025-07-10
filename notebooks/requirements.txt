@@ -1,0 +1,5 @@
+bokeh!=3.0.*,>=2.4.2
+ipykernel
+ipython-autotime
+papermill
+python-intervals
