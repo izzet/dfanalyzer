@@ -266,7 +266,9 @@ def io_function(json_object, current_dict, time_approximate, condition_fn):
     if "args" in json_object:
         if "fhash" in json_object["args"]:
             d["fhash"] = str(json_object["args"]["fhash"])
-        if json_object["cat"] in [CAT_POSIX, CAT_STDIO]:
+        if "size_sum" in json_object["args"]:
+            d["size"] = int(json_object["args"]["size_sum"])
+        elif json_object["cat"] in [CAT_POSIX, CAT_STDIO]:
             name = json_object["name"]
             io_cat = get_io_cat(name)
             if "ret" in json_object["args"]:
