@@ -94,7 +94,7 @@ class DarshanAnalyzer(Analyzer):
             exclude_characteristics=exclude_characteristics,
         )
 
-    def read_trace(self, trace_path: str) -> dd.DataFrame:
+    def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         df = pd.concat(map(self._create_dxt_dataframe, self.reports), ignore_index=True)
         return dd.from_pandas(df, npartitions=len(self.reports))
 
