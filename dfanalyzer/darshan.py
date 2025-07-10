@@ -23,6 +23,8 @@ class DarshanAnalyzer(Analyzer):
         trace_path,
         view_types,
         exclude_characteristics=...,
+        extra_columns=None,
+        extra_columns_fn=None,
         logical_view_types=False,
         metric_boundaries=...,
         percentile=None,
