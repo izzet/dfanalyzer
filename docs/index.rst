@@ -13,6 +13,7 @@ Welcome to DFAnalyzer's documentation!
    overview
    getting-started
    configuration
+   interactive-analysis
    tools
 
 
