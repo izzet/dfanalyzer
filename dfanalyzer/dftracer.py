@@ -329,7 +329,7 @@ def load_objects(
             if extra_columns and not all(col in final_dict for col in extra_columns):
                 missing_cols = [col for col in extra_columns if col not in final_dict]
                 raise ValueError(f"Missing extra columns: {missing_cols}")
-            logging.debug(f"Built an dictionary for line {final_dict}")
+            logging.debug(f"Built a dictionary for line {final_dict}")
             yield final_dict
         except ValueError as error:
             logging.error(f"Processing {line} failed with {error}")
