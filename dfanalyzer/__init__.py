@@ -50,6 +50,7 @@ class DFAnalyzerInstance:
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
     ):
+        """Analyze the trace using the configured analyzer."""
         return self.analyzer.analyze_trace(
             exclude_characteristics=self.hydra_config.exclude_characteristics,
             extra_columns=extra_columns,
@@ -62,6 +63,12 @@ class DFAnalyzerInstance:
             unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )
+
+    def shutdown(self):
+        """Shutdown the Dask client and cluster."""
+        self.client.close()
+        if hasattr(self.cluster, 'close'):
+            self.cluster.close()
 
 
 def init_with_hydra(hydra_overrides: List[str]):
