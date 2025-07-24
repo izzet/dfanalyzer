@@ -171,7 +171,7 @@ def set_metric_scores(
         if 'bw_mean' in metric:
             metric_pct = 1 - metric_pct
         score_cols[score_col] = np.digitize(metric_pct, bins=PERCENTAGE_BINS, right=True)
-        score_cols[score_col] = np.where(np.isnan(df[metric]), np.nan, score_cols[score_col])
+        score_cols[score_col] = np.where(pd.isna(df[metric]), np.nan, score_cols[score_col])
 
     if score_cols:
         score_df = pd.DataFrame(score_cols, index=df.index)
