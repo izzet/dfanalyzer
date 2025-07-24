@@ -77,9 +77,9 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         default_factory=lambda: {
             # 'compute_avg_througput':
             # 'compute_util': 'compute_{time_metric}.fillna(0) / (compute_{time_metric}.fillna(0) + fetch_data_{time_metric}.fillna(0) + checkpoint_{time_metric}.fillna(0))',
-            'compute_util': 'compute_{time_metric} / (app_{time_metric} + {epsilon})',
-            'fetch_data_util': 'fetch_data_{time_metric} / (app_{time_metric} + {epsilon})',
-            'checkpoint_util': 'checkpoint_{time_metric} / (app_{time_metric} + {epsilon})',
+            'compute_util': 'compute_{time_metric} / (training_{time_metric} + {epsilon})',
+            'fetch_data_util': 'fetch_data_{time_metric} / (training_{time_metric} + {epsilon})',
+            'checkpoint_util': 'checkpoint_{time_metric} / (training_{time_metric} + {epsilon})',
             # 'consumer_rate': 'data_loader_item_count_sum / compute_time_sum',
             # 'producer_rate': 'data_loader_item_count_sum / data_loader_item_time_sum',
             # 'producer_consumer_rate': 'producer_rate / consumer_rate',
@@ -185,6 +185,31 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'consumer_rate',
             'producer_rate',
         ]
+    )
+
+
+@dc.dataclass
+class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'app': 'func_name == "ai_root"',
+            'training': 'cat == "pipeline" & func_name == "train"',
+            'compute': 'cat == "compute" & func_name == "compute"',
+            'fetch_data': 'func_name == "fetch.iter"',
+            'data_loader': 'cat == "data_loader" & ~func_name.isin(["loop.iter", "loop.yield"])',
+            'data_loader_fork': 'cat == "posix" & func_name == "fork"',
+            'reader': 'cat == "reader"',
+            # 'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
+            'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
+            # 'reader_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_ssd")',
+            'checkpoint': 'cat == "checkpoint"',
+            # 'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
+            'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
+            'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
+            'other_posix': 'cat.isin(["posix", "stdio"])',
+            # 'other_posix_lustre': 'cat.isin(["posix_lustre", "stdio_lustre"])',
+            # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
+        }
     )
 
 
@@ -409,6 +434,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer", name="recorder", node=RecorderAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIO)
+    cs.store(group="analyzer/preset", name="dlio-ailogging", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
