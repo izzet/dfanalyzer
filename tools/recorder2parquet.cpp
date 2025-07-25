@@ -1064,18 +1064,18 @@ int main(int argc, char **argv)
     if (dfa_log_level == nullptr)
     {
         DFANALYZER_LOGGER->level = cpplogger::LoggerType::LOG_ERROR;
-        DFANALYZER_LOGINFO("Enabling ERROR loggin", "");
+        DFANALYZER_LOGINFO("Enabling ERROR logging", "");
     }
     else
     {
         if (strcmp(dfa_log_level, "INFO") == 0)
         {
             DFANALYZER_LOGGER->level = cpplogger::LoggerType::LOG_INFO;
-            DFANALYZER_LOGINFO("Enabling INFO loggin", "");
+            DFANALYZER_LOGINFO("Enabling INFO logging", "");
         }
         else if (strcmp(dfa_log_level, "DEBUG") == 0)
         {
-            DFANALYZER_LOGINFO("Enabling DEBUG loggin", "");
+            DFANALYZER_LOGINFO("Enabling DEBUG logging", "");
             DFANALYZER_LOGGER->level = cpplogger::LoggerType::LOG_DEBUG;
         }
     }
