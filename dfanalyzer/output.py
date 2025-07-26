@@ -156,6 +156,8 @@ class ConsoleOutput(Output):
     def handle_result(self, result: AnalyzerResultType):
         print_objects = []
         for view_key in result.flat_views:
+            if view_key[-1] not in result.view_types:
+                continue
             summary = self._create_summary(result=result, view_key=view_key)
             summary_table = self._create_summary_table(summary=summary, view_key=view_key)
             layer_breakdown_table = self._create_layer_breakdown_table(summary=summary, view_key=view_key)

@@ -158,8 +158,8 @@ class Analyzer(abc.ABC):
         is_slope_based = threshold is not None
 
         # Check if high-level metrics are checkpointed
-        hlm_view_types = list(sorted(view_types))
-        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=hlm_view_types)
+        proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
+        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
         if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
@@ -170,7 +170,7 @@ class Analyzer(abc.ABC):
                 extra_columns_fn=extra_columns_fn,
             )
             raw_stats = self.read_stats(traces=traces)
-            traces = self.postread_trace(traces=traces, view_types=hlm_view_types).map_partitions(set_size_bins)
+            traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
             if self.time_sliced:
                 traces = traces.map_partitions(
                     split_duration_records_vectorized,
@@ -188,7 +188,7 @@ class Analyzer(abc.ABC):
         hlm = self.compute_high_level_metrics(
             checkpoint_name=hlm_checkpoint_name,
             traces=traces,
-            view_types=hlm_view_types,
+            view_types=proc_view_types,
         )
         (hlm, raw_stats) = persist(hlm, raw_stats)
         wait([hlm, raw_stats])
@@ -209,13 +209,13 @@ class Analyzer(abc.ABC):
             layer_main_view = self.compute_main_view(
                 layer=layer,
                 hlm=layer_hlm,
-                view_types=view_types,
+                view_types=proc_view_types,
             )
             layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
             layer_views = self.compute_views(
                 layer=layer,
                 main_view=layer_main_view,
-                view_types=view_types,
+                view_types=proc_view_types,
                 percentile=percentile,
                 threshold=threshold,
                 is_slope_based=is_slope_based,
@@ -225,7 +225,7 @@ class Analyzer(abc.ABC):
                     layer=layer,
                     main_view=layer_main_view,
                     views=layer_views,
-                    view_types=view_types,
+                    view_types=proc_view_types,
                     percentile=percentile,
                     threshold=threshold,
                     is_slope_based=is_slope_based,
