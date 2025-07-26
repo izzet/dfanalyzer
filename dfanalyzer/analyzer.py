@@ -844,7 +844,7 @@ class Analyzer(abc.ABC):
             .repartition(partition_size=partition_size)
             .replace(0, np.nan)
         )
-        hlm[bin_cols] = hlm[bin_cols].astype('uint32[pyarrow]')
+        hlm[bin_cols] = hlm[bin_cols].astype("uint32[pyarrow]")
         return hlm.persist()
 
     def _compute_main_view(
@@ -914,9 +914,12 @@ class Analyzer(abc.ABC):
                 ]
         view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
+        pre_view = records.reset_index()
+        if view_type is not COL_PROC_NAME:
+            pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
+
         view = (
-            records.reset_index()
-            .groupby([view_type])
+            pre_view.groupby([view_type])
             .agg(view_agg)
             .replace(0, np.nan)
             .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based)
