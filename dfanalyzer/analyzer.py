@@ -9,6 +9,7 @@ import os
 import pandas as pd
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
+from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .analysis_utils import (
@@ -103,7 +104,7 @@ class Analyzer(abc.ABC):
         self.layer_defs = preset.layer_defs
         self.layer_deps = preset.layer_deps or {}
         self.layers = list(preset.layer_defs.keys())
-        self.logical_views = preset.logical_views or {}
+        self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.threaded_layers = preset.threaded_layers or []
         self.time_approximate = time_approximate
@@ -901,6 +902,8 @@ class Analyzer(abc.ABC):
             if "_bin_" in col:
                 view_agg[col] = [sum]
             elif any(map(col.endswith, view_types_diff)):
+                view_agg[col] = [unique_set_flatten()]
+            elif col in it.chain.from_iterable(self.logical_views.values()):
                 view_agg[col] = [unique_set_flatten()]
             elif pd.api.types.is_numeric_dtype(records[col].dtype):
                 view_agg[col] = [
