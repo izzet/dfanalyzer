@@ -741,6 +741,8 @@ class Analyzer(abc.ABC):
 
     @staticmethod
     def set_layer_metrics(hlm: pd.DataFrame, derived_metrics: Dict[str, str]) -> pd.DataFrame:
+        # Create an explicit copy to avoid SettingWithCopyWarning
+        hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
         for metric, condition in derived_metrics.items():
             is_data_metric = metric in ["data", "read", "write"]
