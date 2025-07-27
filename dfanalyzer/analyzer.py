@@ -926,7 +926,7 @@ class Analyzer(abc.ABC):
         view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
         pre_view = records.reset_index()
-        if view_type is not COL_PROC_NAME:
+        if view_type != COL_PROC_NAME:
             pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
 
         view = (
