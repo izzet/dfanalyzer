@@ -134,28 +134,6 @@ You can select a preset like this:
 
    dfanalyzer analyzer/preset=dlio
 
-Darshan Analyzer (``analyzer=darshan``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For analyzing Darshan DXT trace files.
-
-.. list-table::
-   :widths: 25 15 15 45
-   :header-rows: 1
-
-   * - Parameter
-     - Type
-     - Default
-     - Description
-   * - ``analyzer.time_granularity``
-     - float
-     - 1e3
-     - Time granularity for Darshan (in nanoseconds).
-   * - ``analyzer.time_resolution``
-     - float
-     - 1e3
-     - Time resolution for Darshan (in nanoseconds).
-
 DFTracer Analyzer (``analyzer=dftracer``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -177,6 +155,28 @@ For analyzing DFTracer trace files. This is the **default** analyzer.
      - float
      - 1e6
      - Time resolution for DFTracer (in nanoseconds).
+
+Darshan Analyzer (``analyzer=darshan``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For analyzing Darshan DXT trace files.
+
+.. list-table::
+   :widths: 25 15 15 45
+   :header-rows: 1
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``analyzer.time_granularity``
+     - float
+     - 1e3
+     - Time granularity for Darshan (in nanoseconds).
+   * - ``analyzer.time_resolution``
+     - float
+     - 1e3
+     - Time resolution for Darshan (in nanoseconds).
 
 Recorder Analyzer (``analyzer=recorder``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
