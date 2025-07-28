@@ -18,7 +18,7 @@ To install DFAnalyzer through `pip` (recommended for most users):
 # This might involve using your system's package manager or a tool like Spack.
 # Example using Spack to prepare the environment:
 # spack -e tools install
-pip install dfanalyzer[darshan]
+pip install dfanalyzer
 ```
 
 To install DFAnalyzer from source (for developers or custom builds):
@@ -26,9 +26,10 @@ To install DFAnalyzer from source (for developers or custom builds):
 ```bash
 # 1. Install system dependencies:
 #    Refer to the "Install system dependencies" step in .github/workflows/ci.yml
-#    (e.g., build-essential, cmake, libarrow-dev, libhdf5-dev, etc.).
+#    (e.g., build-essential, cmake, libarrow-dev, libhdf5-dev, ninja-build, etc.).
 #    Alternatively, tools like Spack can help manage these:
 #    # spack -e tools install
+module load ninja
 
 # 2. Install Python build dependencies:
 python -m pip install --upgrade pip meson-python setuptools wheel
@@ -36,7 +37,7 @@ python -m pip install --upgrade pip meson-python setuptools wheel
 # 3. Install DFAnalyzer from the root of this repository:
 #    The following command includes optional C++ components (tests and tools).
 #    The --prefix argument is optional and specifies the installation location.
-pip install .[darshan] \
+pip install -e . \
   -Csetup-args="--prefix=$HOME/.local" \
   -Csetup-args="-Denable_tests=true" \
   -Csetup-args="-Denable_tools=true"
