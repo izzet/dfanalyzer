@@ -9,6 +9,7 @@ import os
 import pandas as pd
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
+from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .analysis_utils import (
@@ -71,6 +72,7 @@ class Analyzer(abc.ABC):
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
+        quantile_stats: bool = False,
         time_approximate: bool = True,
         time_granularity: float = 1e6,
         time_resolution: float = 1e6,
@@ -98,10 +100,11 @@ class Analyzer(abc.ABC):
         self.checkpoint_dir = checkpoint_dir
         self.debug = debug
         self.derived_metrics = preset.derived_metrics or {}
+        self.quantile_stats = quantile_stats
         self.layer_defs = preset.layer_defs
         self.layer_deps = preset.layer_deps or {}
         self.layers = list(preset.layer_defs.keys())
-        self.logical_views = preset.logical_views or {}
+        self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.threaded_layers = preset.threaded_layers or []
         self.time_approximate = time_approximate
@@ -156,8 +159,8 @@ class Analyzer(abc.ABC):
         is_slope_based = threshold is not None
 
         # Check if high-level metrics are checkpointed
-        hlm_view_types = list(sorted(view_types))
-        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=hlm_view_types)
+        proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
+        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
         if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
@@ -168,7 +171,7 @@ class Analyzer(abc.ABC):
                 extra_columns_fn=extra_columns_fn,
             )
             raw_stats = self.read_stats(traces=traces)
-            traces = self.postread_trace(traces=traces, view_types=hlm_view_types).map_partitions(set_size_bins)
+            traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
             if self.time_sliced:
                 traces = traces.map_partitions(
                     split_duration_records_vectorized,
@@ -186,7 +189,7 @@ class Analyzer(abc.ABC):
         hlm = self.compute_high_level_metrics(
             checkpoint_name=hlm_checkpoint_name,
             traces=traces,
-            view_types=hlm_view_types,
+            view_types=proc_view_types,
         )
         (hlm, raw_stats) = persist(hlm, raw_stats)
         wait([hlm, raw_stats])
@@ -207,13 +210,13 @@ class Analyzer(abc.ABC):
             layer_main_view = self.compute_main_view(
                 layer=layer,
                 hlm=layer_hlm,
-                view_types=view_types,
+                view_types=proc_view_types,
             )
             layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
             layer_views = self.compute_views(
                 layer=layer,
                 main_view=layer_main_view,
-                view_types=view_types,
+                view_types=proc_view_types,
                 percentile=percentile,
                 threshold=threshold,
                 is_slope_based=is_slope_based,
@@ -223,7 +226,7 @@ class Analyzer(abc.ABC):
                     layer=layer,
                     main_view=layer_main_view,
                     views=layer_views,
-                    view_types=view_types,
+                    view_types=proc_view_types,
                     percentile=percentile,
                     threshold=threshold,
                     is_slope_based=is_slope_based,
@@ -844,7 +847,7 @@ class Analyzer(abc.ABC):
             .repartition(partition_size=partition_size)
             .replace(0, np.nan)
         )
-        hlm[bin_cols] = hlm[bin_cols].astype('uint32[pyarrow]')
+        hlm[bin_cols] = hlm[bin_cols].astype("uint32[pyarrow]")
         return hlm.persist()
 
     def _compute_main_view(
@@ -900,23 +903,34 @@ class Analyzer(abc.ABC):
                 view_agg[col] = [sum]
             elif any(map(col.endswith, view_types_diff)):
                 view_agg[col] = [unique_set_flatten()]
-            else:
+            elif col in it.chain.from_iterable(self.logical_views.values()):
+                view_agg[col] = [unique_set_flatten()]
+            elif pd.api.types.is_numeric_dtype(records[col].dtype):
                 view_agg[col] = [
                     sum,
                     min,
                     max,
                     "mean",
                     "std",
-                    quantile_stats(0.01, 0.99),
-                    quantile_stats(0.05, 0.95),
-                    quantile_stats(0.1, 0.9),
-                    quantile_stats(0.25, 0.75),
                 ]
+                if self.quantile_stats:
+                    view_agg[col].append(quantile_stats(0.01, 0.99))
+                    view_agg[col].append(quantile_stats(0.05, 0.95))
+                    view_agg[col].append(quantile_stats(0.1, 0.9))
+                    view_agg[col].append(quantile_stats(0.25, 0.75))
+            else:
+                raise TypeError(
+                    f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
+                    f"Developer must add explicit handling for this data type in _compute_view method."
+                )
         view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
+        pre_view = records.reset_index()
+        if view_type != COL_PROC_NAME:
+            pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
+
         view = (
-            records.reset_index()
-            .groupby([view_type])
+            pre_view.groupby([view_type])
             .agg(view_agg)
             .replace(0, np.nan)
             .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based)

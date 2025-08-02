@@ -79,9 +79,11 @@ class Output(abc.ABC):
             total_num_nodes=0,
             total_num_processes=0,
         )
-        time_metric = 'time_sum' if view_key[-1] == COL_PROC_NAME else 'time_max'
+        is_process_based = view_key[-1] == COL_PROC_NAME
+        time_metric = 'time_sum' if is_process_based else 'time_max'
         for layer in result.layers:
-            time = flat_view.get(f"{layer}_{time_metric}", pd.Series([0.0])).sum()
+            times = flat_view.get(f"{layer}_{time_metric}", pd.Series([0.0]))
+            time = times.max() if is_process_based else times.sum()
             count = flat_view.get(f"{layer}_count_sum", pd.Series([0])).sum()
             size = None
             if 'posix' in layer:
@@ -94,21 +96,26 @@ class Output(abc.ABC):
             u_size = None
             if u_time_col in flat_view:
                 u_time_mask = flat_view[u_time_col] > 0
-                u_time = flat_view[u_time_col][u_time_mask].sum()
-                u_count = flat_view.get(f"{layer}_count_sum", pd.Series([0.0]))[u_time_mask].sum()
+                u_times = flat_view.get(u_time_col, pd.Series([0.0]))[u_time_mask]
+                u_time = 0.0
+                if u_times.any():
+                    u_time = u_times.max() if is_process_based else u_times.sum()
+                u_counts = flat_view.get(f"{layer}_count_sum", pd.Series([0.0]))[u_time_mask]
+                u_count = u_counts.sum() if u_counts.any() else 0
                 if 'posix' in layer:
-                    u_size = flat_view.get(f"{layer}_size_sum", pd.Series([0.0]))[u_time_mask].sum()
+                    u_sizes = flat_view.get(f"{layer}_size_sum", pd.Series([0.0]))[u_time_mask]
+                    u_size = u_sizes.sum() if u_sizes.any() else 0.0
             summary.layer_metrics[layer] = OutputLayerMetrics(
-                time=float(time),
+                time=float('nan') if pd.isna(time) else float(time),
                 count=int(count),
-                size=float(size) if size is not None else float('nan'),
-                ops=float(count / time) if time > 0 else 0.0,
-                bandwidth=float(size / time) if size and time else float('nan'),
+                size=float('nan') if pd.isna(size) else float(size),
+                ops=float('nan') if pd.isna(time) else float(count / time),
+                bandwidth=float('nan') if pd.isna(time) or pd.isna(size) else float(size / time),
                 num_files=0 if pd.isna(num_files) else int(num_files),
                 num_processes=0 if pd.isna(num_processes) else int(num_processes),
-                u_time=float(u_time) if u_time is not None else None,
-                u_count=int(u_count) if u_count is not None else None,
-                u_size=float(u_size) if u_size is not None else None,
+                u_time=None if pd.isna(u_time) else float(u_time),
+                u_count=None if pd.isna(u_count) else int(u_count),
+                u_size=None if pd.isna(u_size) else float(u_size),
             )
             if not pd.isna(num_processes):
                 summary.total_num_processes = max(summary.total_num_processes, int(num_processes))
@@ -149,6 +156,8 @@ class ConsoleOutput(Output):
     def handle_result(self, result: AnalyzerResultType):
         print_objects = []
         for view_key in result.flat_views:
+            if view_key[-1] not in result.view_types:
+                continue
             summary = self._create_summary(result=result, view_key=view_key)
             summary_table = self._create_summary_table(summary=summary, view_key=view_key)
             layer_breakdown_table = self._create_layer_breakdown_table(summary=summary, view_key=view_key)
@@ -158,7 +167,12 @@ class ConsoleOutput(Output):
         console.print(*print_objects)
 
     def _create_layer_breakdown_table(self, summary: OutputSummary, view_key: ViewKey) -> Table:
-        breakdown_table = Table(title="Layer Breakdown (w/ overlap %)", title_style="bold cyan", expand=True)
+        breakdown_table_title = "Layer Breakdown"
+        show_overlap = False
+        if len(summary.layers) > 1:
+            breakdown_table_title += " (w/ overlap %)"
+            show_overlap = True
+        breakdown_table = Table(title=breakdown_table_title, title_style="bold cyan", expand=True)
         breakdown_table.add_column("Layer", style="bold")
         breakdown_table.add_column("Time (s)", justify="right")
         breakdown_table.add_column("Ops", justify="right")
@@ -169,13 +183,20 @@ class ConsoleOutput(Output):
             layer_metrics = summary.layer_metrics[layer]
             if layer_metrics.count == 0:
                 continue
-            time_str = self._format_with_overlap_percentage(layer_metrics.time, layer_metrics.u_time)
-            count_str = self._format_with_overlap_percentage(layer_metrics.count, layer_metrics.u_count, fmt_int=True)
+            if show_overlap:
+                time_str = self._format_val_with_ovlp_pct(layer_metrics.time, layer_metrics.u_time)
+                count_str = self._format_val_with_ovlp_pct(layer_metrics.count, layer_metrics.u_count, fmt_int=True)
+            else:
+                time_str = self._format_val(layer_metrics.time)
+                count_str = self._format_val(layer_metrics.count, fmt_int=True)
             size_str = '-'
             if not pd.isna(layer_metrics.size):
                 size_value = layer_metrics.size / MiB
                 u_size_value = layer_metrics.u_size / MiB if layer_metrics.u_size is not None else None
-                size_str = self._format_with_overlap_percentage(size_value, u_size_value)
+                if show_overlap:
+                    size_str = self._format_val_with_ovlp_pct(size_value, u_size_value)
+                else:
+                    size_str = self._format_val(size_value)
             ops_str = f"{layer_metrics.ops:.3f}"
             bandwidth_str = '-'
             if not pd.isna(layer_metrics.bandwidth):
@@ -218,16 +239,23 @@ class ConsoleOutput(Output):
 
         return summary_table
 
-    def _format_with_overlap_percentage(self, value, u_value, fmt_int=False):
+    def _format_val(self, value: float, fmt_int=False) -> str:
+        if value is None or value == 0:
+            return '-'
+        if fmt_int:
+            return f"{int(value):,}"
+        return f"{value:.3f}"
+
+    def _format_val_with_ovlp_pct(self, value, u_value, fmt_int=False):
         value = value or 0
         if value == 0 or u_value is None:
-            value = f"{int(value):,}" if fmt_int else f"{value:.3f}"
+            value = self._format_val(value, fmt_int)
             return f"{value} (" + ('-' * 4) + ")"
         u_value = u_value or 0
-        overlap_pct = max(0.0, 1.0 - (u_value / value))
-        padded_percent = f"{int(round(overlap_pct * 100)):>3d}%"
-        color = self._percentage_color(overlap_pct)
-        value = f"{int(value):,}" if fmt_int else f"{value:.3f}"
+        ovlp_pct = max(0.0, 1.0 - (u_value / value))
+        padded_percent = f"{int(round(ovlp_pct * 100)):>3d}%"
+        color = self._percentage_color(ovlp_pct)
+        value = self._format_val(value, fmt_int)
         return f"{value} ([{color}]{padded_percent}[/{color}])"
 
     def _percentage_color(self, percentage: float) -> str:
