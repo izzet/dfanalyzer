@@ -192,6 +192,7 @@ def io_columns():
         "image_id": "uint64[pyarrow]",
         "io_cat": "uint8[pyarrow]",
         "size": "uint64[pyarrow]",
+        "offset": "uint64[pyarrow]",
     }
     return columns
 
@@ -212,6 +213,10 @@ def io_function(json_dict: dict):
                 if size > 0:
                     if io_cat in [IOCategory.READ.value, IOCategory.WRITE.value]:
                         d["size"] = size
+            if "offset" in json_dict["args"]:
+                offset = int(json_dict["args"]["offset"])
+                if offset >= 0:
+                    d["offset"] = offset
             d[COL_IO_CAT] = io_cat
         else:
             if "image_idx" in json_dict["args"]:
@@ -692,6 +697,7 @@ class DFTracerAnalyzer(Analyzer):
         )
 
         traces["size"] = traces["size"].replace(0, np.nan)
+        traces["offset"] = traces["offset"].replace(0, np.nan)
 
         return traces
 
