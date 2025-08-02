@@ -33,10 +33,7 @@ def fix_dtypes(df: pd.DataFrame):
     double_cols.extend([col for col in df.columns if col.endswith('_slope')])
     double_cols.extend([col for col in df.columns if col.endswith('_pct')])
     size_cols = [col for col in df.columns if col.endswith('_size')]
-    # df[int_cols] = df[int_cols].astype('int64[pyarrow]')
-    # df[double_cols] = df[double_cols].astype('double[pyarrow]')
-    # df[size_cols] = df[size_cols].astype('int64[pyarrow]')
-    df[int_cols] = df[int_cols].astype('Int32')
+    df[int_cols] = df[int_cols].astype('Int64')
     df[double_cols] = df[double_cols].astype('Float64')
     df[size_cols] = df[size_cols].astype('Int64')
     return df
