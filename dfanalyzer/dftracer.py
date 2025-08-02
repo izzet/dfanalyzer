@@ -697,7 +697,8 @@ class DFTracerAnalyzer(Analyzer):
         )
 
         traces["size"] = traces["size"].replace(0, np.nan)
-        traces["offset"] = traces["offset"].replace(0, np.nan)
+        if "offset" in traces.columns:
+            traces["offset"] = traces["offset"].replace(0, np.nan)
 
         return traces
 
