@@ -371,7 +371,7 @@ class DFTracerAnalyzer(Analyzer):
         gz_bag = None
         pfw_bag = None
         if len(pfw_gz_pattern) > 0:
-            max_line_numbers = dask.bag.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
+            max_line_numbers = db.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
             logging.debug(f"Max lines per file are {max_line_numbers}")
             json_line_delayed = []
             total_lines = 0
@@ -387,7 +387,7 @@ class DFTracerAnalyzer(Analyzer):
             for filename, start, end in json_line_delayed:
                 num_lines = end - start + 1
                 json_line_bags.append(dask.delayed(load_indexed_gzip_files, nout=num_lines)(filename, start, end))
-            json_lines = dask.bag.concat(json_line_bags)
+            json_lines = db.concat(json_line_bags)
             gz_bag = (
                 json_lines.map(
                     load_objects,
