@@ -365,7 +365,7 @@ class DFTracerAnalyzer(Analyzer):
         logging.debug(f"Processing files {all_files}")
         if len(pfw_gz_pattern) > 0:
             db.from_sequence(pfw_gz_pattern).map(create_index).compute()
-        logging.info(f"Created index for {len(pfw_gz_pattern)} files")
+            logging.info(f"Created index for {len(pfw_gz_pattern)} files")
         total_size = db.from_sequence(all_files).map(get_size).sum().compute()
         logging.info(f"Total size of all files are {total_size} bytes")
         gz_bag = None
