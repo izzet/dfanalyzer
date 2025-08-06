@@ -83,6 +83,8 @@ def init_with_hydra(hydra_overrides: List[str]):
     cluster = instantiate(hydra_config.cluster)
     if isinstance(cluster, ExternalCluster):
         client = Client(cluster.scheduler_address)
+        if cluster.restart_on_connect:
+            client.restart()
     else:
         client = Client(cluster)
     analyzer = instantiate(
