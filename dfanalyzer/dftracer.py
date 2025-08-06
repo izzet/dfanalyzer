@@ -343,11 +343,21 @@ def load_objects(
 
 class DFTracerAnalyzer(Analyzer):
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
-        if os.path.isdir(trace_path) and "*" not in trace_path:
-            trace_path = f"{trace_path}/*"
-        # ===============================================
-        pfw_pattern = glob(f"{trace_path}.pfw")
-        pfw_gz_pattern = glob(f"{trace_path}.pfw.gz")
+        pfw_pattern = []
+        pfw_gz_pattern = []
+        if os.path.isdir(trace_path):
+            if "*" not in trace_path:
+                trace_path = f"{trace_path}/*"
+            pfw_pattern = glob(f"{trace_path}.pfw")
+            pfw_gz_pattern = glob(f"{trace_path}.pfw.gz")
+        elif trace_path.endswith("*.pfw.gz"):
+            pfw_gz_pattern = glob(trace_path)
+        elif trace_path.endswith("*.pfw"):
+            pfw_pattern = glob(trace_path)
+        elif trace_path.endswith(".pfw.gz"):
+            pfw_gz_pattern = [trace_path]
+        elif trace_path.endswith(".pfw"):
+            pfw_pattern = [trace_path]
         all_files = pfw_pattern + pfw_gz_pattern
         if len(all_files) == 0:
             logging.error("No files selected for .pfw and .pfw.gz")
