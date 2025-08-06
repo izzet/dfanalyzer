@@ -344,21 +344,11 @@ def load_objects(
 class DFTracerAnalyzer(Analyzer):
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         if os.path.isdir(trace_path) and "*" not in trace_path:
-            trace_path = f"{trace_path}/*.pfw*"
+            trace_path = f"{trace_path}/*"
         # ===============================================
-        file_pattern = glob(trace_path)
-        all_files = []
-        pfw_pattern = []
-        pfw_gz_pattern = []
-        for file in file_pattern:
-            if file.endswith(".pfw"):
-                pfw_pattern.append(file)
-                all_files.append(file)
-            elif file.endswith(".pfw.gz"):
-                pfw_gz_pattern.append(file)
-                all_files.append(file)
-            else:
-                logging.warning(f"Ignoring unsuported file {file}")
+        pfw_pattern = glob(f"{trace_path}.pfw")
+        pfw_gz_pattern = glob(f"{trace_path}.pfw.gz")
+        all_files = pfw_pattern + pfw_gz_pattern
         if len(all_files) == 0:
             logging.error("No files selected for .pfw and .pfw.gz")
             exit(1)
