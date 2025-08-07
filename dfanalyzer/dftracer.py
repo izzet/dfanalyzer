@@ -1,6 +1,7 @@
 import dask
 import dask.bag as db
 import dask.dataframe as dd
+import glob
 import json
 import logging
 import math
@@ -11,7 +12,6 @@ import portion as I
 import sys
 import zindex_py as zindex
 from dask.distributed import wait
-from glob import glob
 from typing import Callable, Dict, List, Optional
 
 from .analyzer import Analyzer
@@ -343,25 +343,17 @@ def load_objects(
 
 class DFTracerAnalyzer(Analyzer):
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
-        pfw_pattern = []
-        pfw_gz_pattern = []
+        pfw_pattern, pfw_gz_pattern = [], []
         if os.path.isdir(trace_path):
-            if "*" not in trace_path:
-                trace_path = f"{trace_path}/*"
-            pfw_pattern = glob(f"{trace_path}.pfw")
-            pfw_gz_pattern = glob(f"{trace_path}.pfw.gz")
-        elif trace_path.endswith("*.pfw.gz"):
-            pfw_gz_pattern = glob(trace_path)
-        elif trace_path.endswith("*.pfw"):
-            pfw_pattern = glob(trace_path)
+            pfw_pattern = glob.glob(os.path.join(trace_path, "*.pfw"))
+            pfw_gz_pattern = glob.glob(os.path.join(trace_path, "*.pfw.gz"))
         elif trace_path.endswith(".pfw.gz"):
-            pfw_gz_pattern = [trace_path]
+            pfw_gz_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
         elif trace_path.endswith(".pfw"):
-            pfw_pattern = [trace_path]
+            pfw_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
         all_files = pfw_pattern + pfw_gz_pattern
-        if len(all_files) == 0:
-            logging.error("No files selected for .pfw and .pfw.gz")
-            exit(1)
+        if not all_files:
+            raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
         logging.debug(f"Processing files {all_files}")
         if len(pfw_gz_pattern) > 0:
             db.from_sequence(pfw_gz_pattern).map(create_index).compute()
