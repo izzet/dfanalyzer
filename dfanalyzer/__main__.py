@@ -39,7 +39,8 @@ def main(cfg: Config) -> None:
     output: OutputType = instantiate(cfg.output)
     output.handle_result(result=result)
     client.close()
-    cluster.close()  # type: ignore
+    if not isinstance(cluster, ExternalCluster):
+        cluster.close()  # type: ignore
 
 
 if __name__ == "__main__":
