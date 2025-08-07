@@ -126,9 +126,12 @@ jobs:
               cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address          
             dfanalyzer analyzer=recorder percentile=0.99 trace_path=tests/data/extracted/recorder-posix-parquet \
               cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address
-          fi
-          dfanalyzer analyzer=dftracer analyzer/preset=dlio percentile=0.99 trace_path=tests/data/extracted/dftracer-dlio \
-            cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address
+            dfanalyzer analyzer=dftracer analyzer/preset=dlio percentile=0.99 trace_path=tests/data/extracted/dftracer-dlio \
+              cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address
+          else
+            dfanalyzer analyzer=dftracer analyzer/preset=dlio percentile=0.99 trace_path=tests/data/extracted/dftracer-dlio \
+              cluster=external cluster.restart_on_connect=False cluster.scheduler_address=$scheduler_address
+          fi          
 
           # Kill the cluster process
           kill $cluster_pid || true
