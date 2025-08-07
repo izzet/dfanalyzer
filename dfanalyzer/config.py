@@ -8,10 +8,11 @@ from typing import Any, Dict, List, Optional
 
 from .constants import COL_TIME_RANGE, VIEW_TYPES
 from .types import ViewMetricBoundaries
-from .utils.env_utils import get_bool_env_var
+from .utils.env_utils import get_bool_env_var, get_int_env_var
 
 
 CHECKPOINT_VIEWS = get_bool_env_var("DFANALYZER_CHECKPOINT_VIEWS", False)
+CLUSTER_RESTART_TIMEOUT_SECONDS = get_int_env_var("DFANALYZER_CLUSTER_RESTART_TIMEOUT_SECONDS", 120)
 DERIVED_POSIX_METRICS = {
     'data': 'io_cat == 1 or io_cat == 2',
     'read': 'io_cat == 1',
