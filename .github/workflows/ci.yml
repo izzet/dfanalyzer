@@ -112,10 +112,10 @@ jobs:
 
           # Wait for the scheduler address to appear in the log (file will contain only the address)
           for i in {1..30}; do
-            if [ -s cluster.log ]; then break; fi
+            if grep -q '^tcp://' cluster.log; then break; fi
             sleep 1
           done
-          scheduler_address=$(cat cluster.log | tail -1)
+          scheduler_address=$(grep '^tcp://' cluster.log | tail -1)
           echo "Scheduler address: $scheduler_address"
 
           # Run analysis commands using the external cluster
