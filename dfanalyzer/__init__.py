@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Union, Optional
 
 from .analyzer import Analyzer
 from .cluster import ClusterType, ExternalCluster
-from .config import init_hydra_config_store
+from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
 from .output import ConsoleOutput, CSVOutput, SQLiteOutput
 from .recorder import RecorderAnalyzer
@@ -83,6 +83,8 @@ def init_with_hydra(hydra_overrides: List[str]):
     cluster = instantiate(hydra_config.cluster)
     if isinstance(cluster, ExternalCluster):
         client = Client(cluster.scheduler_address)
+        if cluster.restart_on_connect:
+            client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
     else:
         client = Client(cluster)
     analyzer = instantiate(

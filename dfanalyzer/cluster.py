@@ -60,7 +60,7 @@ ClusterType = Union[ExternalCluster, LocalCluster, LSFCluster, PBSCluster, SLURM
 @hydra.main(version_base=None, config_name="config")
 def main(cfg: Config) -> None:
     cluster: ClusterType = instantiate(cfg.cluster)
-    print(cluster.scheduler.address)
+    print(cluster.scheduler.address, flush=True)
     try:
         signal.pause()
     except KeyboardInterrupt:
