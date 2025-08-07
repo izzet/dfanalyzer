@@ -4,9 +4,8 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from . import AnalyzerType, ClusterType, OutputType
-from .config import Config, init_hydra_config_store
+from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, init_hydra_config_store
 from .cluster import ExternalCluster
-from .types import Rule
 
 
 init_hydra_config_store()
@@ -18,7 +17,7 @@ def main(cfg: Config) -> None:
     if isinstance(cluster, ExternalCluster):
         client = Client(cluster.scheduler_address)
         if cluster.restart_on_connect:
-            client.restart()
+            client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
     else:
         client = Client(cluster)
     analyzer: AnalyzerType = instantiate(
