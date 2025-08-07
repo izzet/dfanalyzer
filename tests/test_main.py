@@ -25,7 +25,7 @@ smoke_percentile_params = [0.95]
 
 @pytest.fixture(scope="session")
 def dask_cluster():
-    cluster = LocalCluster()
+    cluster = LocalCluster(processes=False, protocol="tcp", worker_class="distributed.nanny.Nanny")
     yield cluster
     # This teardown code runs after all tests are done
     cluster.close()
