@@ -391,7 +391,7 @@ class Config:
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
-    percentile: Optional[float] = None
+    percentile: Optional[float] = 0.9
     threshold: Optional[int] = None
     time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
