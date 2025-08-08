@@ -41,7 +41,7 @@ dependencies = [
     "scipy~=1.10.0",
     "strenum>=0.4",
     "venn==0.1.3",
-    "zindex_py==0.0.5",
+    "zindex_py==0.0.6",
 ]
 
 [project.optional-dependencies]
