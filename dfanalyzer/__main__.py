@@ -29,8 +29,6 @@ def main(cfg: Config) -> None:
         exclude_characteristics=cfg.exclude_characteristics,
         logical_view_types=cfg.logical_view_types,
         metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
-        percentile=cfg.percentile,
-        threshold=cfg.threshold,
         trace_path=cfg.trace_path,
         unoverlapped_posix_only=cfg.unoverlapped_posix_only,
         view_types=cfg.view_types,

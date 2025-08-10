@@ -18,7 +18,7 @@ parameters in several ways:
 
    .. code-block:: bash
 
-      dfanalyzer trace_path=path/to/traces analyzer.preset=dlio percentile=0.99
+      dfanalyzer trace_path=path/to/traces analyzer/preset=dlio
 
 2. **Group selection**:
 
@@ -47,14 +47,6 @@ Core Parameters
      - string
      - Required
      - Path to the I/O trace data for analysis.
-   * - ``percentile``
-     - float
-     - null
-     - Percentile threshold for significant I/O operations.
-   * - ``threshold``
-     - int
-     - null
-     - Severity threshold for significant I/O operations.
    * - ``view_types``
      - list[str]
      - ``["file_name", "proc_name", "time_range"]``

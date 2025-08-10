@@ -391,12 +391,10 @@ class Config:
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
-    percentile: Optional[float] = 0.9
-    threshold: Optional[int] = None
     time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
     verbose: Optional[bool] = False
-    view_types: Optional[List[str]] = dc.field(default_factory=lambda: VIEW_TYPES)
+    view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
     unoverlapped_posix_only: Optional[bool] = False
 
 

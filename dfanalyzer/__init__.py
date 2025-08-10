@@ -45,7 +45,6 @@ class DFAnalyzerInstance:
 
     def analyze_trace(
         self,
-        percentile: Optional[float] = None,
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
@@ -57,7 +56,6 @@ class DFAnalyzerInstance:
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
-            percentile=self.hydra_config.percentile if not percentile else percentile,
             time_view_type=self.hydra_config.time_view_type,
             trace_path=self.hydra_config.trace_path,
             unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,

@@ -124,8 +124,6 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        percentile: Optional[float] = None,
-        threshold: Optional[int] = None,
         time_view_type: Optional[ViewType] = None,
         unoverlapped_posix_only: Optional[bool] = False,
     ) -> AnalyzerResultType:
@@ -141,23 +139,11 @@ class Analyzer(abc.ABC):
             exclude_characteristics: A list of I/O characteristics to exclude.
             logical_view_types: Whether to compute views based on logical relationships.
             metrics: A list of metrics to analyze (e.g., 'iops', 'bw', 'time').
-            percentile: The percentile to use for identifying critical views.
-                        Mutually exclusive with 'threshold'.
-            threshold: The threshold value for slope-based bottleneck detection.
-                       Mutually exclusive with 'percentile'.
             view_types: A list of view types to compute (e.g., 'file_name', 'proc_name').
 
         Returns:
             An AnalyzerResultType object containing the analysis results.
-
-        Raises:
-            ValueError: If neither 'percentile' nor 'threshold' is defined.
         """
-        # Check if both percentile and threshold are none
-        if percentile is None and threshold is None:
-            raise ValueError("Either percentile or threshold must be defined")
-        is_slope_based = threshold is not None
-
         # Check if high-level metrics are checkpointed
         proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
@@ -217,9 +203,6 @@ class Analyzer(abc.ABC):
                 layer=layer,
                 main_view=layer_main_view,
                 view_types=proc_view_types,
-                percentile=percentile,
-                threshold=threshold,
-                is_slope_based=is_slope_based,
             )
             if logical_view_types:
                 layer_logical_views = self.compute_logical_views(
@@ -227,9 +210,6 @@ class Analyzer(abc.ABC):
                     main_view=layer_main_view,
                     views=layer_views,
                     view_types=proc_view_types,
-                    percentile=percentile,
-                    threshold=threshold,
-                    is_slope_based=is_slope_based,
                 )
                 layer_views.update(layer_logical_views)
             hlms[layer] = layer_hlm
@@ -466,9 +446,6 @@ class Analyzer(abc.ABC):
         layer: Layer,
         main_view: dd.DataFrame,
         view_types: List[ViewType],
-        percentile: Optional[float],
-        threshold: Optional[int],
-        is_slope_based: bool,
     ) -> Views:
         """Computes multifaceted views for each specified metric.
 
@@ -480,8 +457,6 @@ class Analyzer(abc.ABC):
             main_view: The main aggregated Dask DataFrame.
             metrics: A list of metrics to compute views for.
             metric_boundaries: A dictionary of precomputed metric boundaries.
-            percentile: The percentile used to identify critical items in views.
-            threshold: The threshold value for slope-based critical item identification.
             view_types: A list of base view types to permute for creating views.
 
         Returns:
@@ -499,7 +474,6 @@ class Analyzer(abc.ABC):
                     local_dict={"indices": views[(parent_view_type,)].index},
                 )
             views[view_key] = self.compute_view(
-                is_slope_based=is_slope_based,
                 layer=layer,
                 records=parent_records,
                 view_key=view_key,
@@ -514,9 +488,6 @@ class Analyzer(abc.ABC):
         main_view: dd.DataFrame,
         views: Dict[ViewKey, dd.DataFrame],
         view_types: List[ViewType],
-        percentile: Optional[float],
-        threshold: Optional[int],
-        is_slope_based: bool,
     ):
         """Computes views based on predefined logical relationships in the data.
 
@@ -527,8 +498,6 @@ class Analyzer(abc.ABC):
             main_view: The main aggregated Dask DataFrame.
             metric_boundaries: A dictionary of precomputed metric boundaries.
             metrics: A list of metrics to compute logical views for.
-            percentile: The percentile used to identify critical items in views.
-            threshold: The threshold value for slope-based critical item identification.
             view_results: The existing dictionary of computed views to be updated.
             view_types: A list of base view types available in the main_view.
 
@@ -559,7 +528,6 @@ class Analyzer(abc.ABC):
                 else:
                     parent_records = parent_records.eval(f"{view_type} = {view_condition}")
                 logical_views[view_key] = self.compute_view(
-                    is_slope_based=is_slope_based,
                     layer=layer,
                     records=parent_records,
                     view_key=view_key,
@@ -576,20 +544,16 @@ class Analyzer(abc.ABC):
         view_type: str,
         view_types: List[ViewType],
         records: dd.DataFrame,
-        is_slope_based: bool,
     ) -> dd.DataFrame:
         """Computes a single view based on the provided parameters.
 
-        This involves restoring a view from a checkpoint or computing it,
-        then filtering it to identify critical items based on percentile or threshold.
+        This involves restoring a view from a checkpoint or computing it.
 
         Args:
             metrics: The list of all metrics being analyzed.
             metric: The specific metric for this view.
             metric_boundary: The precomputed boundary for the current metric.
-            percentile: The percentile to identify critical items.
             records: The Dask DataFrame (parent records) to compute the view from.
-            threshold: The threshold for slope-based critical item identification.
             view_key: The key identifying this specific view.
             view_type: The primary dimension/column for this view.
 
@@ -600,7 +564,6 @@ class Analyzer(abc.ABC):
         return self.restore_view(
             name=self.get_checkpoint_name(CHECKPOINT_VIEW, str(layer), *list(view_key)),
             fallback=lambda: self._compute_view(
-                is_slope_based=is_slope_based,
                 layer=layer,
                 records=records,
                 view_key=view_key,
@@ -891,7 +854,6 @@ class Analyzer(abc.ABC):
         view_key: ViewKey,
         view_type: str,
         view_types: List[ViewType],
-        is_slope_based: bool,
     ) -> dd.DataFrame:
         is_view_process_based = self.is_view_process_based(view_key)
 

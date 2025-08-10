@@ -76,8 +76,8 @@ LOGICAL_VIEW_TYPES = [
     ('proc_name', 'thread_id'),
 ]
 VIEW_TYPES = [
-    # 'file_name',
-    # 'proc_name',
+    'file_name',
+    'proc_name',
     'time_range',
 ]
 
