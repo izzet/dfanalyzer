@@ -12,9 +12,9 @@ from .analyzer import Analyzer
 from .cluster import ClusterType, ExternalCluster
 from .config import init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
-from .output import ConsoleOutput, CSVOutput, SQLiteOutput
+from .output import ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput
 from .recorder import RecorderAnalyzer
-from .types import ViewType
+from .types import AnalyzerResultType, ViewType
 
 try:
     from .darshan import DarshanAnalyzer
@@ -22,7 +22,7 @@ except ModuleNotFoundError:
     DarshanAnalyzer = Analyzer
 
 AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
-OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput]
+OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput]
 
 # Suppress Dask warnings that are not relevant to the user
 dask.config.set({"dataframe.query-planning-warning": False})
@@ -43,15 +43,36 @@ class DFAnalyzerInstance:
     hydra_config: DictConfig
     output: OutputType
 
-    def analyze_trace(
+    def analyze_file(
         self,
         percentile: Optional[float] = None,
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-    ):
+    ) -> AnalyzerResultType:
         """Analyze the trace using the configured analyzer."""
-        return self.analyzer.analyze_trace(
+        return self.analyzer.analyze_file(
+            exclude_characteristics=self.hydra_config.exclude_characteristics,
+            extra_columns=extra_columns,
+            extra_columns_fn=extra_columns_fn,
+            logical_view_types=self.hydra_config.logical_view_types,
+            metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
+            path=self.hydra_config.input.path,
+            percentile=self.hydra_config.percentile if not percentile else percentile,
+            time_view_type=self.hydra_config.time_view_type,
+            unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
+            view_types=self.hydra_config.view_types if not view_types else view_types,
+        )
+
+    def analyze_zmq(
+        self,
+        percentile: Optional[float] = None,
+        view_types: Optional[List[ViewType]] = None,
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+    ) -> AnalyzerResultType:
+        """Analyze the ZMQ trace using the configured analyzer."""
+        return self.analyzer.analyze_zmq(
             exclude_characteristics=self.hydra_config.exclude_characteristics,
             extra_columns=extra_columns,
             extra_columns_fn=extra_columns_fn,
@@ -59,7 +80,7 @@ class DFAnalyzerInstance:
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
             percentile=self.hydra_config.percentile if not percentile else percentile,
             time_view_type=self.hydra_config.time_view_type,
-            trace_path=self.hydra_config.trace_path,
+            trace_address=self.hydra_config.trace_address,
             unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )

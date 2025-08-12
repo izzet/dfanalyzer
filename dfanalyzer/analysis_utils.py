@@ -141,7 +141,17 @@ def set_unique_counts(df: pd.DataFrame, layer: str):
         if COL_FILE_NAME in unique_col and 'posix' not in layer:
             continue
         nunique_col = unique_col.replace('_unique', '_nunique')
-        df[nunique_col] = df[unique_col].map(len).astype('uint64[pyarrow]')
+        if df[unique_col].isnull().all():
+            if df[unique_col].dtype != 'object':
+                logging.warning(
+                    "Column '%s' is not of object dtype (actual: %s) and all values are null during 'set_unique_counts'",
+                    unique_col,
+                    df[unique_col].dtype,
+                )
+            df[nunique_col] = 0
+        else:
+            df[nunique_col] = df[unique_col].map(len)
+        df[nunique_col] = df[nunique_col].astype('Int32')
     return df.drop(columns=unique_cols)
 
 

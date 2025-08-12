@@ -1,7 +1,7 @@
 import functools
 import logging
-import dask.dataframe as dd
 from distributed import get_client
+
 from .logger import ElapsedTimeLogger
 
 
@@ -37,8 +37,3 @@ def event_logger(key: str, message: str, level=logging.INFO):
         return wrapper
 
     return decorator
-
-
-def flatten_column_names(ddf: dd.DataFrame):
-    ddf.columns = ['_'.join(tup).rstrip('_') for tup in ddf.columns.values]
-    return ddf

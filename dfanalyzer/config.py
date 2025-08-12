@@ -304,7 +304,34 @@ class SLURMClusterConfig(JobQueueClusterConfig):
 
 
 @dc.dataclass
+class InputConfig:
+    pass
+
+
+@dc.dataclass
+class FileInputConfig(InputConfig):
+    _target_: str = "dfanalyzer.config.FileInputConfig"
+    path: str = MISSING
+
+
+class ZMQInput:
+    def __init__(self, address: str):
+        self.address = address
+
+
+@dc.dataclass
+class ZMQInputConfig(InputConfig):
+    _target_: str = "dfanalyzer.config.ZMQInput"
+    address: str = MISSING
+
+
+@dc.dataclass
 class OutputConfig:
+    pass
+
+
+@dc.dataclass
+class FileOutputConfig(OutputConfig):
     compact: Optional[bool] = False
     name: Optional[str] = ""
     root_only: Optional[bool] = True
@@ -312,21 +339,27 @@ class OutputConfig:
 
 
 @dc.dataclass
-class ConsoleOutputConfig(OutputConfig):
+class ConsoleOutputConfig(FileOutputConfig):
     _target_: str = "dfanalyzer.output.ConsoleOutput"
     show_debug: Optional[bool] = False
     show_header: Optional[bool] = True
 
 
 @dc.dataclass
-class CSVOutputConfig(OutputConfig):
+class CSVOutputConfig(FileOutputConfig):
     _target_: str = "dfanalyzer.output.CSVOutput"
 
 
 @dc.dataclass
-class SQLiteOutputConfig(OutputConfig):
+class SQLiteOutputConfig(FileOutputConfig):
     _target_: str = "dfanalyzer.output.SQLiteOutput"
     run_db_path: Optional[str] = ""
+
+
+@dc.dataclass
+class ZMQOutputConfig(OutputConfig):
+    _target_: str = "dfanalyzer.output.ZMQOutput"
+    address: str = MISSING
 
 
 @dc.dataclass
@@ -401,6 +434,7 @@ class Config:
             {"analyzer/preset": "posix"},
             {"hydra/job": "custom"},
             {"cluster": "local"},
+            {"input": "file"},
             {"output": "console"},
             "_self_",
             {"override hydra/help": "custom"},
@@ -411,13 +445,13 @@ class Config:
     cluster: ClusterConfig = MISSING
     debug: Optional[bool] = False
     exclude_characteristics: Optional[List[str]] = dc.field(default_factory=list)
+    input: InputConfig = MISSING
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
     percentile: Optional[float] = None
     threshold: Optional[int] = None
     time_view_type: Optional[str] = COL_TIME_RANGE
-    trace_path: str = MISSING
     verbose: Optional[bool] = False
     view_types: Optional[List[str]] = dc.field(default_factory=lambda: VIEW_TYPES)
     unoverlapped_posix_only: Optional[bool] = False
@@ -440,7 +474,10 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
     cs.store(group="cluster", name="pbs", node=PBSClusterConfig)
     cs.store(group="cluster", name="slurm", node=SLURMClusterConfig)
+    cs.store(group="input", name="file", node=FileInputConfig)
+    cs.store(group="input", name="zmq", node=ZMQInputConfig)
     cs.store(group="output", name="console", node=ConsoleOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
+    cs.store(group="output", name="zmq", node=ZMQOutputConfig)
     return cs

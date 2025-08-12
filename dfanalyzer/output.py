@@ -16,6 +16,7 @@ from .types import (
     ViewKey,
     humanized_view_name,
 )
+from .utils.streaming import Stream, is_streaming_available
 
 
 @dc.dataclass
@@ -45,7 +46,7 @@ class OutputSummary:
     total_num_processes: int
 
 
-class Output(abc.ABC):
+class FileOutput(abc.ABC):
     def __init__(
         self,
         compact: bool = False,
@@ -132,7 +133,7 @@ class Output(abc.ABC):
         )
 
 
-class ConsoleOutput(Output):
+class ConsoleOutput(FileOutput):
     def __init__(
         self,
         compact: bool = False,
@@ -242,12 +243,12 @@ class ConsoleOutput(Output):
         return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
-class CSVOutput(Output):
+class CSVOutput(FileOutput):
     def handle_result(self, result: AnalyzerResultType):
         raise NotImplementedError("CSVOutput is not implemented yet.")
 
 
-class SQLiteOutput(Output):
+class SQLiteOutput(FileOutput):
     def __init__(
         self,
         compact: bool = False,
@@ -262,3 +263,18 @@ class SQLiteOutput(Output):
 
     def handle_result(self, result: AnalyzerResultType):
         raise NotImplementedError("SQLiteOutput is not implemented yet.")
+
+
+class ZMQOutput:
+    def __init__(self, address: str, bind: Optional[bool] = False):
+        if not is_streaming_available:
+            raise RuntimeError("Streaming is not available")
+        self.address = address
+        self.bind = bind
+
+    def handle_stream(self, stream: Stream) -> None:
+        """
+        Consumes an analysis stream and sinks it to the configured ZMQ address.
+        """
+        print(f"Sinking analysis stream to ZMQ address: {self.address}")
+        stream.to_zmq(self.address, bind=self.bind)
