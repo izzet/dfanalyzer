@@ -1,5 +1,4 @@
 import dask
-import warnings
 from dataclasses import dataclass
 from distributed import Client
 from hydra import compose, initialize
@@ -15,6 +14,12 @@ from .dftracer import DFTracerAnalyzer
 from .output import ConsoleOutput, CSVOutput, SQLiteOutput
 from .recorder import RecorderAnalyzer
 from .types import ViewType
+from .utils.warning_utils import filter_warnings
+
+filter_warnings()
+
+# TODO(izzet): Suppress Dask warnings that are not relevant to the user
+dask.config.set({"dataframe.query-planning-warning": False})
 
 try:
     from .darshan import DarshanAnalyzer
@@ -23,16 +28,6 @@ except ModuleNotFoundError:
 
 AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
 OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput]
-
-# Suppress Dask warnings that are not relevant to the user
-dask.config.set({"dataframe.query-planning-warning": False})
-
-# Suppress FutureWarnings related to pandas grouper
-warnings.filterwarnings(
-    action="ignore",
-    message=".*grouper",
-    category=FutureWarning,
-)
 
 
 @dataclass
