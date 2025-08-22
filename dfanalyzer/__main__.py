@@ -36,11 +36,13 @@ def main(cfg: Config) -> None:
     with log_block("Configuring logging on all Dask workers"):
         client.run(configure_logging, log_file=log_file, json_logs=False, level="info")
 
-    analyzer: AnalyzerType = instantiate(
-        cfg.analyzer,
-        debug=cfg.debug,
-        verbose=cfg.verbose,
-    )
+    with console_block("Analyzer setup"):
+        analyzer: AnalyzerType = instantiate(
+            cfg.analyzer,
+            debug=cfg.debug,
+            verbose=cfg.verbose,
+        )
+    
     result = analyzer.analyze_trace(
         exclude_characteristics=cfg.exclude_characteristics,
         logical_view_types=cfg.logical_view_types,
