@@ -11,6 +11,7 @@ backward_opts.add_cmake_defines(
         'CMAKE_CXX_FLAGS': '-I' + custom_include_dir,
         'CMAKE_INSTALL_LIBDIR': get_option('libdir'),
         'CMAKE_INSTALL_PREFIX': get_option('prefix'),
+        'CMAKE_POLICY_VERSION_MINIMUM': '3.5',
     },
 )
 backward_proj = cmake.subproject('backward-cpp', options: backward_opts)
