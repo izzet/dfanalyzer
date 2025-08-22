@@ -250,7 +250,7 @@ class Analyzer(abc.ABC):
                         checkpointed_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
 
         # Process views to create flat views
-        with console_block("Process views to create flat views"):
+        with console_block("Process views"):
             flat_views = {}
             for layer in views:
                 for view_key in views[layer]:
