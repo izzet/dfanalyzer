@@ -56,6 +56,7 @@ class RecorderAnalyzer(Analyzer):
         time_ranges = self._compute_time_ranges(
             global_min_max=self.global_min_max,
             time_granularity=self.time_granularity,
+            time_resolution=self.time_resolution,
         )
         traces = (
             traces[(traces['cat'] == CAT_POSIX) & (traces['io_cat'].isin(IO_CATS))]
