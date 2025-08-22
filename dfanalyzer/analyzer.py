@@ -32,7 +32,6 @@ from .constants import (
 from .metrics import (
     set_cross_layer_metrics,
     set_main_metrics,
-    set_metric_scores,
     set_view_metrics,
 )
 from .types import (
@@ -74,7 +73,7 @@ class Analyzer(abc.ABC):
         debug: bool = False,
         quantile_stats: bool = False,
         time_approximate: bool = True,
-        time_granularity: float = 1e6,
+        time_granularity: float = 1,
         time_resolution: float = 1e6,
         time_sliced: bool = False,
         verbose: bool = False,
@@ -87,7 +86,7 @@ class Analyzer(abc.ABC):
             checkpoint_dir: Directory to store checkpoint data.
             debug: Whether to enable debug mode.
             time_approximate: Whether to use approximate time for I/O operations.
-            time_granularity: The time granularity for analysis, in microseconds.
+            time_granularity: The time granularity for analysis, in seconds.
             time_resolution: The time resolution for analysis, in microseconds.
             time_sliced: Whether to slice time ranges for analysis.
             verbose: Whether to enable verbose logging.
@@ -161,7 +160,7 @@ class Analyzer(abc.ABC):
             if self.time_sliced:
                 traces = traces.map_partitions(
                     split_duration_records_vectorized,
-                    time_granularity=self.time_granularity / self.time_resolution,
+                    time_granularity=self.time_granularity,
                     time_resolution=self.time_resolution,
                 )
         else:
@@ -763,10 +762,10 @@ class Analyzer(abc.ABC):
     def validate_time_granularity(self, hlm: dd.DataFrame, view_types: List[ViewType]):
         if "io_time" in hlm.columns:
             max_io_time = hlm.groupby(view_types)["io_time"].sum().max().compute()
-            if max_io_time > (self.time_granularity / 1e6):
+            if max_io_time > self.time_granularity:
                 raise ValueError(
-                    f"The max 'io_time' exceeds the 'time_granularity' '{int(self.time_granularity / 1e6)}e6'. "
-                    f"Please adjust the 'time_granularity' to '{int(2 * max_io_time)}e6' and rerun the analyzer."
+                    f"The max 'io_time' exceeds the 'time_granularity' '{self.time_granularity}'. "
+                    f"Please adjust the 'time_granularity' to '{int(2 * max_io_time)}' and rerun the analyzer."
                 )
 
     @staticmethod
@@ -897,7 +896,7 @@ class Analyzer(abc.ABC):
             pre_view.groupby([view_type])
             .agg(view_agg)
             .replace(0, np.nan)
-            .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based)
+            .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based, time_granularity=self.time_granularity)
         )
         view = flatten_column_names(view)
         view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes).persist()
@@ -919,11 +918,6 @@ class Analyzer(abc.ABC):
             is_view_process_based=is_view_process_based,
         )
         flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
-        flat_view = set_metric_scores(
-            flat_view,
-            metric_boundaries=metric_boundaries[view_type],
-            unscored_metrics=self.unscored_metrics,
-        )
         return flat_view.sort_index(axis=1)
 
     def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
@@ -931,7 +925,7 @@ class Analyzer(abc.ABC):
         for metric, eval_condition in self.additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
-                time_interval=self.time_granularity / self.time_resolution,
+                time_interval=self.time_granularity,
                 time_metric=time_metric,
             )
             view = view.eval(f"{metric} = {eval_condition}")

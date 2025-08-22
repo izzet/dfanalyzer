@@ -525,7 +525,7 @@ class DFTracerAnalyzer(Analyzer):
             _ = wait(self.events)
             self.events["ts"] = self.events["ts"] - self.events["ts"].min()
             self.events["te"] = self.events["ts"] + self.events["dur"]
-            self.events["trange"] = self.events["ts"] // self.time_granularity
+            self.events["trange"] = self.events["ts"] // (self.time_granularity * self.time_resolution)
             if is_pyarrow_dtype_supported():
                 self.events["ts"] = self.events["ts"].astype("uint64[pyarrow]")
                 self.events["te"] = self.events["te"].astype("uint64[pyarrow]")

@@ -204,21 +204,21 @@ class AnalyzerConfig:
 @dc.dataclass
 class DarshanAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.darshan.DarshanAnalyzer"
-    time_granularity: Optional[float] = 1e3
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e3
 
 
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
-    time_granularity: Optional[float] = 1e6
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 
 
 @dc.dataclass
 class RecorderAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.recorder.RecorderAnalyzer"
-    time_granularity: Optional[float] = 1e7
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e7
 
 

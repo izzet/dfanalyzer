@@ -139,7 +139,7 @@ class DarshanAnalyzer(Analyzer):
                             'func_name': 'read',
                             'host_name': host_name,
                             'io_cat': IOCategory.READ.value,
-                            'time_range': int(start_times[i] * self.time_granularity),
+                            'time_range': int(start_times[i] * self.time_granularity * self.time_resolution),
                             'cat': 'posix',
                             'acc_pat': 0,  # Would need more logic for random access patterns
                             'count': 1,
@@ -169,7 +169,7 @@ class DarshanAnalyzer(Analyzer):
                             'func_name': 'write',
                             'host_name': host_name,
                             'io_cat': IOCategory.WRITE.value,
-                            'time_range': int(start_times[i] * self.time_granularity),
+                            'time_range': int(start_times[i] * self.time_granularity * self.time_resolution),
                             'cat': 'posix',
                             'acc_pat': 0,  # Would need more logic for random access patterns
                             'count': 1,
