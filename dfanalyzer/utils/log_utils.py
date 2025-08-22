@@ -82,7 +82,7 @@ def console_block(message: str, level: str = "info", logger=None, **kwargs):
             yield
         finally:
             elapsed = time.perf_counter() - start
-            console.print(f"✓ {message}")
+            console.print(f"✓ {message} [i]({elapsed:.3f}s)[/i]")
             getattr(logger, level)(f"✓ {message}", elapsed=elapsed, **kwargs)
 
 
