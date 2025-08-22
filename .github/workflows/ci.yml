@@ -72,6 +72,12 @@ jobs:
           pip install --upgrade meson-python setuptools wheel
           pip install -r tests/requirements.txt
 
+      - name: Ensure system cmake
+        run: |
+          pip uninstall -y cmake || true
+          which cmake
+          cmake --version
+
       - name: Install DFAnalyzer
         run: |
           pip install .[darshan] \
