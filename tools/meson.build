@@ -24,6 +24,7 @@ cpp_logger_opts.add_cmake_defines(
         'CMAKE_CXX_FLAGS': '-I' + custom_include_dir,
         'CMAKE_INSTALL_LIBDIR': get_option('libdir'),
         'CMAKE_INSTALL_PREFIX': get_option('prefix'),
+        'CMAKE_POLICY_VERSION_MINIMUM': '3.5',
     },
 )
 cpp_logger_proj = cmake.subproject('cpp-logger', options: cpp_logger_opts)
@@ -36,6 +37,7 @@ recorder_opts.add_cmake_defines(
         'CMAKE_CXX_FLAGS': '-I' + custom_include_dir,
         'CMAKE_INSTALL_LIBDIR': get_option('libdir'),
         'CMAKE_INSTALL_PREFIX': get_option('prefix'),
+        'CMAKE_POLICY_VERSION_MINIMUM': '3.5',
         'RECORDER_INSTALL_LIB_DIR': get_option('libdir'),
     },
 )
