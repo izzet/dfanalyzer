@@ -19,7 +19,6 @@ def main(cfg: Config) -> None:
     # Configure structlog + stdlib logging
     hydra_config = HydraConfig.get()
     log_file = f"{hydra_config.runtime.output_dir}/{hydra_config.job.name}.log"
-    # print(OmegaConf.to_yaml(hydra_config))
     configure_logging(log_file=log_file, json_logs=False, level="info")
     log = structlog.get_logger()
     log.info("Starting dfanalyzer")
