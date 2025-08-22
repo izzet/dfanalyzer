@@ -101,7 +101,7 @@ Common Analyzer Parameters
    * - ``analyzer.time_granularity``
      - float
      - Varies
-     - Time granularity for analysis (in nanoseconds). Defaults vary by analyzer.
+     - Time granularity for analysis (in seconds). Defaults vary by analyzer.
    * - ``analyzer.time_resolution``
      - float
      - Varies
@@ -141,8 +141,8 @@ For analyzing DFTracer trace files. This is the **default** analyzer.
      - Description
    * - ``analyzer.time_granularity``
      - float
-     - 1e6
-     - Time granularity for DFTracer (in nanoseconds).
+     - 1
+     - Time granularity for DFTracer (in seconds).
    * - ``analyzer.time_resolution``
      - float
      - 1e6
@@ -163,8 +163,8 @@ For analyzing Darshan DXT trace files.
      - Description
    * - ``analyzer.time_granularity``
      - float
-     - 1e3
-     - Time granularity for Darshan (in nanoseconds).
+     - 1
+     - Time granularity for Darshan (in seconds).
    * - ``analyzer.time_resolution``
      - float
      - 1e3
@@ -185,8 +185,8 @@ For analyzing Recorder trace files.
      - Description
    * - ``analyzer.time_granularity``
      - float
-     - 1e7
-     - Time granularity for Recorder (in nanoseconds).
+     - 1
+     - Time granularity for Recorder (in seconds).
    * - ``analyzer.time_resolution``
      - float
      - 1e7
@@ -315,5 +315,3 @@ For environments using the LSF workload manager.
 
 PBS Cluster (``cluster=pbs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For environments using the PBS workload manager.

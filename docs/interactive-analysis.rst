@@ -38,7 +38,7 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
    from dfanalyzer import init_with_hydra
 
    run_dir = f"./unet3d_v100_hdf5"
-   time_granularity = 5e6  # 5 seconds
+   time_granularity = 5  # 5 seconds
    trace_path = f"./data/dftracer-dlio"
    view_types = ["time_range", "proc_name"]
 
