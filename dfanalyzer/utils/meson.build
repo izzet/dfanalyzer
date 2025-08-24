@@ -10,8 +10,8 @@ py.install_sources(
         'expr_utils.py',
         'file_utils.py',
         'json_encoders.py',
-        'logger.py',
-        'yaml_utils.py',
+        'log_utils.py',
+        'warning_utils.py',
     ],
     subdir: 'dfanalyzer/utils',
 )

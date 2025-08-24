@@ -34,7 +34,6 @@ class AnalysisRuntimeConfig:
     num_threads_per_worker: int
     num_workers: int
     processes: bool
-    threshold: float
     verbose: bool
     working_dir: str
 

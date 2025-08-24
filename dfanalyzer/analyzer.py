@@ -1,4 +1,5 @@
 import abc
+import dask
 import dask.dataframe as dd
 import hashlib
 import itertools as it
@@ -7,6 +8,7 @@ import math
 import numpy as np
 import os
 import pandas as pd
+import structlog
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
@@ -32,7 +34,6 @@ from .constants import (
 from .metrics import (
     set_cross_layer_metrics,
     set_main_metrics,
-    set_metric_scores,
     set_view_metrics,
 )
 from .types import (
@@ -44,10 +45,11 @@ from .types import (
     Views,
 )
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
-from .utils.dask_utils import event_logger, flatten_column_names
+from .utils.dask_utils import flatten_column_names
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
+from .utils.log_utils import console_block, log_block
 
 
 CHECKPOINT_FLAT_VIEW = "_flat_view"
@@ -64,6 +66,8 @@ HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 PARTITION_SIZE = "128MB"
 VIEW_PERMUTATIONS = False
 
+logger = structlog.get_logger()
+
 
 class Analyzer(abc.ABC):
     def __init__(
@@ -74,7 +78,7 @@ class Analyzer(abc.ABC):
         debug: bool = False,
         quantile_stats: bool = False,
         time_approximate: bool = True,
-        time_granularity: float = 1e6,
+        time_granularity: float = 1,
         time_resolution: float = 1e6,
         time_sliced: bool = False,
         verbose: bool = False,
@@ -87,7 +91,7 @@ class Analyzer(abc.ABC):
             checkpoint_dir: Directory to store checkpoint data.
             debug: Whether to enable debug mode.
             time_approximate: Whether to use approximate time for I/O operations.
-            time_granularity: The time granularity for analysis, in microseconds.
+            time_granularity: The time granularity for analysis, in seconds.
             time_resolution: The time resolution for analysis, in microseconds.
             time_sliced: Whether to slice time ranges for analysis.
             verbose: Whether to enable verbose logging.
@@ -98,6 +102,8 @@ class Analyzer(abc.ABC):
         self.additional_metrics = preset.additional_metrics or {}
         self.checkpoint = checkpoint
         self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_tasks = []
+        self.dask_client = get_client()
         self.debug = debug
         self.derived_metrics = preset.derived_metrics or {}
         self.quantile_stats = quantile_stats
@@ -124,8 +130,6 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        percentile: Optional[float] = None,
-        threshold: Optional[int] = None,
         time_view_type: Optional[ViewType] = None,
         unoverlapped_posix_only: Optional[bool] = False,
     ) -> AnalyzerResultType:
@@ -141,159 +145,177 @@ class Analyzer(abc.ABC):
             exclude_characteristics: A list of I/O characteristics to exclude.
             logical_view_types: Whether to compute views based on logical relationships.
             metrics: A list of metrics to analyze (e.g., 'iops', 'bw', 'time').
-            percentile: The percentile to use for identifying critical views.
-                        Mutually exclusive with 'threshold'.
-            threshold: The threshold value for slope-based bottleneck detection.
-                       Mutually exclusive with 'percentile'.
             view_types: A list of view types to compute (e.g., 'file_name', 'proc_name').
 
         Returns:
             An AnalyzerResultType object containing the analysis results.
-
-        Raises:
-            ValueError: If neither 'percentile' nor 'threshold' is defined.
         """
-        # Check if both percentile and threshold are none
-        if percentile is None and threshold is None:
-            raise ValueError("Either percentile or threshold must be defined")
-        is_slope_based = threshold is not None
-
         # Check if high-level metrics are checkpointed
         proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
-        if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
-            # Read trace & stats
-            traces = self.read_trace(
-                trace_path=trace_path,
-                extra_columns=extra_columns,
-                extra_columns_fn=extra_columns_fn,
-            )
-            raw_stats = self.read_stats(traces=traces)
-            traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
-            if self.time_sliced:
-                traces = traces.map_partitions(
-                    split_duration_records_vectorized,
-                    time_granularity=self.time_granularity / self.time_resolution,
-                    time_resolution=self.time_resolution,
-                )
-        else:
-            # Restore stats
-            raw_stats = self.restore_extra_data(
-                name=self.get_stats_checkpoint_name(),
-                fallback=lambda: None,
-            )
+        with console_block("Read trace & stats"):
+            if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
+                # Read trace & stats
+                with log_block("read_trace"):
+                    traces = self.read_trace(
+                        trace_path=trace_path,
+                        extra_columns=extra_columns,
+                        extra_columns_fn=extra_columns_fn,
+                    )
+                with log_block("read_stats"):
+                    raw_stats = self.read_stats(traces=traces)
+                with log_block("postread_trace"):
+                    traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
+                if self.time_sliced:
+                    with log_block("split_duration_records_vectorized"):
+                        traces = traces.map_partitions(
+                            split_duration_records_vectorized,
+                            time_granularity=self.time_granularity,
+                            time_resolution=self.time_resolution,
+                        )
+            else:
+                # Restore stats
+                with log_block("restore_raw_stats"):
+                    raw_stats = self.restore_extra_data(
+                        name=self.get_stats_checkpoint_name(),
+                        fallback=lambda: None,
+                    )
 
         # Compute high-level metrics
-        hlm = self.compute_high_level_metrics(
-            checkpoint_name=hlm_checkpoint_name,
-            traces=traces,
-            view_types=proc_view_types,
-        )
-        (hlm, raw_stats) = persist(hlm, raw_stats)
-        wait([hlm, raw_stats])
+        with console_block("Compute high-level metrics"):
+            with log_block("compute_high_level_metrics"):
+                hlm = self.compute_high_level_metrics(
+                    checkpoint_name=hlm_checkpoint_name,
+                    traces=traces,
+                    view_types=proc_view_types,
+                )
+            with log_block("persist"):
+                (hlm, raw_stats) = persist(hlm, raw_stats)
+            with log_block("wait"):
+                wait([hlm, raw_stats])
 
         # Validate time granularity
         # self.validate_time_granularity(hlm=hlm, view_types=hlm_view_types)
 
         # Compute layers & views
-        hlms = {}
-        main_views = {}
-        main_indexes = {}
-        views = {}
-        view_keys = set()
-        for layer, layer_condition in self.layer_defs.items():
-            layer_hlm = hlm.copy()
-            if layer_condition:
-                layer_hlm = hlm.query(layer_condition)
-            layer_main_view = self.compute_main_view(
-                layer=layer,
-                hlm=layer_hlm,
-                view_types=proc_view_types,
-            )
-            layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
-            layer_views = self.compute_views(
-                layer=layer,
-                main_view=layer_main_view,
-                view_types=proc_view_types,
-                percentile=percentile,
-                threshold=threshold,
-                is_slope_based=is_slope_based,
-            )
-            if logical_view_types:
-                layer_logical_views = self.compute_logical_views(
-                    layer=layer,
-                    main_view=layer_main_view,
-                    views=layer_views,
-                    view_types=proc_view_types,
-                    percentile=percentile,
-                    threshold=threshold,
-                    is_slope_based=is_slope_based,
-                )
-                layer_views.update(layer_logical_views)
-            hlms[layer] = layer_hlm
-            main_views[layer] = layer_main_view
-            main_indexes[layer] = layer_main_index
-            views[layer] = layer_views
-            view_keys.update(layer_views.keys())
+        with console_block("Compute views"):
+            with log_block("create_layers_and_views_tasks"):
+                hlms = {}
+                main_views = {}
+                main_indexes = {}
+                views = {}
+                view_keys = set()
+                for layer, layer_condition in self.layer_defs.items():
+                    layer_hlm = hlm.copy()
+                    if layer_condition:
+                        layer_hlm = hlm.query(layer_condition)
+                    layer_main_view = self.compute_main_view(
+                        layer=layer,
+                        hlm=layer_hlm,
+                        view_types=proc_view_types,
+                    )
+                    layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
+                    layer_views = self.compute_views(
+                        layer=layer,
+                        main_view=layer_main_view,
+                        view_types=proc_view_types,
+                    )
+                    if logical_view_types:
+                        layer_logical_views = self.compute_logical_views(
+                            layer=layer,
+                            main_view=layer_main_view,
+                            views=layer_views,
+                            view_types=proc_view_types,
+                        )
+                        layer_views.update(layer_logical_views)
+                    hlms[layer] = layer_hlm
+                    main_views[layer] = layer_main_view
+                    main_indexes[layer] = layer_main_index
+                    views[layer] = layer_views
+                    view_keys.update(layer_views.keys())
 
-        (views, raw_stats) = compute(views, raw_stats)
+            with log_block("compute_views_and_raw_stats"):
+                (views, raw_stats) = compute(views, raw_stats)
 
         # Restore checkpointed flat views if available
         checkpointed_flat_views = {}
         if self.checkpoint:
-            for view_key in view_keys:
-                flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                if self.has_checkpoint(name=flat_view_checkpoint_name):
-                    checkpointed_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
+            with log_block("restore_flat_view_checkpoints"):
+                for view_key in view_keys:
+                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+                    if self.has_checkpoint(name=flat_view_checkpoint_name):
+                        checkpointed_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
 
         # Process views to create flat views
-        flat_views = {}
-        for layer in views:
-            for view_key in views[layer]:
-                if view_key in checkpointed_flat_views:
-                    flat_views[view_key] = checkpointed_flat_views[view_key]
-                    continue
-                view = views[layer][view_key].copy()
-                view.columns = view.columns.map(lambda col: layer.lower() + "_" + col)
-                if view_key in flat_views:
-                    flat_views[view_key] = flat_views[view_key].merge(
-                        view,
-                        how="outer",
-                        left_index=True,
-                        right_index=True,
-                    )
-                else:
-                    flat_views[view_key] = view
+        with console_block("Process views"):
+            flat_views = {}
+            for layer in views:
+                for view_key in views[layer]:
+                    if view_key in checkpointed_flat_views:
+                        flat_views[view_key] = checkpointed_flat_views[view_key]
+                        continue
+                    with log_block("merge_flat_view", view_key=view_key):
+                        view = views[layer][view_key].copy()
+                        view.columns = view.columns.map(lambda col: layer.lower() + "_" + col)
+                        if view_key in flat_views:
+                            flat_views[view_key] = flat_views[view_key].merge(
+                                view,
+                                how="outer",
+                                left_index=True,
+                                right_index=True,
+                            )
+                        else:
+                            flat_views[view_key] = view
+                    try:
+                        df = flat_views[view_key]
+                        mem_bytes = int(df.memory_usage(deep=True).sum()) if hasattr(df, 'memory_usage') else -1
+                        logger.debug(
+                            "Flat view created",
+                            view_key=view_key,
+                            shape=getattr(df, 'shape', None),
+                            mem_bytes=mem_bytes,
+                        )
+                    except Exception:
+                        pass
 
-        # Compute metric boundaries for flat views
-        for view_key in flat_views:
-            if view_key in checkpointed_flat_views:
-                continue
-            view_type = view_key[-1]
-            top_layer = list(self.layer_defs)[0]
-            time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
-            time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
-            metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
-            for layer in self.layer_defs:
-                metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
-            # Process flat views to compute metrics and scores
-            flat_views[view_key] = self._process_flat_view(
-                flat_view=flat_views[view_key],
-                view_key=view_key,
-                metric_boundaries=metric_boundaries,
-            )
+            # Compute metric boundaries for flat views
+            with log_block("process_flat_views+metric_boundaries"):
+                for view_key in flat_views:
+                    if view_key in checkpointed_flat_views:
+                        continue
+                    view_type = view_key[-1]
+                    top_layer = list(self.layer_defs)[0]
+                    time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
+                    with log_block("calculate_metric_boundary", view_key=view_key):
+                        time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
+                        metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
+                        for layer in self.layer_defs:
+                            metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
+                    with log_block("process_flat_view", view_key=view_key):
+                        # Process flat views to compute metrics and scores
+                        flat_views[view_key] = self._process_flat_view(
+                            flat_view=flat_views[view_key],
+                            view_key=view_key,
+                            metric_boundaries=metric_boundaries,
+                        )
 
         # Checkpoint flat views if enabled
         if self.checkpoint:
-            for view_key in flat_views:
-                if view_key in checkpointed_flat_views:
-                    continue
-                flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                flat_views[view_key].to_parquet(f"{flat_view_checkpoint_path}.parquet")
+            with log_block("write_flat_view_checkpoints"):
+                for view_key in flat_views:
+                    if view_key in checkpointed_flat_views:
+                        continue
+                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+                    self.checkpoint_tasks.append(self.dask_client.submit(self._save_flat_view, view=flat_views[view_key], view_path=flat_view_checkpoint_path))
+
+        # Wait for all checkpoint tasks
+        if self.checkpoint:
+            with log_block("wait_for_checkpoints"):
+                wait(self.checkpoint_tasks)
 
         return AnalyzerResultType(
             _hlms=hlms,
@@ -307,6 +329,10 @@ class Analyzer(abc.ABC):
             view_types=view_types,
             views=views,
         )
+
+    @staticmethod
+    def _save_flat_view(view: pd.DataFrame, view_path: str):
+        view.to_parquet(f"{view_path}.parquet")
 
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.
@@ -398,7 +424,7 @@ class Analyzer(abc.ABC):
         """
         return traces.index.count().persist()
 
-    @event_logger(key=EventType.COMPUTE_HLM, message="Compute high-level metrics")
+    
     def compute_high_level_metrics(
         self,
         traces: dd.DataFrame,
@@ -429,7 +455,7 @@ class Analyzer(abc.ABC):
             ),
         )
 
-    @event_logger(key=EventType.COMPUTE_MAIN_VIEW, message="Compute main view")
+    
     def compute_main_view(
         self,
         layer: Layer,
@@ -466,9 +492,6 @@ class Analyzer(abc.ABC):
         layer: Layer,
         main_view: dd.DataFrame,
         view_types: List[ViewType],
-        percentile: Optional[float],
-        threshold: Optional[int],
-        is_slope_based: bool,
     ) -> Views:
         """Computes multifaceted views for each specified metric.
 
@@ -480,8 +503,6 @@ class Analyzer(abc.ABC):
             main_view: The main aggregated Dask DataFrame.
             metrics: A list of metrics to compute views for.
             metric_boundaries: A dictionary of precomputed metric boundaries.
-            percentile: The percentile used to identify critical items in views.
-            threshold: The threshold value for slope-based critical item identification.
             view_types: A list of base view types to permute for creating views.
 
         Returns:
@@ -499,7 +520,6 @@ class Analyzer(abc.ABC):
                     local_dict={"indices": views[(parent_view_type,)].index},
                 )
             views[view_key] = self.compute_view(
-                is_slope_based=is_slope_based,
                 layer=layer,
                 records=parent_records,
                 view_key=view_key,
@@ -514,9 +534,6 @@ class Analyzer(abc.ABC):
         main_view: dd.DataFrame,
         views: Dict[ViewKey, dd.DataFrame],
         view_types: List[ViewType],
-        percentile: Optional[float],
-        threshold: Optional[int],
-        is_slope_based: bool,
     ):
         """Computes views based on predefined logical relationships in the data.
 
@@ -527,8 +544,6 @@ class Analyzer(abc.ABC):
             main_view: The main aggregated Dask DataFrame.
             metric_boundaries: A dictionary of precomputed metric boundaries.
             metrics: A list of metrics to compute logical views for.
-            percentile: The percentile used to identify critical items in views.
-            threshold: The threshold value for slope-based critical item identification.
             view_results: The existing dictionary of computed views to be updated.
             view_types: A list of base view types available in the main_view.
 
@@ -559,7 +574,6 @@ class Analyzer(abc.ABC):
                 else:
                     parent_records = parent_records.eval(f"{view_type} = {view_condition}")
                 logical_views[view_key] = self.compute_view(
-                    is_slope_based=is_slope_based,
                     layer=layer,
                     records=parent_records,
                     view_key=view_key,
@@ -568,7 +582,7 @@ class Analyzer(abc.ABC):
                 )
         return logical_views
 
-    @event_logger(key=EventType.COMPUTE_VIEW, message="Compute view")
+    
     def compute_view(
         self,
         layer: Layer,
@@ -576,20 +590,16 @@ class Analyzer(abc.ABC):
         view_type: str,
         view_types: List[ViewType],
         records: dd.DataFrame,
-        is_slope_based: bool,
     ) -> dd.DataFrame:
         """Computes a single view based on the provided parameters.
 
-        This involves restoring a view from a checkpoint or computing it,
-        then filtering it to identify critical items based on percentile or threshold.
+        This involves restoring a view from a checkpoint or computing it.
 
         Args:
             metrics: The list of all metrics being analyzed.
             metric: The specific metric for this view.
             metric_boundary: The precomputed boundary for the current metric.
-            percentile: The percentile to identify critical items.
             records: The Dask DataFrame (parent records) to compute the view from.
-            threshold: The threshold for slope-based critical item identification.
             view_key: The key identifying this specific view.
             view_type: The primary dimension/column for this view.
 
@@ -600,7 +610,6 @@ class Analyzer(abc.ABC):
         return self.restore_view(
             name=self.get_checkpoint_name(CHECKPOINT_VIEW, str(layer), *list(view_key)),
             fallback=lambda: self._compute_view(
-                is_slope_based=is_slope_based,
                 layer=layer,
                 records=records,
                 view_key=view_key,
@@ -692,9 +701,9 @@ class Analyzer(abc.ABC):
             if force or not os.path.exists(data_path):
                 data = fallback()
                 fire_and_forget(
-                    get_client().submit(
+                    self.dask_client.submit(
                         self.store_extra_data,
-                        data=get_client().submit(compute, data),
+                        data=self.dask_client.submit(compute, data),
                         data_path=data_path,
                     )
                 )
@@ -730,15 +739,20 @@ class Analyzer(abc.ABC):
         if self.checkpoint:
             view_path = self.get_checkpoint_path(name=name)
             if force or not self.has_checkpoint(name=name):
-                view = fallback()
+                with log_block("restore_view_fallback_build", name=name):
+                    view = fallback()
                 if not write_to_disk:
                     return view
-                self.store_view(name=name, view=view)
+                with log_block("restore_view_schedule_store_view", name=name):
+                    checkpoint_task = self.dask_client.compute(self.store_view(name=name, view=view), sync=False)
+                    self.checkpoint_tasks.append(checkpoint_task)
                 if not read_from_disk:
                     return view
-                get_client().cancel(view)
-            return dd.read_parquet(view_path)
-        return fallback()
+                self.dask_client.cancel(checkpoint_task)
+            with log_block("restore_view_read_parquet_metadata", name=name):
+                return dd.read_parquet(view_path)
+        with log_block("restore_view_fallback_build_no_ckpt", name=name):
+            return fallback()
 
     @staticmethod
     def set_layer_metrics(hlm: pd.DataFrame, derived_metrics: Dict[str, str]) -> pd.DataFrame:
@@ -773,7 +787,7 @@ class Analyzer(abc.ABC):
         with open(data_path, "w") as f:
             return json.dump(data[0], f, cls=NpEncoder)
 
-    def store_view(self, name: str, view: dd.DataFrame, compute=True, partition_size="64MB"):
+    def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
         """Stores a Dask DataFrame view to a Parquet checkpoint.
 
         The view DataFrame is repartitioned and then written to a subdirectory
@@ -791,19 +805,21 @@ class Analyzer(abc.ABC):
         for col in view.columns:
             if view.dtypes[col].name == "object":
                 view[col] = view[col].astype(str)
-        return view.repartition(partition_size=partition_size).to_parquet(
+        if view.npartitions > 1:
+            view = view.repartition(partition_size=partition_size)
+        return view.to_parquet(
             self.get_checkpoint_path(name=name),
-            compute=compute,
+            compute=False,
             write_metadata_file=True,
         )
 
     def validate_time_granularity(self, hlm: dd.DataFrame, view_types: List[ViewType]):
         if "io_time" in hlm.columns:
             max_io_time = hlm.groupby(view_types)["io_time"].sum().max().compute()
-            if max_io_time > (self.time_granularity / 1e6):
+            if max_io_time > self.time_granularity:
                 raise ValueError(
-                    f"The max 'io_time' exceeds the 'time_granularity' '{int(self.time_granularity / 1e6)}e6'. "
-                    f"Please adjust the 'time_granularity' to '{int(2 * max_io_time)}e6' and rerun the analyzer."
+                    f"The max 'io_time' exceeds the 'time_granularity' '{self.time_granularity}'. "
+                    f"Please adjust the 'time_granularity' to '{int(2 * max_io_time)}' and rerun the analyzer."
                 )
 
     @staticmethod
@@ -859,29 +875,30 @@ class Analyzer(abc.ABC):
         view_types: List[ViewType],
         partition_size: str,
     ) -> dd.DataFrame:
-        # Set layer metrics
-        if "posix" not in layer.lower():
-            size_cols = [col for col in hlm.columns if col.startswith("size")]
-            hlm = hlm.drop(columns=size_cols)  # type: ignore
-            if "file_name" in hlm.columns:
-                hlm = hlm.drop(columns=["file_name"])  # type: ignore
-        hlm = hlm.map_partitions(self.set_layer_metrics, derived_metrics=self.derived_metrics[layer])
-        # Build agg dict
-        view_types_diff = set(VIEW_TYPES).difference(view_types)
-        main_view_agg = {}
-        for col in hlm.columns:
-            if any(map(col.endswith, view_types_diff)):
-                main_view_agg[col] = unique_set_flatten()
-            elif col not in HLM_EXTRA_COLS:
-                main_view_agg[col] = sum
-        main_view = (
-            hlm.groupby(list(view_types))
-            .agg(main_view_agg, split_out=hlm.npartitions)
-            .map_partitions(set_main_metrics)
-            .replace(0, np.nan)
-            .map_partitions(fix_dtypes)
-            .persist()
-        )
+        with log_block("drop_and_set_metrics", layer=layer):
+            if "posix" not in layer.lower():
+                size_cols = [col for col in hlm.columns if col.startswith("size")]
+                hlm = hlm.drop(columns=size_cols)  # type: ignore
+                if "file_name" in hlm.columns:
+                    hlm = hlm.drop(columns=["file_name"])  # type: ignore
+            hlm = hlm.map_partitions(self.set_layer_metrics, derived_metrics=self.derived_metrics[layer])
+        with log_block("build_agg_dict", layer=layer):
+            view_types_diff = set(VIEW_TYPES).difference(view_types)
+            main_view_agg = {}
+            for col in hlm.columns:
+                if any(map(col.endswith, view_types_diff)):
+                    main_view_agg[col] = unique_set_flatten()
+                elif col not in HLM_EXTRA_COLS:
+                    main_view_agg[col] = sum
+        with log_block("compute_main_view", layer=layer):
+            main_view = (
+                hlm.groupby(list(view_types))
+                .agg(main_view_agg, split_out=hlm.npartitions)
+                .map_partitions(set_main_metrics)
+                .replace(0, np.nan)
+                .map_partitions(fix_dtypes)
+                .persist()
+            )
         return main_view
 
     def _compute_view(
@@ -891,7 +908,6 @@ class Analyzer(abc.ABC):
         view_key: ViewKey,
         view_type: str,
         view_types: List[ViewType],
-        is_slope_based: bool,
     ) -> dd.DataFrame:
         is_view_process_based = self.is_view_process_based(view_key)
 
@@ -899,46 +915,50 @@ class Analyzer(abc.ABC):
         local_view_types = records.index._meta.names
         local_view_types_diff = set(local_view_types).difference([view_type])
 
-        view_agg = {}
-        for col in records.columns:
-            if "_bin_" in col:
-                view_agg[col] = [sum]
-            elif any(map(col.endswith, view_types_diff)):
-                view_agg[col] = [unique_set_flatten()]
-            elif col in it.chain.from_iterable(self.logical_views.values()):
-                view_agg[col] = [unique_set_flatten()]
-            elif pd.api.types.is_numeric_dtype(records[col].dtype):
-                view_agg[col] = [
-                    sum,
-                    min,
-                    max,
-                    "mean",
-                    "std",
-                ]
-                if self.quantile_stats:
-                    view_agg[col].append(quantile_stats(0.01, 0.99))
-                    view_agg[col].append(quantile_stats(0.05, 0.95))
-                    view_agg[col].append(quantile_stats(0.1, 0.9))
-                    view_agg[col].append(quantile_stats(0.25, 0.75))
-            else:
-                raise TypeError(
-                    f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
-                    f"Developer must add explicit handling for this data type in _compute_view method."
-                )
-        view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+        with log_block("build_agg_dict", layer=layer, view_key=view_key):
+            view_agg = {}
+            for col in records.columns:
+                if "_bin_" in col:
+                    view_agg[col] = [sum]
+                elif any(map(col.endswith, view_types_diff)):
+                    view_agg[col] = [unique_set_flatten()]
+                elif col in it.chain.from_iterable(self.logical_views.values()):
+                    view_agg[col] = [unique_set_flatten()]
+                elif pd.api.types.is_numeric_dtype(records[col].dtype):
+                    view_agg[col] = [
+                        sum,
+                        min,
+                        max,
+                        "mean",
+                        "std",
+                    ]
+                    if self.quantile_stats:
+                        view_agg[col].append(quantile_stats(0.01, 0.99))
+                        view_agg[col].append(quantile_stats(0.05, 0.95))
+                        view_agg[col].append(quantile_stats(0.1, 0.9))
+                        view_agg[col].append(quantile_stats(0.25, 0.75))
+                else:
+                    raise TypeError(
+                        f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
+                        f"Developer must add explicit handling for this data type in _compute_view method."
+                    )
+            view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
-        pre_view = records.reset_index()
-        if view_type != COL_PROC_NAME:
-            pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
+        with log_block("pre_grouping", layer=layer, view_key=view_key):
+            pre_view = records.reset_index()
+            if view_type != COL_PROC_NAME:
+                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
 
-        view = (
-            pre_view.groupby([view_type])
-            .agg(view_agg)
-            .replace(0, np.nan)
-            .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based)
-        )
-        view = flatten_column_names(view)
-        view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes).persist()
+        with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
+            view = (
+                pre_view.groupby([view_type])
+                .agg(view_agg)
+                .replace(0, np.nan)
+                .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based, time_granularity=self.time_granularity)
+            )
+        with log_block("finalize", layer=layer, view_key=view_key):
+            view = flatten_column_names(view)
+            view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes).persist()
 
         return view
 
@@ -950,18 +970,15 @@ class Analyzer(abc.ABC):
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
-        flat_view = set_cross_layer_metrics(
-            flat_view,
-            layer_defs=self.layer_defs,
-            layer_deps=self.layer_deps,
-            is_view_process_based=is_view_process_based,
-        )
-        flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
-        flat_view = set_metric_scores(
-            flat_view,
-            metric_boundaries=metric_boundaries[view_type],
-            unscored_metrics=self.unscored_metrics,
-        )
+        with log_block("set_cross_layer_metrics", view_key=view_key):
+            flat_view = set_cross_layer_metrics(
+                flat_view,
+                layer_defs=self.layer_defs,
+                layer_deps=self.layer_deps,
+                is_view_process_based=is_view_process_based,
+            )
+        with log_block("set_additional_metrics", view_key=view_key):
+            flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
         return flat_view.sort_index(axis=1)
 
     def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
@@ -969,7 +986,7 @@ class Analyzer(abc.ABC):
         for metric, eval_condition in self.additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
-                time_interval=self.time_granularity / self.time_resolution,
+                time_interval=self.time_granularity,
                 time_metric=time_metric,
             )
             view = view.eval(f"{metric} = {eval_condition}")

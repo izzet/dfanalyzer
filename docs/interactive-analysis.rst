@@ -37,9 +37,8 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
 
    from dfanalyzer import init_with_hydra
 
-   percentile = 0.9
    run_dir = f"./unet3d_v100_hdf5"
-   time_granularity = 5e6  # 5 seconds
+   time_granularity = 5  # 5 seconds
    trace_path = f"./data/dftracer-dlio"
    view_types = ["time_range", "proc_name"]
 
@@ -50,7 +49,6 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
            'analyzer.checkpoint=False',
            f"analyzer.time_granularity={time_granularity}",
            f"hydra.run.dir={run_dir}",
-           f"percentile={percentile}",
            f"trace_path={trace_path}",
        ]
    )
@@ -73,7 +71,7 @@ Run the trace analysis using the ``analyze_trace`` method.
 
 .. code-block:: python
 
-   result = dfa.analyze_trace(percentile=percentile, view_types=view_types)
+   result = dfa.analyze_trace(view_types=view_types)
 
 The results can then be passed to the output handler to display a summary.
 

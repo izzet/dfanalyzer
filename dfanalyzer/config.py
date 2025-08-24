@@ -42,7 +42,6 @@ class AnalyzerPresetConfig:
 
 @dc.dataclass
 class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'posix': DERIVED_POSIX_METRICS,
@@ -74,18 +73,6 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(
-        default_factory=lambda: {
-            # 'compute_avg_througput':
-            # 'compute_util': 'compute_{time_metric}.fillna(0) / (compute_{time_metric}.fillna(0) + fetch_data_{time_metric}.fillna(0) + checkpoint_{time_metric}.fillna(0))',
-            'compute_util': 'compute_{time_metric} / (app_{time_metric} + {epsilon})',
-            'fetch_data_util': 'fetch_data_{time_metric} / (app_{time_metric} + {epsilon})',
-            'checkpoint_util': 'checkpoint_{time_metric} / (app_{time_metric} + {epsilon})',
-            # 'consumer_rate': 'data_loader_item_count_sum / compute_time_sum',
-            # 'producer_rate': 'data_loader_item_count_sum / data_loader_item_time_sum',
-            # 'producer_consumer_rate': 'producer_rate / consumer_rate',
-        }
-    )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'app': {},
@@ -204,21 +191,21 @@ class AnalyzerConfig:
 @dc.dataclass
 class DarshanAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.darshan.DarshanAnalyzer"
-    time_granularity: Optional[float] = 1e3
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e3
 
 
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
-    time_granularity: Optional[float] = 1e6
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 
 
 @dc.dataclass
 class RecorderAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.recorder.RecorderAnalyzer"
-    time_granularity: Optional[float] = 1e7
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e7
 
 
@@ -391,12 +378,10 @@ class Config:
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
-    percentile: Optional[float] = None
-    threshold: Optional[int] = None
     time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
     verbose: Optional[bool] = False
-    view_types: Optional[List[str]] = dc.field(default_factory=lambda: VIEW_TYPES)
+    view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
     unoverlapped_posix_only: Optional[bool] = False
 
 
@@ -404,7 +389,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs = ConfigStore.instance()
     cs.store(group="hydra/help", name="custom", node=dc.asdict(CustomHelpConfig()))
     cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
-    cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
+    # cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
     cs.store(name="config", node=Config)
     cs.store(group="analyzer", name="darshan", node=DarshanAnalyzerConfig)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)

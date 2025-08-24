@@ -12,7 +12,6 @@ py.install_sources(
         'dftracer.py',
         'metrics.py',
         'output.py',
-        'plots.py',
         'recorder.py',
         'types.py',
     ],
