@@ -33,7 +33,7 @@ dependencies = [
     "pandas>=2.0",
     "portion>=2.4.0",
     "pyarrow>=13",
-    "rich==13.6.0",
+    "rich~=14.1.0",
     "strenum>=0.4",
     "structlog>=25",
     "zindex_py @ git+https://github.com/hariharan-devarajan/zindex.git@fix-pybind-installation",
