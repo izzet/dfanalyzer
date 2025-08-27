@@ -330,10 +330,6 @@ class Analyzer(abc.ABC):
             views=views,
         )
 
-    @staticmethod
-    def _save_flat_view(view: pd.DataFrame, view_path: str):
-        view.to_parquet(f"{view_path}.parquet")
-
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
@@ -980,6 +976,10 @@ class Analyzer(abc.ABC):
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
         return flat_view.sort_index(axis=1)
+
+    @staticmethod
+    def _save_flat_view(view: pd.DataFrame, view_path: str):
+        view.to_parquet(f"{view_path}.parquet")
 
     def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
         time_metric = "time_sum" if is_view_process_based else "time_max"
