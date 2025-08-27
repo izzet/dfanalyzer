@@ -24,6 +24,8 @@ from .analysis_utils import (
 )
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig
 from .constants import (
+    COL_FILE_NAME,
+    COL_HOST_NAME,
     COL_PROC_NAME,
     COL_TIME_END,
     COL_TIME_START,
@@ -344,8 +346,11 @@ class Analyzer(abc.ABC):
             A RawStats dictionary containing 'job_time', 'time_granularity',
             and 'total_count'.
         """
-        job_time = self.compute_job_time(traces=traces)
-        total_count = self.compute_total_count(traces=traces)
+        job_time = self.get_job_time(traces)
+        total_event_count = self.get_total_event_count(traces)
+        unique_file_count = self.get_unique_file_count(traces)
+        unique_host_count = self.get_unique_host_count(traces)
+        unique_process_count = self.get_unique_process_count(traces)
         raw_stats = RawStats(
             **self.restore_extra_data(
                 name=self.get_stats_checkpoint_name(),
@@ -353,7 +358,10 @@ class Analyzer(abc.ABC):
                     job_time=job_time,
                     time_granularity=self.time_granularity,
                     time_resolution=self.time_resolution,
-                    total_count=total_count,
+                    total_event_count=total_event_count,
+                    unique_file_count=unique_file_count,
+                    unique_host_count=unique_host_count,
+                    unique_process_count=unique_process_count,
                 ),
             )
         )
@@ -397,30 +405,6 @@ class Analyzer(abc.ABC):
         """
         return traces
 
-    def compute_job_time(self, traces: dd.DataFrame) -> float:
-        """Computes the total job execution time from the traces.
-
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data,
-                    expected to have 'tstart' and 'tend' columns.
-
-        Returns:
-            The total job time as a float.
-        """
-        return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
-
-    def compute_total_count(self, traces: dd.DataFrame) -> int:
-        """Computes the total number of I/O events in the traces.
-
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of I/O events as an integer.
-        """
-        return traces.index.count().persist()
-
-    
     def compute_high_level_metrics(
         self,
         traces: dd.DataFrame,
@@ -451,7 +435,6 @@ class Analyzer(abc.ABC):
             ),
         )
 
-    
     def compute_main_view(
         self,
         layer: Layer,
@@ -578,7 +561,6 @@ class Analyzer(abc.ABC):
                 )
         return logical_views
 
-    
     def compute_view(
         self,
         layer: Layer,
@@ -648,8 +630,64 @@ class Analyzer(abc.ABC):
     def get_hlm_checkpoint_name(self, view_types: List[ViewType]) -> str:
         return self.get_checkpoint_name(CHECKPOINT_HLM, *sorted(view_types))
 
+    def get_job_time(self, traces: dd.DataFrame) -> float:
+        """Computes the total job execution time from the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data,
+                    expected to have 'tstart' and 'tend' columns.
+
+        Returns:
+            The total job time as a float.
+        """
+        return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
+
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
+
+    def get_total_event_count(self, traces: dd.DataFrame) -> int:
+        """Computes the total number of I/O events in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of I/O events as an integer.
+        """
+        return traces.index.count().persist()
+
+    def get_unique_host_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique hosts accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique hosts accessed as an integer.
+        """
+        return traces[COL_HOST_NAME].nunique()
+
+    def get_unique_file_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique files accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique files accessed as an integer.
+        """
+        return traces[COL_FILE_NAME].nunique()
+
+    def get_unique_process_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique processes accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique processes accessed as an integer.
+        """
+        return traces[COL_PROC_NAME].nunique()
 
     def has_checkpoint(self, name: str):
         """Checks if a checkpoint with the given name exists.

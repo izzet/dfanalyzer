@@ -93,7 +93,7 @@ class DarshanAnalyzer(Analyzer):
         df = pd.concat(map(self._create_dxt_dataframe, self.reports), ignore_index=True)
         return dd.from_pandas(df, npartitions=len(self.reports))
 
-    def compute_job_time(self, traces: dd.DataFrame) -> float:
+    def get_job_time(self, traces: dd.DataFrame) -> float:
         return self.job_time
 
     def _calculate_job_time(self, report: d.DarshanReport) -> float:
