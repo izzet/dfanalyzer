@@ -1,50 +1,50 @@
-import functools
 import logging
 import logging.config
 import structlog
-import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from rich.console import Console
 
+from .notebook_utils import IN_JUPYTER
 
 console = Console()
 
 
-def configure_logging(log_file: str, json_logs: bool = False, level: str = "info") -> None:
-    
+def configure_logging(log_file: str, level: str = "info") -> None:
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
     pre_chain = [
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.stdlib.add_logger_name
+        structlog.stdlib.add_logger_name,
     ]
 
     logging_config = {
-        'version': 1,
-        'handlers': {
-            
-            'json_file': {
-                'class': 'logging.FileHandler',
-                'filename': log_file,
-                'level': 'INFO',
-                'formatter': 'json'
+        "version": 1,
+        "handlers": {
+            "json_file": {
+                "class": "logging.FileHandler",
+                "filename": log_file,
+                "level": level.upper(),
+                "formatter": "json",
             },
         },
-        'formatters': {
-            'json': {
-                '()': structlog.stdlib.ProcessorFormatter,
+        "formatters": {
+            "json": {
+                "()": structlog.stdlib.ProcessorFormatter,
                 "processor": structlog.processors.JSONRenderer(),
-                'foreign_pre_chain': pre_chain
+                "foreign_pre_chain": pre_chain,
             },
-            
         },
-        'loggers': {
-            '': {
-                'handlers': ['json_file'],
-                'level': 'INFO',
-                'propagate': False,
+        "loggers": {
+            "": {
+                "handlers": ["json_file"],
+                "level": level.upper(),
+                "propagate": False,
             }
-        }
+        },
     }
 
     logging.config.dictConfig(logging_config)
@@ -68,7 +68,6 @@ def configure_logging(log_file: str, json_logs: bool = False, level: str = "info
     )
 
 
-
 @contextmanager
 def console_block(message: str, level: str = "info", logger=None, **kwargs):
     """
@@ -76,6 +75,11 @@ def console_block(message: str, level: str = "info", logger=None, **kwargs):
     """
     logger = logger or structlog.get_logger()
     start = time.perf_counter()
+    if IN_JUPYTER:
+        yield
+        elapsed = time.perf_counter() - start
+        getattr(logger, level)(message, elapsed=elapsed, **kwargs)
+        return
     with console.status(f"{message}...", spinner="dots"):
         try:
             getattr(logger, level)(f"▶ {message}...", **kwargs)

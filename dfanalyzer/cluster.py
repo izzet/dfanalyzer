@@ -12,7 +12,6 @@ from .config import (
     ClusterConfig,
     CustomHelpConfig,
     CustomJobConfig,
-    CustomLoggingConfig,
     LocalClusterConfig,
     LSFClusterConfig,
     PBSClusterConfig,
@@ -46,7 +45,6 @@ class Config:
 cs = ConfigStore.instance()
 cs.store(group="hydra/help", name="custom", node=asdict(CustomHelpConfig()))
 cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
-cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
 cs.store(name="config", node=Config)
 cs.store(group="cluster", name="local", node=LocalClusterConfig)
 cs.store(group="cluster", name="lsf", node=LSFClusterConfig)

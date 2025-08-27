@@ -329,35 +329,6 @@ ${hydra:help.footer}
 
 
 @dc.dataclass
-class CustomLoggingConfig:
-    version: int = 1
-    formatters: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "simple": {
-                "datefmt": "%H:%M:%S",
-                "format": "[%(levelname)s] [%(asctime)s.%(msecs)03d] %(message)s [%(pathname)s:%(lineno)d]",
-            }
-        }
-    )
-    handlers: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "file": {
-                "class": "logging.FileHandler",
-                "formatter": "simple",
-                "filename": "${hydra:runtime.output_dir}/${hydra:job.name}.log",
-            },
-        }
-    )
-    root: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "level": "INFO",
-            "handlers": ["file"],
-        }
-    )
-    disable_existing_loggers: bool = False
-
-
-@dc.dataclass
 class Config:
     defaults: List[Any] = dc.field(
         default_factory=lambda: [
@@ -368,7 +339,6 @@ class Config:
             {"output": "console"},
             "_self_",
             {"override hydra/help": "custom"},
-            {"override hydra/job_logging": "custom"},
         ]
     )
     analyzer: AnalyzerConfig = MISSING
@@ -389,7 +359,6 @@ def init_hydra_config_store() -> ConfigStore:
     cs = ConfigStore.instance()
     cs.store(group="hydra/help", name="custom", node=dc.asdict(CustomHelpConfig()))
     cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
-    # cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
     cs.store(name="config", node=Config)
     cs.store(group="analyzer", name="darshan", node=DarshanAnalyzerConfig)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
