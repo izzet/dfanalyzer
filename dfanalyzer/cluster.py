@@ -34,7 +34,6 @@ class Config:
             {"cluster": "local"},
             "_self_",
             {"override hydra/help": "custom"},
-            {"override hydra/job_logging": "custom"},
         ]
     )
     cluster: ClusterConfig = MISSING
