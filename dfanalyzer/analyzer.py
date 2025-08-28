@@ -998,7 +998,11 @@ class Analyzer(abc.ABC):
                 pre_view.groupby([view_type])
                 .agg(view_agg)
                 .replace(0, np.nan)
-                .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based, time_granularity=self.time_granularity)
+                .map_partitions(
+                    set_view_metrics,
+                    is_view_process_based=is_view_process_based,
+                    time_granularity=self.time_granularity,
+                )
             )
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
