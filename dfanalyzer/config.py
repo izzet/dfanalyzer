@@ -31,12 +31,12 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 @dc.dataclass
 class AnalyzerPresetConfig:
     additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
+    async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     layer_defs: Dict[str, Optional[str]] = MISSING
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
@@ -52,7 +52,6 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
             'posix': 'cat.str.contains("posix|stdio")',
         }
     )
-    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
         default_factory=lambda: {
             'file_name': {
@@ -67,12 +66,20 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
-    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
+    async_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: [
+            'data_loader',
+            'data_loader_fork',
+            'reader',
+            # 'reader_posix',
+            'reader_posix_lustre',
+            # 'reader_posix_ssd',
+        ]
+    )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'app': {},
@@ -158,16 +165,6 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
-    threaded_layers: Optional[List[str]] = dc.field(
-        default_factory=lambda: [
-            'data_loader',
-            'data_loader_fork',
-            'reader',
-            # 'reader_posix',
-            'reader_posix_lustre',
-            # 'reader_posix_ssd',
-        ]
-    )
     unscored_metrics: Optional[List[str]] = dc.field(
         default_factory=lambda: [
             'consumer_rate',
