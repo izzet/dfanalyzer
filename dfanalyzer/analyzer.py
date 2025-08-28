@@ -24,11 +24,12 @@ from .analysis_utils import (
 )
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig
 from .constants import (
+    COL_FILE_NAME,
+    COL_HOST_NAME,
     COL_PROC_NAME,
     COL_TIME_END,
     COL_TIME_START,
     VIEW_TYPES,
-    EventType,
     Layer,
 )
 from .metrics import (
@@ -99,25 +100,19 @@ class Analyzer(abc.ABC):
         if checkpoint:
             assert checkpoint_dir != "", "Checkpoint directory must be defined"
 
-        self.additional_metrics = preset.additional_metrics or {}
         self.checkpoint = checkpoint
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_tasks = []
         self.dask_client = get_client()
         self.debug = debug
-        self.derived_metrics = preset.derived_metrics or {}
         self.quantile_stats = quantile_stats
-        self.layer_defs = preset.layer_defs
-        self.layer_deps = preset.layer_deps or {}
         self.layers = list(preset.layer_defs.keys())
         self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
-        self.threaded_layers = preset.threaded_layers or []
         self.time_approximate = time_approximate
         self.time_granularity = time_granularity
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
-        self.unscored_metrics = preset.unscored_metrics or []
         self.verbose = verbose
         ensure_dir(self.checkpoint_dir)
 
@@ -130,7 +125,6 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        time_view_type: Optional[ViewType] = None,
         unoverlapped_posix_only: Optional[bool] = False,
     ) -> AnalyzerResultType:
         """Analyzes I/O trace data to identify performance bottlenecks.
@@ -167,7 +161,9 @@ class Analyzer(abc.ABC):
                 with log_block("read_stats"):
                     raw_stats = self.read_stats(traces=traces)
                 with log_block("postread_trace"):
-                    traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
+                    traces = self.postread_trace(traces=traces, view_types=proc_view_types)
+                with log_block("set_size_bins"):
+                    traces = traces.map_partitions(set_size_bins)
                 if self.time_sliced:
                     with log_block("split_duration_records_vectorized"):
                         traces = traces.map_partitions(
@@ -207,7 +203,7 @@ class Analyzer(abc.ABC):
                 main_indexes = {}
                 views = {}
                 view_keys = set()
-                for layer, layer_condition in self.layer_defs.items():
+                for layer, layer_condition in self.preset.layer_defs.items():
                     layer_hlm = hlm.copy()
                     if layer_condition:
                         layer_hlm = hlm.query(layer_condition)
@@ -243,11 +239,7 @@ class Analyzer(abc.ABC):
         checkpointed_flat_views = {}
         if self.checkpoint:
             with log_block("restore_flat_view_checkpoints"):
-                for view_key in view_keys:
-                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                    if self.has_checkpoint(name=flat_view_checkpoint_name):
-                        checkpointed_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
+                checkpointed_flat_views.update(self.restore_flat_views(view_keys=list(view_keys)))
 
         # Process views to create flat views
         with console_block("Process views"):
@@ -287,12 +279,12 @@ class Analyzer(abc.ABC):
                     if view_key in checkpointed_flat_views:
                         continue
                     view_type = view_key[-1]
-                    top_layer = list(self.layer_defs)[0]
+                    top_layer = list(self.preset.layer_defs)[0]
                     time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
                     with log_block("calculate_metric_boundary", view_key=view_key):
                         time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
                         metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
-                        for layer in self.layer_defs:
+                        for layer in self.preset.layer_defs:
                             metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
                     with log_block("process_flat_view", view_key=view_key):
                         # Process flat views to compute metrics and scores
@@ -305,12 +297,7 @@ class Analyzer(abc.ABC):
         # Checkpoint flat views if enabled
         if self.checkpoint:
             with log_block("write_flat_view_checkpoints"):
-                for view_key in flat_views:
-                    if view_key in checkpointed_flat_views:
-                        continue
-                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                    self.checkpoint_tasks.append(self.dask_client.submit(self._save_flat_view, view=flat_views[view_key], view_path=flat_view_checkpoint_path))
+                self.checkpoint_tasks.extend(self.store_flat_views(flat_views=flat_views))
 
         # Wait for all checkpoint tasks
         if self.checkpoint:
@@ -330,10 +317,6 @@ class Analyzer(abc.ABC):
             views=views,
         )
 
-    @staticmethod
-    def _save_flat_view(view: pd.DataFrame, view_path: str):
-        view.to_parquet(f"{view_path}.parquet")
-
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
@@ -348,8 +331,11 @@ class Analyzer(abc.ABC):
             A RawStats dictionary containing 'job_time', 'time_granularity',
             and 'total_count'.
         """
-        job_time = self.compute_job_time(traces=traces)
-        total_count = self.compute_total_count(traces=traces)
+        job_time = self.get_job_time(traces)
+        total_event_count = self.get_total_event_count(traces)
+        unique_file_count = self.get_unique_file_count(traces)
+        unique_host_count = self.get_unique_host_count(traces)
+        unique_process_count = self.get_unique_process_count(traces)
         raw_stats = RawStats(
             **self.restore_extra_data(
                 name=self.get_stats_checkpoint_name(),
@@ -357,7 +343,10 @@ class Analyzer(abc.ABC):
                     job_time=job_time,
                     time_granularity=self.time_granularity,
                     time_resolution=self.time_resolution,
-                    total_count=total_count,
+                    total_event_count=total_event_count,
+                    unique_file_count=unique_file_count,
+                    unique_host_count=unique_host_count,
+                    unique_process_count=unique_process_count,
                 ),
             )
         )
@@ -401,30 +390,6 @@ class Analyzer(abc.ABC):
         """
         return traces
 
-    def compute_job_time(self, traces: dd.DataFrame) -> float:
-        """Computes the total job execution time from the traces.
-
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data,
-                    expected to have 'tstart' and 'tend' columns.
-
-        Returns:
-            The total job time as a float.
-        """
-        return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
-
-    def compute_total_count(self, traces: dd.DataFrame) -> int:
-        """Computes the total number of I/O events in the traces.
-
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of I/O events as an integer.
-        """
-        return traces.index.count().persist()
-
-    
     def compute_high_level_metrics(
         self,
         traces: dd.DataFrame,
@@ -455,7 +420,6 @@ class Analyzer(abc.ABC):
             ),
         )
 
-    
     def compute_main_view(
         self,
         layer: Layer,
@@ -582,7 +546,6 @@ class Analyzer(abc.ABC):
                 )
         return logical_views
 
-    
     def compute_view(
         self,
         layer: Layer,
@@ -652,8 +615,64 @@ class Analyzer(abc.ABC):
     def get_hlm_checkpoint_name(self, view_types: List[ViewType]) -> str:
         return self.get_checkpoint_name(CHECKPOINT_HLM, *sorted(view_types))
 
+    def get_job_time(self, traces: dd.DataFrame) -> float:
+        """Computes the total job execution time from the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data,
+                    expected to have 'tstart' and 'tend' columns.
+
+        Returns:
+            The total job time as a float.
+        """
+        return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
+
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
+
+    def get_total_event_count(self, traces: dd.DataFrame) -> int:
+        """Computes the total number of I/O events in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of I/O events as an integer.
+        """
+        return traces.index.count().persist()
+
+    def get_unique_host_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique hosts accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique hosts accessed as an integer.
+        """
+        return traces[COL_HOST_NAME].nunique()
+
+    def get_unique_file_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique files accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique files accessed as an integer.
+        """
+        return traces[COL_FILE_NAME].nunique()
+
+    def get_unique_process_count(self, traces: dd.DataFrame):
+        """Computes the total number of unique processes accessed in the traces.
+
+        Args:
+            traces: A Dask DataFrame containing the I/O trace data.
+
+        Returns:
+            The total count of unique processes accessed as an integer.
+        """
+        return traces[COL_PROC_NAME].nunique()
 
     def has_checkpoint(self, name: str):
         """Checks if a checkpoint with the given name exists.
@@ -711,6 +730,15 @@ class Analyzer(abc.ABC):
             with open(data_path, "r") as f:
                 return json.load(f)
         return fallback()
+
+    def restore_flat_views(self, view_keys: List[ViewKey]) -> Dict[ViewKey, pd.DataFrame]:
+        restored_flat_views = {}
+        for view_key in view_keys:
+            flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+            flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+            if self.has_checkpoint(name=flat_view_checkpoint_name):
+                restored_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
+        return restored_flat_views
 
     def restore_view(
         self,
@@ -786,6 +814,22 @@ class Analyzer(abc.ABC):
         """
         with open(data_path, "w") as f:
             return json.dump(data[0], f, cls=NpEncoder)
+
+    def store_flat_views(self, flat_views: Dict[ViewKey, pd.DataFrame]):
+        store_flat_view_tasks = []
+        for view_key in flat_views:
+            flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+            flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+            if self.has_checkpoint(name=flat_view_checkpoint_name):
+                continue
+            store_flat_view_tasks.append(
+                self.dask_client.submit(
+                    self._save_flat_view,
+                    view=flat_views[view_key],
+                    view_path=flat_view_checkpoint_path,
+                )
+            )
+        return store_flat_view_tasks
 
     def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
         """Stores a Dask DataFrame view to a Parquet checkpoint.
@@ -881,7 +925,7 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            hlm = hlm.map_partitions(self.set_layer_metrics, derived_metrics=self.derived_metrics[layer])
+            hlm = hlm.map_partitions(self.set_layer_metrics, derived_metrics=self.preset.derived_metrics[layer])
         with log_block("build_agg_dict", layer=layer):
             view_types_diff = set(VIEW_TYPES).difference(view_types)
             main_view_agg = {}
@@ -954,7 +998,11 @@ class Analyzer(abc.ABC):
                 pre_view.groupby([view_type])
                 .agg(view_agg)
                 .replace(0, np.nan)
-                .map_partitions(set_view_metrics, is_view_process_based=is_view_process_based, time_granularity=self.time_granularity)
+                .map_partitions(
+                    set_view_metrics,
+                    is_view_process_based=is_view_process_based,
+                    time_granularity=self.time_granularity,
+                )
             )
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
@@ -973,17 +1021,22 @@ class Analyzer(abc.ABC):
         with log_block("set_cross_layer_metrics", view_key=view_key):
             flat_view = set_cross_layer_metrics(
                 flat_view,
-                layer_defs=self.layer_defs,
-                layer_deps=self.layer_deps,
+                layer_defs=self.preset.layer_defs,
+                layer_deps=self.preset.layer_deps,
+                async_layers=self.preset.async_layers,
                 is_view_process_based=is_view_process_based,
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
         return flat_view.sort_index(axis=1)
 
+    @staticmethod
+    def _save_flat_view(view: pd.DataFrame, view_path: str):
+        view.to_parquet(f"{view_path}.parquet")
+
     def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
         time_metric = "time_sum" if is_view_process_based else "time_max"
-        for metric, eval_condition in self.additional_metrics.items():
+        for metric, eval_condition in self.preset.additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
                 time_interval=self.time_granularity,

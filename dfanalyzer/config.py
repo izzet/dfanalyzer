@@ -31,12 +31,12 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 @dc.dataclass
 class AnalyzerPresetConfig:
     additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
+    async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     layer_defs: Dict[str, Optional[str]] = MISSING
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
@@ -52,7 +52,6 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
             'posix': 'cat.str.contains("posix|stdio")',
         }
     )
-    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
         default_factory=lambda: {
             'file_name': {
@@ -67,12 +66,20 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
-    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
+    async_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: [
+            'data_loader',
+            'data_loader_fork',
+            'reader',
+            # 'reader_posix',
+            'reader_posix_lustre',
+            # 'reader_posix_ssd',
+        ]
+    )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'app': {},
@@ -158,16 +165,6 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
-    threaded_layers: Optional[List[str]] = dc.field(
-        default_factory=lambda: [
-            'data_loader',
-            'data_loader_fork',
-            'reader',
-            # 'reader_posix',
-            'reader_posix_lustre',
-            # 'reader_posix_ssd',
-        ]
-    )
     unscored_metrics: Optional[List[str]] = dc.field(
         default_factory=lambda: [
             'consumer_rate',
@@ -329,35 +326,6 @@ ${hydra:help.footer}
 
 
 @dc.dataclass
-class CustomLoggingConfig:
-    version: int = 1
-    formatters: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "simple": {
-                "datefmt": "%H:%M:%S",
-                "format": "[%(levelname)s] [%(asctime)s.%(msecs)03d] %(message)s [%(pathname)s:%(lineno)d]",
-            }
-        }
-    )
-    handlers: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "file": {
-                "class": "logging.FileHandler",
-                "formatter": "simple",
-                "filename": "${hydra:runtime.output_dir}/${hydra:job.name}.log",
-            },
-        }
-    )
-    root: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "level": "INFO",
-            "handlers": ["file"],
-        }
-    )
-    disable_existing_loggers: bool = False
-
-
-@dc.dataclass
 class Config:
     defaults: List[Any] = dc.field(
         default_factory=lambda: [
@@ -368,7 +336,6 @@ class Config:
             {"output": "console"},
             "_self_",
             {"override hydra/help": "custom"},
-            {"override hydra/job_logging": "custom"},
         ]
     )
     analyzer: AnalyzerConfig = MISSING
@@ -378,7 +345,6 @@ class Config:
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
-    time_view_type: Optional[str] = COL_TIME_RANGE
     trace_path: str = MISSING
     verbose: Optional[bool] = False
     view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
@@ -389,7 +355,6 @@ def init_hydra_config_store() -> ConfigStore:
     cs = ConfigStore.instance()
     cs.store(group="hydra/help", name="custom", node=dc.asdict(CustomHelpConfig()))
     cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
-    # cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
     cs.store(name="config", node=Config)
     cs.store(group="analyzer", name="darshan", node=DarshanAnalyzerConfig)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)

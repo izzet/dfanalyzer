@@ -643,8 +643,11 @@ class DFTracerAnalyzer(Analyzer):
             .map_partitions(self._sanitize_size_offset)
         )
 
-    def compute_job_time(self, traces):
-        return super().compute_job_time(traces) / self.time_resolution
+    def get_job_time(self, traces):
+        return super().get_job_time(traces) / self.time_resolution
+
+    def get_unique_process_count(self, traces: dd.DataFrame):
+        return traces["pid"].nunique()
 
     @staticmethod
     def _set_epochs(df: pd.DataFrame, epochs: pd.DataFrame):

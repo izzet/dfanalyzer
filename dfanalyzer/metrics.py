@@ -103,6 +103,7 @@ def set_cross_layer_metrics(
     df: pd.DataFrame,
     layer_defs: Dict[Layer, str],
     layer_deps: Dict[Layer, Optional[Layer]],
+    async_layers: List[Layer],
     is_view_process_based: bool,
 ) -> pd.DataFrame:
     time_metric = 'time_sum' if is_view_process_based else 'time_max'
@@ -125,16 +126,9 @@ def set_cross_layer_metrics(
 
     # Set unoverlapped times if there is compute time
     if compute_time_metric in df.columns:
-        # Set unoverlapped time metrics (this has to come before time percentage calc.)
-        for time_col in _find_metric(df.columns, time_metric):
-            if (
-                time_col.startswith('u_')
-                or time_col.startswith('d_')
-                or f'compute_{time_metric}' in time_col
-                or 'app_' in time_col
-                or 'training_' in time_col
-            ):
-                continue
+        # Set unoverlapped time metrics
+        for async_layer in async_layers:
+            time_col = f"{async_layer}_{time_metric}"
             compute_times = df[compute_time_metric].fillna(0)
             time_series = df[time_col].astype('Float64')
             compute_series = compute_times.astype('Float64')

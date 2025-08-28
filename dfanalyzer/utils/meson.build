@@ -11,6 +11,7 @@ py.install_sources(
         'file_utils.py',
         'json_encoders.py',
         'log_utils.py',
+        'notebook_utils.py',
         'warning_utils.py',
     ],
     subdir: 'dfanalyzer/utils',

@@ -67,8 +67,11 @@ class RecorderAnalyzer(Analyzer):
         traces['cat'] = traces['cat'].astype('string')
         return traces
 
-    def compute_total_count(self, traces: dd.DataFrame) -> int:
+    def get_total_event_count(self, traces: dd.DataFrame) -> int:
         return traces[(traces['cat'] == CAT_POSIX) & (traces['io_cat'].isin(IO_CATS))].reduction(len, sum).persist()
+
+    def get_unique_host_count(self, traces: dd.DataFrame):
+        return traces["hostname"].nunique()
 
     @staticmethod
     def _compute_time_ranges(global_min_max: dict, time_granularity: float, time_resolution: float):

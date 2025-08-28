@@ -51,10 +51,6 @@ Core Parameters
      - list[str]
      - ``["file_name", "proc_name", "time_range"]``
      - A list of perspectives to analyze the data from.
-   * - ``time_view_type``
-     - str
-     - ``time_range``
-     - The type of time-based view to use for analysis.
    * - ``debug``
      - bool
      - ``false``
