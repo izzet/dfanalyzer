@@ -237,11 +237,7 @@ class Analyzer(abc.ABC):
         checkpointed_flat_views = {}
         if self.checkpoint:
             with log_block("restore_flat_view_checkpoints"):
-                for view_key in view_keys:
-                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                    if self.has_checkpoint(name=flat_view_checkpoint_name):
-                        checkpointed_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
+                checkpointed_flat_views.update(self.restore_flat_views(view_keys=list(view_keys)))
 
         # Process views to create flat views
         with console_block("Process views"):
@@ -299,12 +295,7 @@ class Analyzer(abc.ABC):
         # Checkpoint flat views if enabled
         if self.checkpoint:
             with log_block("write_flat_view_checkpoints"):
-                for view_key in flat_views:
-                    if view_key in checkpointed_flat_views:
-                        continue
-                    flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
-                    flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
-                    self.checkpoint_tasks.append(self.dask_client.submit(self._save_flat_view, view=flat_views[view_key], view_path=flat_view_checkpoint_path))
+                self.checkpoint_tasks.extend(self.store_flat_views(flat_views=flat_views))
 
         # Wait for all checkpoint tasks
         if self.checkpoint:
@@ -738,6 +729,15 @@ class Analyzer(abc.ABC):
                 return json.load(f)
         return fallback()
 
+    def restore_flat_views(self, view_keys: List[ViewKey]) -> Dict[ViewKey, pd.DataFrame]:
+        restored_flat_views = {}
+        for view_key in view_keys:
+            flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+            flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+            if self.has_checkpoint(name=flat_view_checkpoint_name):
+                restored_flat_views[view_key] = pd.read_parquet(f"{flat_view_checkpoint_path}.parquet")
+        return restored_flat_views
+
     def restore_view(
         self,
         name: str,
@@ -812,6 +812,22 @@ class Analyzer(abc.ABC):
         """
         with open(data_path, "w") as f:
             return json.dump(data[0], f, cls=NpEncoder)
+
+    def store_flat_views(self, flat_views: Dict[ViewKey, pd.DataFrame]):
+        store_flat_view_tasks = []
+        for view_key in flat_views:
+            flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
+            flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
+            if self.has_checkpoint(name=flat_view_checkpoint_name):
+                continue
+            store_flat_view_tasks.append(
+                self.dask_client.submit(
+                    self._save_flat_view,
+                    view=flat_views[view_key],
+                    view_path=flat_view_checkpoint_path,
+                )
+            )
+        return store_flat_view_tasks
 
     def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
         """Stores a Dask DataFrame view to a Parquet checkpoint.
