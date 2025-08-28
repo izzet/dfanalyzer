@@ -161,7 +161,9 @@ class Analyzer(abc.ABC):
                 with log_block("read_stats"):
                     raw_stats = self.read_stats(traces=traces)
                 with log_block("postread_trace"):
-                    traces = self.postread_trace(traces=traces, view_types=proc_view_types).map_partitions(set_size_bins)
+                    traces = self.postread_trace(traces=traces, view_types=proc_view_types)
+                with log_block("set_size_bins"):
+                    traces = traces.map_partitions(set_size_bins)
                 if self.time_sliced:
                     with log_block("split_duration_records_vectorized"):
                         traces = traces.map_partitions(
