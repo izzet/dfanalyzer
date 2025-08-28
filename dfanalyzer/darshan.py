@@ -27,7 +27,6 @@ class DarshanAnalyzer(Analyzer):
         extra_columns_fn=None,
         logical_view_types=False,
         metric_boundaries=...,
-        time_view_type=None,
         unoverlapped_posix_only=False,
     ):
         if not trace_path.endswith('.darshan') and not os.path.isdir(trace_path):
@@ -57,7 +56,6 @@ class DarshanAnalyzer(Analyzer):
                 extra_columns_fn=extra_columns_fn,
                 logical_view_types=logical_view_types,
                 metric_boundaries=metric_boundaries,
-                time_view_type=time_view_type,
                 unoverlapped_posix_only=unoverlapped_posix_only,
             )
 

@@ -125,7 +125,6 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        time_view_type: Optional[ViewType] = None,
         unoverlapped_posix_only: Optional[bool] = False,
     ) -> AnalyzerResultType:
         """Analyzes I/O trace data to identify performance bottlenecks.

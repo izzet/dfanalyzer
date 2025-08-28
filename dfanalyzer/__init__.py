@@ -53,7 +53,6 @@ class DFAnalyzerInstance:
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
-            time_view_type=self.hydra_config.time_view_type,
             trace_path=self.hydra_config.trace_path,
             unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
             view_types=self.hydra_config.view_types if not view_types else view_types,
