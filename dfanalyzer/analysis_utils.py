@@ -157,7 +157,7 @@ def split_duration_records_vectorized(
 
     if max_chunks == 0:
         df[COL_TIME_RANGE] = df[COL_TIME_START] // (time_granularity * time_resolution)
-        df[COL_TIME_RANGE] = df[COL_TIME_RANGE].astype('uint64[pyarrow]')
+        df[COL_TIME_RANGE] = df[COL_TIME_RANGE].astype('int64')
         return df.copy()
 
     # Create expansion indices
@@ -188,7 +188,7 @@ def split_duration_records_vectorized(
     result_df[COL_TIME_START] = ts_base.repeat(n_chunks) + ts_offsets
 
     result_df[COL_TIME_RANGE] = result_df[COL_TIME_START] // (time_granularity * time_resolution)
-    result_df[COL_TIME_RANGE] = result_df[COL_TIME_RANGE].astype('uint64[pyarrow]')
+    result_df[COL_TIME_RANGE] = result_df[COL_TIME_RANGE].astype('int64')
 
     counts = df[COL_COUNT].to_numpy()
     expanded_counts = counts.repeat(n_chunks)
