@@ -10,7 +10,7 @@ import pandas as pd
 import portion as I
 import structlog
 import sys
-import zindex_py as zindex
+from dftracer.utils import Indexer, Reader
 from dask.distributed import wait
 from typing import Callable, Dict, List, Optional
 
@@ -126,56 +126,36 @@ TRACE_COL_MAPPING = {
     'ts': COL_TIME_START,
 }
 
+
 def create_index(filename):
-    index_file = f"{filename}.zindex"
+    index_file = f"{filename}.idx"
     if not os.path.exists(index_file):
-        status = zindex.create_index(
-            filename,
-            index_file=f"file:{index_file}",
-            regex="id:\b([0-9]+)",
-            numeric=True,
-            unique=True,
-            debug=False,
-            verbose=False,
-        )
-        logger.debug("Creating index", filename=filename, status=status)
+        indexer = Indexer(filename, index_file, checkpoint_size=32 * 1024 * 1024)
+        indexer.build()
+        logger.debug("Creating index", filename=filename)
     return filename
 
 
-def generate_line_batches(filename, max_line):
-    batch_size = 1024 * 16
-    for start in range(0, max_line, batch_size):
-        end = min((start + batch_size - 1), (max_line - 1))
+def generate_batches(filename, max_bytes):
+    batch_size = 4 * 1024 * 1024  # 4 MB
+    for start in range(0, max_bytes, batch_size):
+        # this range is intended since DFTracerJsonLinesBytesReader do
+        # line boundary algorithm internally to chop incomplete line
+        end = min(start + batch_size, max_bytes)
         logger.debug("Created batch", filename=filename, start=start, end=end)
         yield filename, start, end
 
 
-def get_linenumber(filename):
-    index_file = f"{filename}.zindex"
-    line_number = zindex.get_max_line(
-        filename,
-        index_file=index_file,
-        debug=False,
-        verbose=False,
-    )
-    logger.debug("File has lines", filename=filename, line_number=line_number)
-    return (filename, line_number)
-
-
 def get_size(filename):
+    size = 0
     if filename.endswith(".pfw"):
         size = os.stat(filename).st_size
     elif filename.endswith(".pfw.gz"):
-        index_file = f"{filename}.zindex"
-        line_number = zindex.get_max_line(
-            filename,
-            index_file=index_file,
-            debug=False,
-            verbose=False,
-        )
-        size = line_number * 256
+        index_file = f"{filename}.idx"
+        indexer = Indexer(filename, index_file)
+        size = indexer.get_max_bytes()
     logger.debug("File has size", filename=filename, size=size / 1024**3)
-    return int(size)
+    return filename, int(size)
 
 
 def get_io_cat(func_name: str):
@@ -239,31 +219,23 @@ def is_pyarrow_dtype_supported() -> bool:
 
 
 def load_indexed_gzip_files(filename, start, end):
-    index_file = f"{filename}.zindex"
-    json_lines = zindex.zquery(
-        filename,
-        index_file=index_file,
-        raw=f"select a.line from LineOffsets a where a.line >= {start} AND a.line <= {end};",
-        debug=False,
-        verbose=False,
-    )
+    index_file = f"{filename}.idx"
+    reader = Reader(filename, index_file)
+    json_lines = reader.read_line_bytes_json(start, end)
     logger.debug("Read json lines", filename=filename, start=start, end=end, num_lines=len(json_lines))
     return json_lines
 
 
-def load_objects(
-    line: str,
+def load_objects_dict(
+    json_dict: dict,
     time_approximate: bool,
     extra_columns: Optional[Dict[str, str]],
     extra_columns_fn: Optional[Callable[[dict], dict]],
 ):
     final_dict = {}
-    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
-        json_dict = {}
+    logger.debug("Loading dict", json_dict=json_dict)
+    if json_dict is not None:
         try:
-            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
-            json_dict = json.loads(unicode_line, strict=False)
-            logger.debug("Loading dict", json_dict=json_dict)
             if "name" in json_dict:
                 final_dict["name"] = json_dict["name"]
             if "cat" in json_dict:
@@ -318,8 +290,10 @@ def load_objects(
             else:
                 final_dict["type"] = 0  # 0->regular event
                 if "dur" in json_dict:
-                    json_dict["dur"] = int(json_dict["dur"])
-                    json_dict["ts"] = int(json_dict["ts"])
+                    if type(json_dict["dur"]) is not int:
+                        json_dict["dur"] = int(json_dict["dur"])
+                    if type(json_dict["ts"]) is not int:
+                        json_dict["ts"] = int(json_dict["ts"])
                     final_dict["ts"] = json_dict["ts"]
                     final_dict["dur"] = json_dict["dur"]
                     final_dict["te"] = final_dict["ts"] + final_dict["dur"]
@@ -333,8 +307,24 @@ def load_objects(
             if extra_columns and not all(col in final_dict for col in extra_columns):
                 missing_cols = [col for col in extra_columns if col not in final_dict]
                 raise ValueError(f"Missing extra columns: {missing_cols}")
-            logger.debug("Built a dictionary for line", final_dict=final_dict)
+            logger.debug("Built a dictionary for dict", final_dict=final_dict)
             yield final_dict
+        except ValueError as error:
+            logger.error("Processing dict failed", dict=json_dict, error=error)
+    return {}
+
+
+def load_objects_str(
+    line: str,
+    time_approximate: bool,
+    extra_columns: Optional[Dict[str, str]],
+    extra_columns_fn: Optional[Callable[[dict], dict]],
+):
+    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
+        try:
+            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
+            json_dict = json.loads(unicode_line, strict=False)
+            yield from load_objects_dict(json_dict, time_approximate, extra_columns, extra_columns_fn)
         except ValueError as error:
             logger.error("Processing line failed", line=line, error=error)
     return {}
@@ -360,19 +350,19 @@ class DFTracerAnalyzer(Analyzer):
                 db.from_sequence(pfw_gz_pattern).map(create_index).compute()
                 logger.info("Created index for files", num_files=len(pfw_gz_pattern))
         with log_block("sum_total_size"):
-            total_size = db.from_sequence(all_files).map(get_size).sum().compute()
+            sizes = db.from_sequence(all_files).map(get_size).compute()
+            total_size = sum(size for _, size in sizes)
             logger.info("Total size of all files", total_size=total_size)
         gz_bag = None
         pfw_bag = None
         if len(pfw_gz_pattern) > 0:
             with log_block("gzip_index_and_batches"):
-                max_line_numbers = db.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
-                logger.debug("Max lines per file", max_line_numbers=max_line_numbers)
+                logger.debug("Max bytes per file", sizes=sizes)
                 json_line_delayed = []
                 total_lines = 0
-                for filename, max_line in max_line_numbers:
-                    total_lines += max_line
-                    for _, start, end in generate_line_batches(filename, max_line):
+                for filename, max_bytes in sizes:
+                    total_lines += max_bytes
+                    for _, start, end in generate_batches(filename, max_bytes):
                         json_line_delayed.append((filename, start, end))
 
                 logger.info(
@@ -383,13 +373,12 @@ class DFTracerAnalyzer(Analyzer):
                 )
                 json_line_bags = []
                 for filename, start, end in json_line_delayed:
-                    num_lines = end - start + 1
-                    json_line_bags.append(dask.delayed(load_indexed_gzip_files, nout=num_lines)(filename, start, end))
+                    json_line_bags.append(dask.delayed(load_indexed_gzip_files)(filename, start, end))
                 json_lines = db.concat(json_line_bags)
             with log_block("parse_gzip_json_lines"):
                 gz_bag = (
                     json_lines.map(
-                        load_objects,
+                        load_objects_dict,
                         time_approximate=self.time_approximate,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
@@ -403,7 +392,7 @@ class DFTracerAnalyzer(Analyzer):
                 pfw_bag = (
                     db.read_text(pfw_pattern)
                     .map(
-                        load_objects,
+                        load_objects_str,
                         time_approximate=self.time_approximate,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
@@ -655,24 +644,18 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
-        base_condition = (df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna())
-    
+        base_condition = df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna()
+
         # Step 1: Map file purpose suffixes first
-        purpose_updates = {
-            "/data": "_reader",
-            "/checkpoint": "_checkpoint"
-        }
-        
+        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
+
         for path, suffix in purpose_updates.items():
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-        
+
         # Step 2: Map filesystem suffixes
-        filesystem_updates = {
-            "/lustre": "_lustre",
-            "/ssd": "_ssd"
-        }
-        
+        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
+
         for path, suffix in filesystem_updates.items():
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
@@ -689,13 +672,8 @@ class DFTracerAnalyzer(Analyzer):
     @staticmethod
     def _set_proc_names(df: pd.DataFrame):
         df[COL_PROC_NAME] = (
-                "app#"
-                + df[COL_HOST_NAME].astype(str)
-                + "#"
-                + df["pid"].astype(str)
-                + "#"
-                + df["tid"].astype(str)
-            )
+            "app#" + df[COL_HOST_NAME].astype(str) + "#" + df["pid"].astype(str) + "#" + df["tid"].astype(str)
+        )
         return df
 
     @staticmethod

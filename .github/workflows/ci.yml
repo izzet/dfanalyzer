@@ -78,6 +78,8 @@ jobs:
             -Csetup-args="--prefix=$HOME/.local" \
             -Csetup-args="-Denable_tests=true" \
             -Csetup-args="-Denable_tools=true"
+          # temporary to test dftracer-utils
+          pip install --index-url https://test.pypi.org/simple/ dftracer-utils
 
       - name: Determine test type
         id: test-type

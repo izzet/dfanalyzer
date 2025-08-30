@@ -36,7 +36,7 @@ dependencies = [
     "rich~=14.1.0",
     "strenum>=0.4",
     "structlog>=25",
-    "zindex_py @ git+https://github.com/hariharan-devarajan/zindex.git@fix-pybind-installation",
+    # "dftracer-utils>=0.0.4"
 ]
 
 [project.optional-dependencies]
