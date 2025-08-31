@@ -565,14 +565,15 @@ class DFTracerAnalyzer(Analyzer):
         )
 
         # Set epochs
-        if self.assign_epochs:
-            if "epoch" not in self.layer_defs:
-                raise ValueError("Epoch layer definition is missing")
-            epochs = traces.query(self.layer_defs["epoch"]).compute()
-            epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
-            epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
-            epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
-            traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+        with log_block("assign_epochs"):
+            if self.assign_epochs:
+                if "epoch" not in self.preset.layer_defs:
+                    raise ValueError("Epoch layer definition is missing")
+                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
+                epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
+                epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
+                epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
+                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
 
         # Ignore redundant function calls
         with log_block("filter_functions"):
