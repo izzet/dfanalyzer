@@ -89,6 +89,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         default_factory=lambda: {
             'app': {},
             'training': {},
+            'epoch': {},
             'compute': {},
             'fetch_data': {},
             'data_loader': {
@@ -116,8 +117,9 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
     )
     layer_defs: Dict[str, Optional[str]] = dc.field(
         default_factory=lambda: {
-            'app': 'func_name == "DLIOBenchmark.run"',
-            'training': 'func_name == "DLIOBenchmark._train"',
+            'app': 'func_name.isin(["DLIOBenchmark.initialize", "DLIOBenchmark.run"])',
+            'training': 'func_name == "DLIOBenchmark.run"',
+            'epoch': 'func_name == "DLIOBenchmark._train"',
             'compute': 'cat == "ai_framework"',
             'fetch_data': 'func_name.isin(["<module>.iter", "fetch-data.iter", "loop.iter"])',
             'data_loader': 'cat == "data_loader" & ~func_name.isin(["loop.iter", "loop.yield"])',
@@ -139,15 +141,16 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         default_factory=lambda: {
             'app': None,
             'training': 'app',
-            'compute': 'training',
-            'fetch_data': 'training',
+            'epoch': 'training',
+            'compute': 'epoch',
+            'fetch_data': 'epoch',
             'data_loader': 'fetch_data',
             'data_loader_fork': 'fetch_data',
             'reader': 'data_loader',
             # 'reader_posix': 'reader',
             'reader_posix_lustre': 'reader',
             # 'reader_posix_ssd': 'reader_posix',
-            'checkpoint': 'training',
+            'checkpoint': 'epoch',
             # 'checkpoint_posix': 'checkpoint',
             'checkpoint_posix_lustre': 'checkpoint',
             'checkpoint_posix_ssd': 'checkpoint',
@@ -210,6 +213,7 @@ class DarshanAnalyzerConfig(AnalyzerConfig):
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
+    assign_epochs: Optional[bool] = False
     time_granularity: Optional[float] = 1e6
     time_resolution: Optional[float] = 1e6
 

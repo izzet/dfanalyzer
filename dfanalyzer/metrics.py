@@ -131,6 +131,7 @@ def set_cross_layer_metrics(
                 or f'compute_{time_metric}' in time_col
                 or 'app_' in time_col
                 or 'training_' in time_col
+                or 'epoch_' in time_col
             ):
                 continue
             compute_times = df[compute_time_metric].fillna(0)

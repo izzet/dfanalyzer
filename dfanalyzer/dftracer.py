@@ -342,6 +342,10 @@ def load_objects(
 
 
 class DFTracerAnalyzer(Analyzer):
+    def __init__(self, preset, assign_epochs=False, **kwargs):
+        super().__init__(preset, **kwargs)
+        self.assign_epochs = assign_epochs
+
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         if os.path.isdir(trace_path) and "*" not in trace_path:
             trace_path = f"{trace_path}/*.pfw*"
@@ -604,6 +608,15 @@ class DFTracerAnalyzer(Analyzer):
         )
 
         # Set epochs
+        if self.assign_epochs:
+            if "epoch" not in self.layer_defs:
+                raise ValueError("Epoch layer definition is missing")
+            epochs = traces.query(self.layer_defs["epoch"]).compute()
+            epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
+            epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
+            epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
+            traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+
         # epochs = (
         #     traces.query('func_name == "DLIOBenchmark._train"')
         #     .groupby([COL_PROC_NAME, COL_FUNC_NAME])
@@ -706,8 +719,22 @@ class DFTracerAnalyzer(Analyzer):
         return super().compute_job_time(traces) / self.time_resolution
 
     @staticmethod
-    def _set_epochs(df: pd.DataFrame, epochs: pd.DataFrame):
-        return df.assign(epoch=np.digitize(df["time_range"], bins=epochs["time_range"], right=False))
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
+        return df
 
     @staticmethod
     def _set_steps(df: pd.DataFrame, step_time_ranges: pd.DataFrame):
