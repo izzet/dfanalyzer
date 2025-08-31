@@ -1,7 +1,8 @@
+import glob
 import pathlib
 import pytest
 import random
-from glob import glob
+from dask.distributed import LocalCluster
 from dfanalyzer import init_with_hydra
 
 
@@ -22,6 +23,14 @@ smoke_checkpoint_params = [False]  # Skip checkpoint to make tests faster
 smoke_percentile_params = [0.95]
 
 
+@pytest.fixture(scope="session")
+def dask_cluster():
+    cluster = LocalCluster(processes=False, protocol="tcp", worker_class="distributed.nanny.Nanny")
+    yield cluster
+    # This teardown code runs after all tests are done
+    cluster.close()
+
+
 @pytest.mark.full
 @pytest.mark.parametrize("analyzer, preset, trace_path", full_analyzer_trace_params)
 @pytest.mark.parametrize("checkpoint", full_checkpoint_params)
@@ -33,16 +42,10 @@ def test_e2e_full(
     checkpoint: bool,
     percentile: float,
     tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
 ) -> None:
     """Full test suite with all parameter combinations."""
-    _test_e2e(
-        analyzer,
-        preset,
-        trace_path,
-        checkpoint,
-        percentile,
-        tmp_path,
-    )
+    _test_e2e(analyzer, preset, trace_path, checkpoint, percentile, tmp_path, dask_cluster)
 
 
 @pytest.mark.smoke
@@ -56,16 +59,10 @@ def test_e2e_smoke(
     checkpoint: bool,
     percentile: float,
     tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
 ) -> None:
     """Smoke test with minimal parameter combinations for quick validation."""
-    _test_e2e(
-        analyzer,
-        preset,
-        trace_path,
-        checkpoint,
-        percentile,
-        tmp_path,
-    )
+    _test_e2e(analyzer, preset, trace_path, checkpoint, percentile, tmp_path, dask_cluster)
 
 
 def _test_e2e(
@@ -75,9 +72,11 @@ def _test_e2e(
     checkpoint: bool,
     percentile: float,
     tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
 ) -> None:
     """Common test logic extracted to avoid duplication."""
     checkpoint_dir = f"{tmp_path}/checkpoints"
+    scheduler_address = dask_cluster.scheduler_address
 
     view_types = ["proc_name", "time_range"]
     if trace_path.endswith("darshan-posix"):
@@ -89,6 +88,9 @@ def _test_e2e(
             f"analyzer/preset={preset}",
             f"analyzer.checkpoint={checkpoint}",
             f"analyzer.checkpoint_dir={checkpoint_dir}",
+            "cluster=external",
+            f"cluster.restart_on_connect={True}",
+            f"cluster.scheduler_address={scheduler_address}",
             f"hydra.run.dir={tmp_path}",
             f"hydra.runtime.output_dir={tmp_path}",
             f"percentile={percentile}",
@@ -113,7 +115,10 @@ def _test_e2e(
         f"Expected {len(dfa.hydra_config.analyzer.preset.layer_defs)} layers, got {len(result.layers)}"
     )
     if checkpoint:
-        assert any(glob(f"{result.checkpoint_dir}/*.json")), "No checkpoint found"
+        assert any(glob.glob(f"{result.checkpoint_dir}/*.json")), "No checkpoint found"
 
     # Shutdown the Dask client and cluster
     dfa.shutdown()
+
+    # Verify that the Dask client is closed
+    assert dfa.client.status == "closed", "Dask client should be closed after shutdown"

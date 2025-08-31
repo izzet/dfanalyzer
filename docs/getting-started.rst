@@ -12,7 +12,7 @@ To install DFAnalyzer through ``pip`` (recommended for most users):
    # This might involve using your system's package manager or a tool like Spack.
    # Example using Spack to prepare the environment:
    # spack -e tools install
-   pip install dfanalyzer[darshan]
+   pip install dfanalyzer
 
 To install DFAnalyzer from source (for developers or custom builds):
 
@@ -20,9 +20,10 @@ To install DFAnalyzer from source (for developers or custom builds):
 
    # 1. Install system dependencies:
    #    Refer to the "Install system dependencies" step in .github/workflows/ci.yml
-   #    (e.g., build-essential, cmake, libarrow-dev, libhdf5-dev, etc.).
+   #    (e.g., build-essential, cmake, libarrow-dev, libhdf5-dev, ninja-build, etc.).
    #    Alternatively, tools like Spack can help manage these:
    #    # spack -e tools install
+   module load ninja
 
    # 2. Install Python build dependencies:
    python -m pip install --upgrade pip meson-python setuptools wheel
@@ -30,7 +31,7 @@ To install DFAnalyzer from source (for developers or custom builds):
    # 3. Install DFAnalyzer from the root of this repository:
    #    The following command includes optional C++ components (tests and tools).
    #    The --prefix argument is optional and specifies the installation location.
-   pip install .[darshan] \
+   pip install -e . \
      -Csetup-args="--prefix=$HOME/.local" \
      -Csetup-args="-Denable_tests=true" \
      -Csetup-args="-Denable_tools=true"
@@ -46,10 +47,10 @@ Here's an example of how to run DFAnalyzer with the ``recorder`` analyzer using 
 .. code-block:: bash
 
    # Before running, ensure the sample data is extracted.
-   # For example, to extract the 'recorder-parquet' sample used below:
+   # For example, to extract the 'dftracer-dlio' sample used below:
    # mkdir -p tests/data/extracted
-   # tar -xzf tests/data/recorder-posix-parquet.tar.gz -C tests/data/extracted
-   dfanalyzer +analyzer=recorder percentile=0.99 trace_path=tests/data/extracted/recorder-posix-parquet
+   # tar -xzf tests/data/dftracer-dlio.tar.gz -C tests/data/extracted
+   dfanalyzer analyzer/preset=dlio percentile=0.9 trace_path=tests/data/extracted/dftracer-dlio view_types=[time_range]
 
 This command analyzes the traces and prints a high-level summary of the application's execution. Below is a sample of the "Time Period Summary" output:
 

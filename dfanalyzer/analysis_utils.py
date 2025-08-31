@@ -33,10 +33,7 @@ def fix_dtypes(df: pd.DataFrame):
     double_cols.extend([col for col in df.columns if col.endswith('_slope')])
     double_cols.extend([col for col in df.columns if col.endswith('_pct')])
     size_cols = [col for col in df.columns if col.endswith('_size')]
-    # df[int_cols] = df[int_cols].astype('int64[pyarrow]')
-    # df[double_cols] = df[double_cols].astype('double[pyarrow]')
-    # df[size_cols] = df[size_cols].astype('int64[pyarrow]')
-    df[int_cols] = df[int_cols].astype('Int32')
+    df[int_cols] = df[int_cols].astype('Int64')
     df[double_cols] = df[double_cols].astype('Float64')
     df[size_cols] = df[size_cols].astype('Int64')
     return df
@@ -53,7 +50,7 @@ def set_app_name(df: pd.DataFrame):
         app_name=lambda df: df.index.get_level_values(COL_PROC_NAME)
         .str.split(PROC_NAME_SEPARATOR)
         .str[0]
-        .astype("string[pyarrow]"),
+        .astype("string"),
     )
 
 
@@ -62,7 +59,7 @@ def set_host_name(df: pd.DataFrame):
         app_name=lambda df: df.index.get_level_values(COL_PROC_NAME)
         .str.split(PROC_NAME_SEPARATOR)
         .str[1]
-        .astype("string[pyarrow]"),
+        .astype("string"),
     )
 
 
@@ -70,7 +67,7 @@ def set_file_dir(df: pd.DataFrame):
     if COL_FILE_NAME not in df.index.names:
         return df
     return df.assign(
-        file_dir=df.index.get_level_values(COL_FILE_NAME).map(os.path.dirname).astype("string[pyarrow]"),
+        file_dir=df.index.get_level_values(COL_FILE_NAME).map(os.path.dirname).astype("string"),
     )
 
 
@@ -82,7 +79,7 @@ def set_file_pattern(df: pd.DataFrame):
         return re.sub('[0-9]+', FILE_PATTERN_PLACEHOLDER, file_name)
 
     return df.assign(
-        file_pattern=df.index.get_level_values(COL_FILE_NAME).map(_apply_regex).astype("string[pyarrow]"),
+        file_pattern=df.index.get_level_values(COL_FILE_NAME).map(_apply_regex).astype("string"),
     )
 
 
@@ -169,7 +166,7 @@ def split_duration_records_vectorized(
 
     if max_chunks == 0:
         df[COL_TIME_RANGE] = df[COL_TIME_START] // (time_granularity * time_resolution)
-        df[COL_TIME_RANGE] = df[COL_TIME_RANGE].astype('uint64[pyarrow]')
+        df[COL_TIME_RANGE] = df[COL_TIME_RANGE].astype('Int64')
         return df.copy()
 
     # Create expansion indices
@@ -200,7 +197,7 @@ def split_duration_records_vectorized(
     result_df[COL_TIME_START] = ts_base.repeat(n_chunks) + ts_offsets
 
     result_df[COL_TIME_RANGE] = result_df[COL_TIME_START] // (time_granularity * time_resolution)
-    result_df[COL_TIME_RANGE] = result_df[COL_TIME_RANGE].astype('uint64[pyarrow]')
+    result_df[COL_TIME_RANGE] = result_df[COL_TIME_RANGE].astype('Int64')
 
     counts = df[COL_COUNT].to_numpy()
     expanded_counts = counts.repeat(n_chunks)

@@ -118,7 +118,7 @@ def set_cross_layer_metrics(
         overhead_time_col = f"{layer}_overhead_{time_metric}"
         child_times = sum(df[f"{child}_{time_metric}"].fillna(0) for child in child_layers)
         df[overhead_time_col] = np.maximum(df[f"{layer}_{time_metric}"] - child_times, 0)
-        df[overhead_time_col] = df[overhead_time_col].astype('double[pyarrow]')
+        df[overhead_time_col] = df[overhead_time_col].astype('Float64')
         metric_cols.append(overhead_time_col)
 
     # Set unoverlapped times if there is compute time
@@ -134,10 +134,10 @@ def set_cross_layer_metrics(
             ):
                 continue
             compute_times = df[compute_time_metric].fillna(0)
-            time_series = df[time_col].astype('float64')
-            compute_series = compute_times.astype('float64')
+            time_series = df[time_col].astype('Float64')
+            compute_series = compute_times.astype('Float64')
             unoverlapped_series = (time_series - compute_series).clip(lower=0)
-            df[f"u_{time_col}"] = pd.array(unoverlapped_series, dtype='double[pyarrow]')
+            df[f"u_{time_col}"] = pd.array(unoverlapped_series, dtype='Float64')
 
     return df.replace([np.inf, -np.inf], np.nan).sort_index(axis=1)
 

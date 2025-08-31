@@ -8,7 +8,8 @@ import math
 import numpy as np
 import os
 import pandas as pd
-from distributed import fire_and_forget, get_client, wait
+from dask.distributed import fire_and_forget, get_client, wait
+from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .analysis_utils import (
@@ -76,6 +77,7 @@ class Analyzer(abc.ABC):
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
+        quantile_stats: bool = False,
         time_approximate: bool = True,
         time_granularity: float = 1e6,
         time_resolution: float = 1e6,
@@ -103,10 +105,11 @@ class Analyzer(abc.ABC):
         self.checkpoint_dir = checkpoint_dir
         self.debug = debug
         self.derived_metrics = preset.derived_metrics or {}
+        self.quantile_stats = quantile_stats
         self.layer_defs = preset.layer_defs
         self.layer_deps = preset.layer_deps or {}
         self.layers = list(preset.layer_defs.keys())
-        self.logical_views = preset.logical_views or {}
+        self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.threaded_layers = preset.threaded_layers or []
         self.time_approximate = time_approximate
@@ -161,8 +164,8 @@ class Analyzer(abc.ABC):
         is_slope_based = threshold is not None
 
         # Check if high-level metrics are checkpointed
-        view_types = list(sorted(view_types))
-        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=view_types)
+        proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
+        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
         if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
@@ -173,7 +176,7 @@ class Analyzer(abc.ABC):
                 extra_columns_fn=extra_columns_fn,
             )
             raw_stats = self.read_stats(traces=traces)
-            traces = self.postread_trace(traces=traces, view_types=view_types)
+            traces = self.postread_trace(traces=traces, view_types=proc_view_types)
             traces = traces.map_partitions(set_size_bins)
             if self.time_sliced:
                 traces = traces.map_partitions(
@@ -192,7 +195,7 @@ class Analyzer(abc.ABC):
 
         return self._analyze_trace(
             traces=traces,
-            view_types=view_types,
+            view_types=proc_view_types,
             logical_view_types=logical_view_types,
             raw_stats=raw_stats,
             metric_boundaries=metric_boundaries,
@@ -719,6 +722,8 @@ class Analyzer(abc.ABC):
 
     @staticmethod
     def set_layer_metrics(hlm: pd.DataFrame, derived_metrics: Dict[str, str]) -> pd.DataFrame:
+        # Create an explicit copy to avoid SettingWithCopyWarning
+        hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
         for metric, condition in derived_metrics.items():
             is_data_metric = metric in ["data", "read", "write"]
@@ -984,7 +989,7 @@ class Analyzer(abc.ABC):
             # print("hlm_agg pandas", hlm_agg)
             hlm = traces.groupby(hlm_groupby).agg(hlm_agg).replace(0, np.nan)
 
-        hlm[bin_cols] = hlm[bin_cols].astype("uint32[pyarrow]")
+        hlm[bin_cols] = hlm[bin_cols].astype("Int32")
 
         return hlm
 
@@ -1069,7 +1074,9 @@ class Analyzer(abc.ABC):
                     view_agg[col] = [unique_set_flatten()]
                 else:
                     view_agg[col] = [unique_set_flatten_pd]
-            else:
+            elif col in it.chain.from_iterable(self.logical_views.values()):
+                view_agg[col] = [unique_set_flatten()]
+            elif pd.api.types.is_numeric_dtype(records[col].dtype):
                 view_agg[col] = [
                     "sum",
                     "min",
@@ -1077,27 +1084,30 @@ class Analyzer(abc.ABC):
                     "mean",
                     "std",
                 ]
-                if is_dask:
-                    view_agg[col].extend(
-                        [
-                            quantile_stats(0.01, 0.99),
-                            quantile_stats(0.05, 0.95),
-                            quantile_stats(0.1, 0.9),
-                            quantile_stats(0.25, 0.75),
-                        ]
-                    )
-
+                if self.quantile_stats:
+                    if is_dask:
+                        view_agg[col].append(quantile_stats(0.01, 0.99))
+                        view_agg[col].append(quantile_stats(0.05, 0.95))
+                        view_agg[col].append(quantile_stats(0.1, 0.9))
+                        view_agg[col].append(quantile_stats(0.25, 0.75))
+                    else:
+                        # TODO(izzet) handle pandas version
+                        pass
+            else:
+                raise TypeError(
+                    f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
+                    f"Developer must add explicit handling for this data type in _compute_view method."
+                )
         if is_dask:
             view_agg.update({col: [unique_set()] for col in local_view_types_diff})
         else:
             view_agg.update({col: [unique_set_pd] for col in local_view_types_diff})
 
-        # print("view_agg", view_agg)
-        # print("records dtypes", records.reset_index().dtypes)
-        # print("time_ranges", list(records.reset_index()["time_range"].unique()))
-        # print('records dtypes', records)
+        pre_view = records.reset_index()
+        if view_type != COL_PROC_NAME:
+            pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
 
-        view = records.reset_index().groupby([view_type]).agg(view_agg).replace(0, np.nan)
+        view = pre_view.groupby([view_type]).agg(view_agg).replace(0, np.nan)
 
         if is_dask:
             view = view.map_partitions(set_view_metrics, is_view_process_based=is_view_process_based)

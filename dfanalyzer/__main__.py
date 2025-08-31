@@ -6,9 +6,8 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from . import AnalyzerType, ClusterType, OutputType
-from .config import Config, FileInputConfig, ZMQInput, init_hydra_config_store
+from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, FileInputConfig, ZMQInput, init_hydra_config_store
 from .cluster import ExternalCluster
-from .types import Rule
 
 
 init_hydra_config_store()
@@ -21,7 +20,7 @@ def main(cfg: Config) -> None:
     if isinstance(cluster, ExternalCluster):
         client = Client(cluster.scheduler_address)
         if cluster.restart_on_connect:
-            client.restart()
+            client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
     else:
         client = Client(cluster)
 
@@ -71,7 +70,8 @@ def main(cfg: Config) -> None:
 
     print("Closing Dask client and cluster...")
     client.close()
-    cluster.close()  # type: ignore
+    if not isinstance(cluster, ExternalCluster):
+        cluster.close()  # type: ignore
     print("Shutdown complete.")
 
 

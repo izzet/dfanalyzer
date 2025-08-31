@@ -1,6 +1,7 @@
 import dask
 import dask.bag as db
 import dask.dataframe as dd
+import glob
 import json
 import logging
 import math
@@ -11,8 +12,7 @@ import portion as I
 import sys
 import zindex_py as zindex
 from dask.distributed import wait
-from glob import glob
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from .analyzer import Analyzer
 from .constants import (
@@ -187,11 +187,12 @@ def get_io_cat(func_name: str):
 
 def io_columns():
     columns = {
-        "file_hash": "string[pyarrow]",
-        "host_hash": "string[pyarrow]",
-        "image_id": "uint64[pyarrow]",
-        "io_cat": "uint8[pyarrow]",
-        "size": "uint64[pyarrow]",
+        "file_hash": "string",
+        "host_hash": "string",
+        "image_id": "Int64",
+        "io_cat": "Int8",
+        "size": "Int64",
+        "offset": "Int64",
     }
     return columns
 
@@ -212,6 +213,10 @@ def io_function(json_dict: dict):
                 if size > 0:
                     if io_cat in [IOCategory.READ.value, IOCategory.WRITE.value]:
                         d["size"] = size
+            if "offset" in json_dict["args"]:
+                offset = int(json_dict["args"]["offset"])
+                if offset >= 0:
+                    d["offset"] = offset
             d[COL_IO_CAT] = io_cat
         else:
             if "image_idx" in json_dict["args"]:
@@ -338,35 +343,27 @@ def load_json(
 
 class DFTracerAnalyzer(Analyzer):
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
-        if os.path.isdir(trace_path) and "*" not in trace_path:
-            trace_path = f"{trace_path}/*.pfw*"
-        # ===============================================
-        file_pattern = glob(trace_path)
-        all_files = []
-        pfw_pattern = []
-        pfw_gz_pattern = []
-        for file in file_pattern:
-            if file.endswith(".pfw"):
-                pfw_pattern.append(file)
-                all_files.append(file)
-            elif file.endswith(".pfw.gz"):
-                pfw_gz_pattern.append(file)
-                all_files.append(file)
-            else:
-                logging.warning(f"Ignoring unsuported file {file}")
-        if len(all_files) == 0:
-            logging.error("No files selected for .pfw and .pfw.gz")
-            exit(1)
+        pfw_pattern, pfw_gz_pattern = [], []
+        if os.path.isdir(trace_path):
+            pfw_pattern = glob.glob(os.path.join(trace_path, "*.pfw"))
+            pfw_gz_pattern = glob.glob(os.path.join(trace_path, "*.pfw.gz"))
+        elif trace_path.endswith(".pfw.gz"):
+            pfw_gz_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+        elif trace_path.endswith(".pfw"):
+            pfw_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+        all_files = pfw_pattern + pfw_gz_pattern
+        if not all_files:
+            raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
         logging.debug(f"Processing files {all_files}")
         if len(pfw_gz_pattern) > 0:
             db.from_sequence(pfw_gz_pattern).map(create_index).compute()
-        logging.info(f"Created index for {len(pfw_gz_pattern)} files")
+            logging.info(f"Created index for {len(pfw_gz_pattern)} files")
         total_size = db.from_sequence(all_files).map(get_size).sum().compute()
         logging.info(f"Total size of all files are {total_size} bytes")
         gz_bag = None
         pfw_bag = None
         if len(pfw_gz_pattern) > 0:
-            max_line_numbers = dask.bag.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
+            max_line_numbers = db.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
             logging.debug(f"Max lines per file are {max_line_numbers}")
             json_line_delayed = []
             total_lines = 0
@@ -382,7 +379,7 @@ class DFTracerAnalyzer(Analyzer):
             for filename, start, end in json_line_delayed:
                 num_lines = end - start + 1
                 json_line_bags.append(dask.delayed(load_indexed_gzip_files, nout=num_lines)(filename, start, end))
-            json_lines = dask.bag.concat(json_line_bags)
+            json_lines = db.concat(json_line_bags)
             gz_bag = (
                 json_lines.map(
                     load_json,
@@ -577,6 +574,8 @@ class DFTracerAnalyzer(Analyzer):
         )
 
         traces["size"] = traces["size"].replace(0, np.nan)
+        if "offset" in traces.columns:
+            traces["offset"] = traces["offset"].replace(0, np.nan)
 
         return traces
 
