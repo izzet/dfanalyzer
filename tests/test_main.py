@@ -85,7 +85,6 @@ def _test_e2e(
         f"cluster.scheduler_address={scheduler_address}",
         f"hydra.run.dir={tmp_path}",
         f"hydra.runtime.output_dir={tmp_path}",
-        f"percentile={percentile}",
         f"trace_path={trace_path}",
         f"view_types=[{','.join(view_types)}]",
     ]
