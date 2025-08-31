@@ -1,8 +1,12 @@
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
+import pytest
 
 from dfanalyzer.utils.dask_agg import unique_set, unique_set_flatten
+
+# Ensure this module runs in both smoke and full CI modes
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 def test_unique_set_scalar_column_via_dask():
