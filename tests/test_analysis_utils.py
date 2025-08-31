@@ -1,7 +1,7 @@
+import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 import pytest
-import dask.dataframe as dd
 
 from dftracer.analyzer.analysis_utils import split_duration_records_vectorized
 from dftracer.analyzer.constants import (
