@@ -95,6 +95,8 @@ def _test_e2e(
     assert dfa.hydra_config.analyzer.checkpoint_dir == checkpoint_dir
     assert dfa.hydra_config.analyzer.preset.name == preset
     assert dfa.hydra_config.trace_path == trace_path
+    if assign_epochs:
+        assert dfa.hydra_config.analyzer.assign_epochs
 
     # Run the main function
     result = dfa.analyze_trace()
