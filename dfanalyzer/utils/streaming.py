@@ -23,6 +23,7 @@ try:
 
         def update(self, x, who=None, metadata=None):
             # print('Received line', x)
+
             if x.get('name') == 'epoch.start':
                 self.epoch_number += 1
                 print('epoch start', self.epoch_number)
@@ -34,8 +35,11 @@ try:
             if x.get('name') == 'epoch.end':
                 print('epoch end', self.epoch_number)
                 data_to_emit = self._buffer
+                ret = self._emit(data_to_emit)
                 self._buffer = []
-                return self._emit(data_to_emit)
+                return ret
+
+            return []
 
 except ImportError:
     Stream = None

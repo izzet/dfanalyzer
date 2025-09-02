@@ -1,9 +1,12 @@
+from betterset import BetterSet as S
+
+
 def unique_set_flatten_pd(s):
-    return set().union(*s.dropna())
+    return frozenset(S.flatten(s.dropna()))
 
 
 def unique_set_pd(s):
-    return set(s)
+    return frozenset(S(s.dropna().unique().tolist()))
 
 
 unique_set_flatten_pd.__name__ = "unique"

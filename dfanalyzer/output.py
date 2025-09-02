@@ -40,10 +40,10 @@ class OutputSummary:
     layers: List[Layer]
     time_granularity: float
     time_resolution: float
-    total_count: int
-    total_num_files: int
-    total_num_nodes: int
-    total_num_processes: int
+    total_event_count: int
+    unique_file_count: int
+    unique_host_count: int
+    unique_process_count: int
 
 
 class FileOutput(abc.ABC):
@@ -75,10 +75,10 @@ class FileOutput(abc.ABC):
             layers=result.layers,
             time_granularity=float(raw_stats.time_granularity),
             time_resolution=float(raw_stats.time_resolution),
-            total_count=0,
-            total_num_files=0,
-            total_num_nodes=0,
-            total_num_processes=0,
+            total_event_count=int(raw_stats.total_event_count),
+            unique_file_count=int(raw_stats.unique_file_count),
+            unique_host_count=int(raw_stats.unique_host_count),
+            unique_process_count=int(raw_stats.unique_process_count),
         )
         is_process_based = view_key[-1] == COL_PROC_NAME
         time_metric = 'time_sum' if is_process_based else 'time_max'
@@ -110,23 +110,14 @@ class FileOutput(abc.ABC):
                 time=float('nan') if pd.isna(time) else float(time),
                 count=int(count),
                 size=float('nan') if pd.isna(size) else float(size),
-                ops=float('nan') if pd.isna(time) else float(count / time),
-                bandwidth=float('nan') if pd.isna(time) or pd.isna(size) else float(size / time),
+                ops=float('nan') if pd.isna(time) or time == 0 else float(count / time),
+                bandwidth=float('nan') if pd.isna(time) or pd.isna(size) or time == 0 else float(size / time),
                 num_files=0 if pd.isna(num_files) else int(num_files),
                 num_processes=0 if pd.isna(num_processes) else int(num_processes),
                 u_time=None if pd.isna(u_time) else float(u_time),
                 u_count=None if pd.isna(u_count) else int(u_count),
                 u_size=None if pd.isna(u_size) else float(u_size),
             )
-            if not pd.isna(num_processes):
-                summary.total_num_processes = max(summary.total_num_processes, int(num_processes))
-            if not pd.isna(num_files):
-                summary.total_num_files = summary.total_num_files + int(num_files)
-            summary.total_count = summary.total_count + int(count)
-        if (COL_FILE_NAME,) in result.flat_views:
-            summary.total_num_files = len(result.flat_views[(COL_FILE_NAME,)])
-        if (COL_PROC_NAME,) in result.flat_views:
-            summary.total_num_processes = len(result.flat_views[(COL_PROC_NAME,)])
         return summary
 
     def _humanized_layer_name(self, name: str) -> str:
@@ -221,10 +212,10 @@ class ConsoleOutput(FileOutput):
         summary_table.add_column(header='Value', justify='right')
 
         summary_table.add_row('Job Time', 'seconds', f"{summary.job_time:.3f}")
-        summary_table.add_row('Total Count', 'count', f"{summary.total_count:,}")
-        summary_table.add_row('Total Files', 'count', f"{summary.total_num_files:,}")
-        summary_table.add_row('Total Nodes', 'count', f"{summary.total_num_nodes:,}")
-        summary_table.add_row('Total Processes', 'count', f"{summary.total_num_processes:,}")
+        summary_table.add_row('Total Count', 'count', f"{summary.total_event_count:,}")
+        summary_table.add_row('Total Files', 'count', f"{summary.unique_file_count:,}")
+        summary_table.add_row('Total Nodes', 'count', f"{summary.unique_host_count:,}")
+        summary_table.add_row('Total Processes', 'count', f"{summary.unique_process_count:,}")
 
         for layer in summary.layers:
             layer_name = self._humanized_layer_name(layer)

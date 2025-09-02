@@ -1,5 +1,6 @@
+import dfanalyzer.utils.warning_utils  # noqa: F401
 import dask
-import warnings
+import structlog
 from dataclasses import dataclass
 from distributed import Client
 from hydra import compose, initialize
@@ -12,9 +13,14 @@ from .analyzer import Analyzer
 from .cluster import ClusterType, ExternalCluster
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
+from .input import FileInput, ZMQInput
 from .output import ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput
 from .recorder import RecorderAnalyzer
 from .types import AnalyzerResultType, ViewType
+from .utils.log_utils import configure_logging, log_block
+
+# TODO(izzet): Suppress Dask warnings that are not relevant to the user
+dask.config.set({"dataframe.query-planning-warning": False})
 
 try:
     from .darshan import DarshanAnalyzer
@@ -22,17 +28,8 @@ except ModuleNotFoundError:
     DarshanAnalyzer = Analyzer
 
 AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
+InputType = Union[FileInput, ZMQInput]
 OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput]
-
-# Suppress Dask warnings that are not relevant to the user
-dask.config.set({"dataframe.query-planning-warning": False})
-
-# Suppress FutureWarnings related to pandas grouper
-warnings.filterwarnings(
-    action="ignore",
-    message=".*grouper",
-    category=FutureWarning,
-)
 
 
 @dataclass
@@ -41,11 +38,11 @@ class DFAnalyzerInstance:
     client: Client
     cluster: ClusterType
     hydra_config: DictConfig
+    input: InputType
     output: OutputType
 
     def analyze_file(
         self,
-        percentile: Optional[float] = None,
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
@@ -57,31 +54,24 @@ class DFAnalyzerInstance:
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
-            path=self.hydra_config.input.path,
-            percentile=self.hydra_config.percentile if not percentile else percentile,
-            time_view_type=self.hydra_config.time_view_type,
-            unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
+            path=self.input.path,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )
 
     def analyze_zmq(
         self,
-        percentile: Optional[float] = None,
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
     ) -> AnalyzerResultType:
         """Analyze the ZMQ trace using the configured analyzer."""
         return self.analyzer.analyze_zmq(
+            address=self.input.address,
             exclude_characteristics=self.hydra_config.exclude_characteristics,
             extra_columns=extra_columns,
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
-            percentile=self.hydra_config.percentile if not percentile else percentile,
-            time_view_type=self.hydra_config.time_view_type,
-            trace_address=self.hydra_config.trace_address,
-            unoverlapped_posix_only=self.hydra_config.unoverlapped_posix_only,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )
 
@@ -93,6 +83,7 @@ class DFAnalyzerInstance:
 
 
 def init_with_hydra(hydra_overrides: List[str]):
+    # Init Hydra config
     with initialize(version_base=None, config_path=None):
         init_hydra_config_store()
         hydra_config = compose(
@@ -101,23 +92,42 @@ def init_with_hydra(hydra_overrides: List[str]):
             return_hydra_config=True,
         )
     HydraConfig.instance().set_config(hydra_config)
-    cluster = instantiate(hydra_config.cluster)
-    if isinstance(cluster, ExternalCluster):
-        client = Client(cluster.scheduler_address)
-        if cluster.restart_on_connect:
-            client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
-    else:
-        client = Client(cluster)
-    analyzer = instantiate(
-        hydra_config.analyzer,
-        debug=hydra_config.debug,
-        verbose=hydra_config.verbose,
-    )
-    output = instantiate(hydra_config.output)
+
+    # Configure structlog + stdlib logging
+    log_file = f"{hydra_config.hydra.run.dir}/{hydra_config.hydra.job.name}.log"
+    log_level = "debug" if hydra_config.debug else "info"
+    configure_logging(log_file=log_file, level=log_level)
+    log = structlog.get_logger()
+    log.info("Starting dfanalyzer")
+
+    # Setup cluster
+    with log_block("Cluster setup"):
+        cluster = instantiate(hydra_config.cluster)
+        if isinstance(cluster, ExternalCluster):
+            client = Client(cluster.scheduler_address)
+            if cluster.restart_on_connect:
+                client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
+        else:
+            client = Client(cluster)
+
+    # Setup cluster logging
+    with log_block("Configuring logging on all Dask workers"):
+        client.run(configure_logging, log_file=log_file, level=log_level)
+
+    # Setup analyzer
+    with log_block("Analyzer setup"):
+        analyzer = instantiate(
+            hydra_config.analyzer,
+            debug=hydra_config.debug,
+            verbose=hydra_config.verbose,
+        )
+
+    # Setup instance
     return DFAnalyzerInstance(
         analyzer=analyzer,
         client=client,
         cluster=cluster,
         hydra_config=hydra_config,
-        output=output,
+        input=instantiate(hydra_config.input),
+        output=instantiate(hydra_config.output),
     )

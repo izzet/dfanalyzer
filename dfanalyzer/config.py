@@ -31,18 +31,17 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 @dc.dataclass
 class AnalyzerPresetConfig:
     additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
+    async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     layer_defs: Dict[str, Optional[str]] = MISSING
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
 @dc.dataclass
 class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'posix': DERIVED_POSIX_METRICS,
@@ -53,7 +52,6 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
             'posix': 'cat.str.contains("posix|stdio")',
         }
     )
-    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
         default_factory=lambda: {
             'file_name': {
@@ -68,23 +66,19 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
-    threaded_layers: Optional[List[str]] = dc.field(default_factory=list)
-    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(
-        default_factory=lambda: {
-            # 'compute_avg_througput':
-            # 'compute_util': 'compute_{time_metric}.fillna(0) / (compute_{time_metric}.fillna(0) + fetch_data_{time_metric}.fillna(0) + checkpoint_{time_metric}.fillna(0))',
-            'compute_util': 'compute_{time_metric} / (training_{time_metric} + {epsilon})',
-            'fetch_data_util': 'fetch_data_{time_metric} / (training_{time_metric} + {epsilon})',
-            'checkpoint_util': 'checkpoint_{time_metric} / (training_{time_metric} + {epsilon})',
-            # 'consumer_rate': 'data_loader_item_count_sum / compute_time_sum',
-            # 'producer_rate': 'data_loader_item_count_sum / data_loader_item_time_sum',
-            # 'producer_consumer_rate': 'producer_rate / consumer_rate',
-        }
+    async_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: [
+            'data_loader',
+            'data_loader_fork',
+            'reader',
+            # 'reader_posix',
+            'reader_posix_lustre',
+            # 'reader_posix_ssd',
+        ]
     )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
@@ -171,16 +165,6 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
-    threaded_layers: Optional[List[str]] = dc.field(
-        default_factory=lambda: [
-            'data_loader',
-            'data_loader_fork',
-            'reader',
-            # 'reader_posix',
-            'reader_posix_lustre',
-            # 'reader_posix_ssd',
-        ]
-    )
     unscored_metrics: Optional[List[str]] = dc.field(
         default_factory=lambda: [
             'consumer_rate',
@@ -216,7 +200,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
 
 @dc.dataclass
 class AnalyzerConfig:
-    checkpoint: Optional[bool] = True
+    checkpoint: Optional[bool] = False
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
     preset: Optional[AnalyzerPresetConfig] = MISSING
     quantile_stats: Optional[bool] = False
@@ -229,21 +213,21 @@ class AnalyzerConfig:
 @dc.dataclass
 class DarshanAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.darshan.DarshanAnalyzer"
-    time_granularity: Optional[float] = 1e3
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e3
 
 
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
-    time_granularity: Optional[float] = 1e6
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 
 
 @dc.dataclass
 class RecorderAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dfanalyzer.recorder.RecorderAnalyzer"
-    time_granularity: Optional[float] = 1e7
+    time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e7
 
 
@@ -312,18 +296,13 @@ class InputConfig:
 
 @dc.dataclass
 class FileInputConfig(InputConfig):
-    _target_: str = "dfanalyzer.config.FileInputConfig"
+    _target_: str = "dfanalyzer.input.FileInput"
     path: str = MISSING
-
-
-class ZMQInput:
-    def __init__(self, address: str):
-        self.address = address
 
 
 @dc.dataclass
 class ZMQInputConfig(InputConfig):
-    _target_: str = "dfanalyzer.config.ZMQInput"
+    _target_: str = "dfanalyzer.input.ZMQInput"
     address: str = MISSING
 
 
@@ -400,35 +379,6 @@ ${hydra:help.footer}
 
 
 @dc.dataclass
-class CustomLoggingConfig:
-    version: int = 1
-    formatters: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "simple": {
-                "datefmt": "%H:%M:%S",
-                "format": "[%(levelname)s] [%(asctime)s.%(msecs)03d] %(message)s [%(pathname)s:%(lineno)d]",
-            }
-        }
-    )
-    handlers: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "file": {
-                "class": "logging.FileHandler",
-                "formatter": "simple",
-                "filename": "${hydra:runtime.output_dir}/${hydra:job.name}.log",
-            },
-        }
-    )
-    root: Dict[str, Any] = dc.field(
-        default_factory=lambda: {
-            "level": "INFO",
-            "handlers": ["file"],
-        }
-    )
-    disable_existing_loggers: bool = False
-
-
-@dc.dataclass
 class Config:
     defaults: List[Any] = dc.field(
         default_factory=lambda: [
@@ -440,7 +390,6 @@ class Config:
             {"output": "console"},
             "_self_",
             {"override hydra/help": "custom"},
-            {"override hydra/job_logging": "custom"},
         ]
     )
     analyzer: AnalyzerConfig = MISSING
@@ -451,19 +400,14 @@ class Config:
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
-    percentile: Optional[float] = None
-    threshold: Optional[int] = None
-    time_view_type: Optional[str] = COL_TIME_RANGE
     verbose: Optional[bool] = False
-    view_types: Optional[List[str]] = dc.field(default_factory=lambda: VIEW_TYPES)
-    unoverlapped_posix_only: Optional[bool] = False
+    view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
 
 
 def init_hydra_config_store() -> ConfigStore:
     cs = ConfigStore.instance()
     cs.store(group="hydra/help", name="custom", node=dc.asdict(CustomHelpConfig()))
     cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
-    cs.store(group="hydra/job_logging", name="custom", node=CustomLoggingConfig)
     cs.store(name="config", node=Config)
     cs.store(group="analyzer", name="darshan", node=DarshanAnalyzerConfig)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)

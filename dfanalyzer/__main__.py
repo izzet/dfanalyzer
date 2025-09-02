@@ -1,48 +1,68 @@
+import dfanalyzer.utils.warning_utils  # noqa: F401
 import hydra
-import json
 import signal
+import structlog
 from distributed import Client
+from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from . import AnalyzerType, ClusterType, OutputType
-from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, FileInputConfig, ZMQInput, init_hydra_config_store
+from . import AnalyzerType, ClusterType, InputType, OutputType
 from .cluster import ExternalCluster
-
+from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, init_hydra_config_store
+from .input import FileInput, ZMQInput
+from .utils.log_utils import configure_logging, console_block, log_block
 
 init_hydra_config_store()
 
 
 @hydra.main(version_base=None, config_name="config")
 def main(cfg: Config) -> None:
-    cluster: ClusterType = instantiate(cfg.cluster)
+    # Configure structlog + stdlib logging
+    hydra_config = HydraConfig.get()
+    log_file = f"{hydra_config.runtime.output_dir}/{hydra_config.job.name}.log"
+    log_level = "debug" if cfg.debug else "info"
+    configure_logging(log_file=log_file, level=log_level)
+    log = structlog.get_logger()
+    log.info("Starting dfanalyzer")
 
-    if isinstance(cluster, ExternalCluster):
-        client = Client(cluster.scheduler_address)
-        if cluster.restart_on_connect:
-            client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
-    else:
-        client = Client(cluster)
+    # Setup cluster
+    with console_block("Cluster setup"):
+        cluster: ClusterType = instantiate(cfg.cluster)
+        if isinstance(cluster, ExternalCluster):
+            client = Client(cluster.scheduler_address)
+            if cluster.restart_on_connect:
+                client.restart(timeout=CLUSTER_RESTART_TIMEOUT_SECONDS)
+        else:
+            client = Client(cluster)
 
-    analyzer: AnalyzerType = instantiate(
-        cfg.analyzer,
-        debug=cfg.debug,
-        verbose=cfg.verbose,
-    )
-    input = instantiate(cfg.input)
+    # Setup cluster logging
+    with log_block("Configuring logging on all Dask workers"):
+        client.run(configure_logging, log_file=log_file, level=log_level)
+
+    # Setup analyzer
+    with console_block("Analyzer setup"):
+        analyzer: AnalyzerType = instantiate(
+            cfg.analyzer,
+            debug=cfg.debug,
+            verbose=cfg.verbose,
+        )
+
+    input: InputType = instantiate(cfg.input)
     output: OutputType = instantiate(cfg.output)
-    if isinstance(input, FileInputConfig):
+
+    if isinstance(input, FileInput):
+        # Analyze trace
         result = analyzer.analyze_file(
             exclude_characteristics=cfg.exclude_characteristics,
             logical_view_types=cfg.logical_view_types,
             metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
-            percentile=cfg.percentile,
-            threshold=cfg.threshold,
             path=cfg.input.path,
-            unoverlapped_posix_only=cfg.unoverlapped_posix_only,
             view_types=cfg.view_types,
         )
-        output.handle_result(result=result)
+        with console_block("Output"):
+            # Handle result
+            output.handle_result(result=result)
     elif isinstance(input, ZMQInput):
         print(f"Starting stream analysis from: {input.address}")
         analysis_stream = analyzer.analyze_zmq(
@@ -50,15 +70,14 @@ def main(cfg: Config) -> None:
             exclude_characteristics=cfg.exclude_characteristics,
             logical_view_types=cfg.logical_view_types,
             metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
-            percentile=cfg.percentile,
-            threshold=cfg.threshold,
-            unoverlapped_posix_only=cfg.unoverlapped_posix_only,
             view_types=cfg.view_types,
         )
-        analysis_stream = analysis_stream.map(lambda result: result.flat_views[('epoch',)].to_json(orient='index'))
+        analysis_stream = analysis_stream.map(
+            lambda result: result.flat_views[("epoch",)].to_json(orient="index")
+        )
         analysis_stream.sink(print)
         analysis_stream.to_zmq(output.address)
-        analysis_stream.visualize('analysis')
+        analysis_stream.visualize("analysis")
         analysis_stream.start()
         print("Streaming analysis started. Press Ctrl+C to exit.")
         try:
@@ -68,11 +87,11 @@ def main(cfg: Config) -> None:
     else:
         raise ValueError(f"Unsupported input configuration type: {type(cfg.input)}")
 
-    print("Closing Dask client and cluster...")
-    client.close()
-    if not isinstance(cluster, ExternalCluster):
-        cluster.close()  # type: ignore
-    print("Shutdown complete.")
+    # Teardown cluster
+    with console_block("Cluster teardown"):
+        client.close()
+        if not isinstance(cluster, ExternalCluster):
+            cluster.close()  # type: ignore
 
 
 if __name__ == "__main__":
