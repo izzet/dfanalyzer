@@ -54,9 +54,9 @@ def set_main_metrics(df: pd.DataFrame):
         count_col = size_col.replace('size', 'count')
         intensity_col = size_col.replace('size', 'intensity')
         time_col = size_col.replace('size', 'time')
-        df[size_col] = np.where(df[size_col] > 0, df[size_col], np.nan)
-        df[bw_col] = np.where(df[size_col] > 0, df[size_col] / df[time_col], np.nan)
-        df[intensity_col] = np.where(df[size_col] > 0, df[count_col] / df[size_col], np.nan)
+        df[size_col] = df[size_col].where(df[size_col] > 0, pd.NA)
+        df[bw_col] = (df[size_col] / df[time_col]).where(df[size_col] > 0, pd.NA)
+        df[intensity_col] = (df[count_col] / df[size_col]).where(df[size_col] > 0, pd.NA)
 
     for count_col in count_cols:
         ops_col = count_col.replace('count', 'ops')
