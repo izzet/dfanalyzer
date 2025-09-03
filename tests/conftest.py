@@ -5,22 +5,10 @@ import pytest
 import tarfile
 
 
-@pytest.fixture(scope='session', autouse=True)
+@pytest.fixture(scope="session", autouse=True)
 def extract_test_data():
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
-    tar_files = glob.glob(os.path.join(data_dir, '*.tar.gz'))
-
-    for tar_path in tar_files:
-        tar_name = os.path.basename(tar_path)
-        extract_folder_name = tar_name.replace('.tar.gz', '')
-        extract_path = os.path.join(data_dir, 'extracted', extract_folder_name)
-
-        if not os.path.exists(extract_path):
-            os.makedirs(extract_path)
-
-        if not any(os.scandir(extract_path)):
-            with tarfile.open(tar_path, 'r:gz') as tar:
-                tar.extractall(path=extract_path)
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    _ensure_extracted_data(data_dir)
 
 
 @pytest.fixture(scope="session")
@@ -31,8 +19,11 @@ def epoch_posix_events():
     epoch.start metadata message, containing some POSIX events in between, and
     finishing with an epoch.end metadata message.
     """
-    base = os.path.join(os.path.dirname(__file__), "data", "extracted", "dftracer-ai-logging")
-    file_path = os.path.join(base, "trace-0-of-8.pfw")
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    _ensure_extracted_data(data_dir)
+
+    ai_logging_dir = os.path.join(data_dir, "extracted", "dftracer-ai-logging")
+    file_path = os.path.join(ai_logging_dir, "trace-0-of-8.pfw")
 
     if not os.path.exists(file_path):
         # If the test data isn't present, skip tests that request this fixture.
@@ -80,3 +71,25 @@ def epoch_posix_events():
                 break
 
     return epochs
+
+
+def _ensure_extracted_data(data_dir: str) -> None:
+    """Ensure any tar.gz files under data_dir are extracted into data_dir/extracted.
+
+    This is called by both the autouse fixture and by tests that need the
+    extracted files (so CI can trigger extraction if the extracted folder is
+    missing).
+    """
+    tar_files = glob.glob(os.path.join(data_dir, "*.tar.gz"))
+
+    for tar_path in tar_files:
+        tar_name = os.path.basename(tar_path)
+        extract_folder_name = tar_name.replace(".tar.gz", "")
+        extract_path = os.path.join(data_dir, "extracted", extract_folder_name)
+
+        if not os.path.exists(extract_path):
+            os.makedirs(extract_path, exist_ok=True)
+
+        if not any(os.scandir(extract_path)):
+            with tarfile.open(tar_path, "r:gz") as tar:
+                tar.extractall(path=extract_path)
