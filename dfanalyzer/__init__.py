@@ -16,8 +16,9 @@ from .dftracer import DFTracerAnalyzer
 from .input import FileInput, ZMQInput
 from .output import ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput
 from .recorder import RecorderAnalyzer
-from .types import AnalyzerResultType, ViewType
+from .types import ViewType
 from .utils.log_utils import configure_logging, log_block
+
 
 # TODO(izzet): Suppress Dask warnings that are not relevant to the user
 dask.config.set({"dataframe.query-planning-warning": False})
@@ -63,7 +64,7 @@ class DFAnalyzerInstance:
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-    ) -> AnalyzerResultType:
+    ):
         """Analyze the ZMQ trace using the configured analyzer."""
         return self.analyzer.analyze_zmq(
             address=self.input.address,
@@ -78,7 +79,7 @@ class DFAnalyzerInstance:
     def shutdown(self):
         """Shutdown the Dask client and cluster."""
         self.client.close()
-        if hasattr(self.cluster, 'close'):
+        if hasattr(self.cluster, "close"):
             self.cluster.close()
 
 

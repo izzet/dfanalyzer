@@ -197,7 +197,7 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-    ) -> AnalyzerResultType:
+    ) -> Stream:
         extra_columns = {"epoch": "Int8"}
         extra_columns_fn = lambda json_dict: {"epoch": json_dict.get("epoch", None)}
         analysis_stream = self.read_zmq(

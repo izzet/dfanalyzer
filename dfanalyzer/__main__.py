@@ -72,9 +72,7 @@ def main(cfg: Config) -> None:
             metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
             view_types=cfg.view_types,
         )
-        analysis_stream = analysis_stream.map(
-            lambda result: result.flat_views[("epoch",)].to_json(orient="index")
-        )
+        analysis_stream = analysis_stream.map(lambda result: result.flat_views[("epoch",)].to_json(orient="index"))
         analysis_stream.sink(print)
         analysis_stream.to_zmq(output.address)
         analysis_stream.visualize("analysis")

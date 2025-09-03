@@ -74,7 +74,7 @@ jobs:
 
       - name: Install DFAnalyzer
         run: |
-          pip install .[darshan] \
+          pip install .[darshan,streaming] \
             -Csetup-args="--prefix=$HOME/.local" \
             -Csetup-args="-Denable_tests=true" \
             -Csetup-args="-Denable_tools=true"
