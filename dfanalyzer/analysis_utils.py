@@ -158,7 +158,7 @@ def split_duration_records_vectorized(
     time_resolution: float,
 ) -> pd.DataFrame:
     # Convert duration column to numpy array
-    durations = df[COL_TIME].to_numpy()
+    durations = df[COL_TIME].fillna(0).to_numpy()
 
     # Calculate number of chunks needed for each row
     n_chunks = np.ceil(durations / time_granularity).astype(int)
