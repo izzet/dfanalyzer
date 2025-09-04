@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pandas as pd
 import re
+import structlog
 from typing import Union
 
 from .constants import (
@@ -18,6 +19,8 @@ from .constants import (
     SIZE_BINS,
     SIZE_BIN_SUFFIXES,
 )
+
+logger = structlog.get_logger()
 
 
 def fix_dtypes(df: pd.DataFrame):
@@ -140,7 +143,7 @@ def set_unique_counts(df: pd.DataFrame, layer: str):
         nunique_col = unique_col.replace('_unique', '_nunique')
         if df[unique_col].isnull().all():
             if df[unique_col].dtype != 'object':
-                logging.warning(
+                logger.warning(
                     "Column '%s' is not of object dtype (actual: %s) and all values are null during 'set_unique_counts'",
                     unique_col,
                     df[unique_col].dtype,
