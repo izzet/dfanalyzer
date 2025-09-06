@@ -232,3 +232,32 @@ def set_cross_layer_metrics(
     df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
 
     return df.sort_index(axis=1)
+
+
+def set_quantile_metrics(df: pd.DataFrame):
+    quantile_metrics = [col for col in df.columns if col.endswith('_stats') and '_q' in col]
+
+    if not quantile_metrics:
+        return df
+
+    new_cols: Dict[str, pd.Series] = {}
+
+    for stats_col in quantile_metrics:
+        base = stats_col.replace('_stats', '')
+        mean_col = f"{base}_mean"
+        std_col = f"{base}_std"
+        count_col = f"{base}_count"
+
+        mean_series = pd.to_numeric(df[stats_col].str[0], errors='coerce').astype('Float64')
+        std_series = pd.to_numeric(df[stats_col].str[1], errors='coerce').astype('Float64')
+        count_series = pd.to_numeric(df[stats_col].str[2], errors='coerce').astype('Int64')
+
+        new_cols[mean_col] = mean_series
+        new_cols[std_col] = std_series
+        new_cols[count_col] = count_series
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+        df = df.drop(columns=quantile_metrics)
+
+    return df.sort_index(axis=1)

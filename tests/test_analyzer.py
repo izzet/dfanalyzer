@@ -142,6 +142,19 @@ def analyzer_dlio() -> DummyAnalyzer:
     )
 
 
+@pytest.fixture
+def dummy_analyzer_quantiles() -> DummyAnalyzer:
+    preset = AnalyzerPresetConfigPOSIX()
+    return DummyAnalyzer(
+        preset=preset,
+        checkpoint=False,
+        checkpoint_dir="",
+        time_granularity=1.0,
+        time_resolution=1.0,
+        quantile_stats=True,
+    )
+
+
 # ---------- Tests (pandas) ----------
 
 
@@ -566,3 +579,67 @@ def test_compute_view_file_dask_basic(dummy_analyzer: DummyAnalyzer):
     row_f2 = grp[grp["file_name"] == "f2"].iloc[0]
     assert pytest.approx(row_f1["time_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_f2["time_frac_total"], rel=1e-6) == 0.5
+
+
+# ---------- Dask compute_view quantile stats ----------
+
+
+def _assert_quantile_columns_present(df: pd.DataFrame, metric_prefix: str):
+    cols = df.columns.tolist()
+    for rng in ("q1_q99", "q5_q95", "q10_q90", "q25_q75"):
+        assert f"{metric_prefix}_{rng}_mean" in cols
+        assert f"{metric_prefix}_{rng}_std" in cols
+        assert f"{metric_prefix}_{rng}_count" in cols
+        # Ensure legacy _stats column absent
+        assert f"{metric_prefix}_{rng}_stats" not in cols
+
+
+def test_compute_view_proc_dask_quantiles(dummy_analyzer_quantiles: DummyAnalyzer):
+    pdf = build_base_df()
+    traces = dd.from_pandas(pdf, npartitions=2)
+    view_types = ["proc_name", "file_name"]
+    hlm = dummy_analyzer_quantiles._compute_high_level_metrics(
+        traces=traces, view_types=view_types, partition_size="64MB"
+    )
+    main_view = dummy_analyzer_quantiles._compute_main_view(
+        layer="posix", hlm=hlm, view_types=view_types, partition_size="64MB"
+    )
+
+    view_dd = dummy_analyzer_quantiles._compute_view(
+        layer="posix",
+        records=main_view,
+        view_key=("proc_name",),
+        view_type="proc_name",
+        view_types=view_types,
+    )
+    out = view_dd.compute()
+    assert list(out.index.names) == ["proc_name"]
+    _assert_no_infinities(out)
+    _assert_quantile_columns_present(out, "time")
+    # Spot check numeric presence
+    row = out.reset_index().iloc[0]
+    assert pd.api.types.is_number(row["time_q1_q99_mean"]) or pd.isna(row["time_q1_q99_mean"])
+
+
+def test_compute_view_file_dask_quantiles(dummy_analyzer_quantiles: DummyAnalyzer):
+    pdf = build_base_df()
+    traces = dd.from_pandas(pdf, npartitions=2)
+    view_types = ["file_name", "proc_name"]
+    hlm = dummy_analyzer_quantiles._compute_high_level_metrics(
+        traces=traces, view_types=view_types, partition_size="64MB"
+    )
+    main_view = dummy_analyzer_quantiles._compute_main_view(
+        layer="posix", hlm=hlm, view_types=view_types, partition_size="64MB"
+    )
+
+    view_dd = dummy_analyzer_quantiles._compute_view(
+        layer="posix",
+        records=main_view,
+        view_key=("file_name",),
+        view_type="file_name",
+        view_types=view_types,
+    )
+    out = view_dd.compute()
+    assert list(out.index.names) == ["file_name"]
+    _assert_no_infinities(out)
+    _assert_quantile_columns_present(out, "time")

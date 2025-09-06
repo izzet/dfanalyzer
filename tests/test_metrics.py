@@ -2,7 +2,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dfanalyzer.metrics import set_main_metrics, set_view_metrics, set_cross_layer_metrics
+from dfanalyzer.metrics import (
+    set_cross_layer_metrics,
+    set_main_metrics,
+    set_quantile_metrics,
+    set_view_metrics,
+)
 
 
 # Ensure this module runs in both smoke and full CI modes
@@ -461,3 +466,67 @@ def test_set_cross_layer_metrics_derived_metrics_zero_denoms():
     # total fraction is 0/0 as well -> NA for both rows
     assert pd.isna(out.loc[0, "A_foo_time_frac_total"]) and pd.isna(out.loc[1, "A_foo_time_frac_total"])
     _assert_no_infinities(out)
+
+
+# ---------- set_quantile_metrics tests ----------
+
+
+def test_set_quantile_metrics_basic_extraction():
+    df = pd.DataFrame(
+        {
+            "time_q1_q99_stats": [[1.5, 0.5, 10], [3.0, 1.0, 20]],
+            "size_q5_q95_stats": [[100.0, 10.0, 8], [200.0, 20.0, 12]],
+        }
+    )
+
+    out = set_quantile_metrics(df.copy())
+
+    # Original columns dropped
+    assert "time_q1_q99_stats" not in out.columns
+    assert "size_q5_q95_stats" not in out.columns
+
+    # New columns created with correct values and dtypes
+    assert pytest.approx(out.loc[0, "time_q1_q99_mean"], rel=1e-6) == 1.5
+    assert pytest.approx(out.loc[1, "time_q1_q99_std"], rel=1e-6) == 1.0
+    assert out["time_q1_q99_count"].dtype.name in ("Int64", "Int32")
+    assert out.loc[0, "time_q1_q99_count"] == 10
+
+    assert pytest.approx(out.loc[0, "size_q5_q95_mean"], rel=1e-6) == 100.0
+    assert pytest.approx(out.loc[1, "size_q5_q95_std"], rel=1e-6) == 20.0
+    assert out.loc[1, "size_q5_q95_count"] == 12
+
+
+def test_set_quantile_metrics_handles_nan_triplets():
+    df = pd.DataFrame(
+        {
+            "time_q10_q90_stats": [[np.nan, np.nan, np.nan], [1.0, 0.0, 0]],
+        }
+    )
+
+    out = set_quantile_metrics(df.copy())
+
+    # First row NA triplet -> all NA
+    assert pd.isna(out.loc[0, "time_q10_q90_mean"]) and pd.isna(out.loc[0, "time_q10_q90_std"]) and pd.isna(
+        out.loc[0, "time_q10_q90_count"]
+    )
+    # Second row has values
+    assert pytest.approx(out.loc[1, "time_q10_q90_mean"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[1, "time_q10_q90_std"], rel=1e-6) == 0.0
+    assert out.loc[1, "time_q10_q90_count"] == 0
+
+
+def test_set_quantile_metrics_mixed_list_tuple_and_noop():
+    df = pd.DataFrame(
+        {
+            "time_q25_q75_stats": [(1.0, 0.2, 5), [2.0, 0.3, 6]],  # tuple and list
+            "plain_col": [42, 43],
+        }
+    )
+
+    out = set_quantile_metrics(df.copy())
+    # plain_col preserved
+    assert list(out["plain_col"]) == [42, 43]
+    # New columns present
+    assert "time_q25_q75_mean" in out.columns and "time_q25_q75_std" in out.columns and "time_q25_q75_count" in out.columns
+    # Stats dropped
+    assert "time_q25_q75_stats" not in out.columns

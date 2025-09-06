@@ -32,7 +32,13 @@ from .constants import (
     VIEW_TYPES,
     Layer,
 )
-from .metrics import set_cross_layer_metrics, set_main_metrics, set_view_metrics
+from .metrics import (
+    find_layer_time_metrics,
+    set_cross_layer_metrics,
+    set_main_metrics,
+    set_quantile_metrics,
+    set_view_metrics,
+)
 from .types import (
     AnalyzerResultType,
     RawStats,
@@ -552,7 +558,7 @@ class Analyzer(abc.ABC):
                     time_boundary = flat_views[view_key][f"{time_layer}_{time_metric}"].sum()
                 time_boundaries[view_type] = time_boundaries.get(view_type, {})
                 for layer in self.preset.layer_defs:
-                    layer_time_metrics = [col for col in view_cols if col.startswith(layer) and col.endswith(time_metric)]
+                    layer_time_metrics = find_layer_time_metrics(list(view_cols), layer, time_metric)
                     for layer_time_metric in layer_time_metrics:
                         time_boundaries[view_type][layer_time_metric] = time_boundary
         return time_boundaries
@@ -929,7 +935,6 @@ class Analyzer(abc.ABC):
                 with log_block("wait"):
                     wait([hlm, raw_stats])
 
-
         # Compute layers & views
         with console_block("Compute views"):
             with log_block("create_layers_and_views_tasks"):
@@ -1215,12 +1220,21 @@ class Analyzer(abc.ABC):
         with log_block("flatten_column_names", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
 
-        with log_block("set_unique_counts", layer=layer, view_key=view_key):
+        with log_block("set_quantile_metrics", layer=layer, view_key=view_key):
             if is_dask:
-                view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes).persist()
+                view = view.map_partitions(set_quantile_metrics)
+            else:
+                view = set_quantile_metrics(view)
+
+        with log_block("set_unique_counts+fix_dtypes", layer=layer, view_key=view_key):
+            if is_dask:
+                view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes)
             else:
                 view = set_unique_counts(view, layer=layer)
                 view = fix_dtypes(view)
+
+        if is_dask:
+            view = view.persist()
 
         return view
 
