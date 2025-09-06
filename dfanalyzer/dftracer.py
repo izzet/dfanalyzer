@@ -564,6 +564,12 @@ class DFTracerAnalyzer(Analyzer):
         metadata = raw_traces.query("type == 4")[["name", "value"]]
         file_hashes.index = file_hashes.index.astype(str)
         host_hashes.index = host_hashes.index.astype(str)
+        string_hashes.index = string_hashes.index.astype(str)
+        if is_dask:
+            file_hashes = file_hashes.persist()
+            host_hashes = host_hashes.persist()
+            string_hashes = string_hashes.persist()
+            metadata = metadata.persist()
         # print('file_hash dtype', traces["file_hash"].dtype)
         # print('host_hash dtype', traces["host_hash"].dtype)
         # print('file_hash index dtype', file_hashes.index.dtype)
@@ -580,10 +586,10 @@ class DFTracerAnalyzer(Analyzer):
             left_on="host_hash",
             right_index=True,
         )
-        self._file_hashes = file_hashes.persist() if is_dask else file_hashes
-        self._host_hashes = host_hashes.persist() if is_dask else host_hashes
-        self._string_hashes = string_hashes.persist() if is_dask else string_hashes
-        self._metadata = metadata.persist() if is_dask else metadata
+        self._file_hashes = file_hashes
+        self._host_hashes = host_hashes
+        self._string_hashes = string_hashes
+        self._metadata = metadata
         # print('>Traces:\n')
         # print(traces)
         # print('=' * 33)
