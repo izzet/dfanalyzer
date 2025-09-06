@@ -243,14 +243,19 @@ def set_quantile_metrics(df: pd.DataFrame):
     new_cols: Dict[str, pd.Series] = {}
 
     for stats_col in quantile_metrics:
-        base = stats_col.replace('_stats', '')
-        mean_col = f"{base}_mean"
-        std_col = f"{base}_std"
-        count_col = f"{base}_count"
+        stats = df[stats_col]
 
-        mean_series = pd.to_numeric(df[stats_col].str[0], errors='coerce').astype('Float64')
-        std_series = pd.to_numeric(df[stats_col].str[1], errors='coerce').astype('Float64')
-        count_series = pd.to_numeric(df[stats_col].str[2], errors='coerce').astype('Int64')
+        if stats.empty:
+            continue
+
+        col_base = stats_col.replace('_stats', '')
+        mean_col = f"{col_base}_mean"
+        std_col = f"{col_base}_std"
+        count_col = f"{col_base}_count"
+
+        mean_series = pd.to_numeric(stats.str[0], errors='coerce').astype('Float64')
+        std_series = pd.to_numeric(stats.str[1], errors='coerce').astype('Float64')
+        count_series = pd.to_numeric(stats.str[2], errors='coerce').astype('Int64')
 
         new_cols[mean_col] = mean_series
         new_cols[std_col] = std_series
