@@ -3,6 +3,9 @@ import pytest
 from dfanalyzer.utils.streaming import is_streaming_available
 
 
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
+
+
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
 def test_epoch_window_buffers_until_epoch_end():
     """Verify incoming dicts are buffered after epoch.start and emitted on epoch.end."""
