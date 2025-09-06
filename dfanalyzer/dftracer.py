@@ -552,10 +552,10 @@ class DFTracerAnalyzer(Analyzer):
         return columns
 
     def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
-        print('=' * 33)
-        print('Handling metadata:\n')
-        print('>Raw traces:\n')
-        print(raw_traces)
+        # print('=' * 33)
+        # print('Handling metadata:\n')
+        # print('>Raw traces:\n')
+        # print(raw_traces)
         is_dask = isinstance(raw_traces, dd.DataFrame)
         traces = raw_traces.query("type == 0")
         file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
@@ -564,10 +564,10 @@ class DFTracerAnalyzer(Analyzer):
         metadata = raw_traces.query("type == 4")[["name", "value"]]
         file_hashes.index = file_hashes.index.astype(str)
         host_hashes.index = host_hashes.index.astype(str)
-        print('file_hash dtype', traces["file_hash"].dtype)
-        print('host_hash dtype', traces["host_hash"].dtype)
-        print('file_hash index dtype', file_hashes.index.dtype)
-        print('host_hash index dtype', host_hashes.index.dtype)
+        # print('file_hash dtype', traces["file_hash"].dtype)
+        # print('host_hash dtype', traces["host_hash"].dtype)
+        # print('file_hash index dtype', file_hashes.index.dtype)
+        # print('host_hash index dtype', host_hashes.index.dtype)
         traces = traces.merge(
             file_hashes.rename(columns={"name": COL_FILE_NAME}),
             how="left",
@@ -584,9 +584,9 @@ class DFTracerAnalyzer(Analyzer):
         self._host_hashes = host_hashes.persist() if is_dask else host_hashes
         self._string_hashes = string_hashes.persist() if is_dask else string_hashes
         self._metadata = metadata.persist() if is_dask else metadata
-        print('>Traces:\n')
-        print(traces)
-        print('=' * 33)
+        # print('>Traces:\n')
+        # print(traces)
+        # print('=' * 33)
         return traces
 
     @staticmethod
