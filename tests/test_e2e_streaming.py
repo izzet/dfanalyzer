@@ -13,7 +13,10 @@ pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_e2e_zmq(tmp_path: pathlib.Path, epoch_posix_events: List[List[str]]) -> None:
+def test_e2e_zmq(
+    tmp_path: pathlib.Path,
+    dftracer_ai_logging_posix_events: List[List[str]],
+) -> None:
     """Synchronous test: parse toy JSON events and run the analyzer pipeline directly.
 
     This avoids network flakiness while exercising the same parsing and
@@ -42,10 +45,7 @@ def test_e2e_zmq(tmp_path: pathlib.Path, epoch_posix_events: List[List[str]]) ->
     extra_columns_fn = lambda json_dict: {"epoch": json_dict.get("epoch", None)}
 
     # Use realistic epoch lines from the test fixture (first epoch)
-    if not epoch_posix_events:
-        pytest.skip("no epoch data available in fixtures")
-
-    events = epoch_posix_events[0]
+    events = dftracer_ai_logging_posix_events[0]
 
     # Publisher: connect and push the toy messages
     def publisher():
@@ -55,7 +55,7 @@ def test_e2e_zmq(tmp_path: pathlib.Path, epoch_posix_events: List[List[str]]) ->
         time.sleep(0.2)
         for event in events:
             sock.send_string(event)
-            print('send line', event)
+            # print("send line", event)
             time.sleep(0.01)
         sock.close()
         ctx.term()

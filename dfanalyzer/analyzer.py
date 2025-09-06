@@ -27,6 +27,7 @@ from .constants import (
     COL_HOST_NAME,
     COL_PROC_NAME,
     COL_TIME_END,
+    COL_TIME_RANGE,
     COL_TIME_START,
     VIEW_TYPES,
     Layer,
@@ -106,7 +107,12 @@ class Analyzer(abc.ABC):
         self.debug = debug
         self.quantile_stats = quantile_stats
         self.layers = list(preset.layer_defs.keys())
-        self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
+        if preset.logical_views is None:
+            self.logical_views = {}
+        elif isinstance(preset.logical_views, dict):
+            self.logical_views = preset.logical_views
+        else:
+            self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.time_approximate = time_approximate
         self.time_granularity = time_granularity
@@ -524,6 +530,33 @@ class Analyzer(abc.ABC):
                 )
         return logical_views
 
+    def compute_time_boundaries(self, flat_views: Dict[ViewKey, pd.DataFrame]) -> ViewMetricBoundaries:
+        """Computes time boundaries for each metric in the flat views.
+
+        Args:
+            flat_views: A dictionary of flat views keyed by their view types.
+
+        Returns:
+            A dictionary of time boundaries keyed by their view types.
+        """
+        time_boundaries = {}
+        for view_key in flat_views:
+            view_cols = flat_views[view_key].columns
+            view_type = view_key[-1]
+            time_layer = self.get_time_boundary_layer()
+            time_metric = "time_sum" if self.is_view_process_based(view_key) else "time_max"
+            with log_block("calculate_time_boundary", view_key=view_key):
+                if self.time_sliced and view_type == COL_TIME_RANGE:
+                    time_boundary = self.time_granularity
+                else:
+                    time_boundary = flat_views[view_key][f"{time_layer}_{time_metric}"].sum()
+                time_boundaries[view_type] = time_boundaries.get(view_type, {})
+                for layer in self.preset.layer_defs:
+                    layer_time_metrics = [col for col in view_cols if col.startswith(layer) and col.endswith(time_metric)]
+                    for layer_time_metric in layer_time_metrics:
+                        time_boundaries[view_type][layer_time_metric] = time_boundary
+        return time_boundaries
+
     def compute_view(
         self,
         layer: Layer,
@@ -607,6 +640,9 @@ class Analyzer(abc.ABC):
 
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
+
+    def get_time_boundary_layer(self):
+        return list(self.preset.layer_defs)[0]
 
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         """Computes the total number of I/O events in the traces.
@@ -973,20 +1009,15 @@ class Analyzer(abc.ABC):
                     except Exception:
                         pass
 
+            # Compute time boundaries for flat views
+            with log_block("compute_time_boundaries"):
+                metric_boundaries.update(self.compute_time_boundaries(flat_views))
 
-            # Compute metric boundaries for flat views
-            with log_block("process_flat_views+metric_boundaries"):
+            # Process flat views
+            with log_block("process_flat_views"):
                 for view_key in flat_views:
                     if view_key in checkpointed_flat_views:
                         continue
-                    view_type = view_key[-1]
-                    top_layer = list(self.preset.layer_defs)[0]
-                    time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
-                    with log_block("calculate_metric_boundary", view_key=view_key):
-                        time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
-                        metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
-                        for layer in self.preset.layer_defs:
-                            metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
                     with log_block("process_flat_view", view_key=view_key):
                         # Process flat views to compute metrics and scores
                         flat_views[view_key] = self._process_flat_view(
@@ -994,6 +1025,7 @@ class Analyzer(abc.ABC):
                             view_key=view_key,
                             metric_boundaries=metric_boundaries,
                         )
+
         # Checkpoint flat views if enabled
         if self.checkpoint:
             with log_block("write_flat_view_checkpoints"):
@@ -1069,15 +1101,16 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
+            layer_derived_metrics = self.preset.derived_metrics[layer]
             if is_dask:
                 hlm = hlm.map_partitions(
                     self.set_layer_metrics,
-                    derived_metrics=self.preset.derived_metrics[layer],
+                    derived_metrics=layer_derived_metrics,
                 )
             else:
                 hlm = self.set_layer_metrics(
                     hlm=hlm,
-                    derived_metrics=self.preset.derived_metrics[layer],
+                    derived_metrics=layer_derived_metrics,
                 )
 
         with log_block("build_agg_dict", layer=layer):
@@ -1127,11 +1160,8 @@ class Analyzer(abc.ABC):
             local_view_types = records.index._meta.names
         else:
             local_view_types = records.index.names
-        # print("local_view_types", local_view_types, "for", view_key)
 
         local_view_types_diff = set(local_view_types).difference([view_type])
-
-        # print("local_view_types_diff", local_view_types_diff, "for", view_key)
 
         with log_block("build_agg_dict", layer=layer, view_key=view_key):
             view_agg = {}
@@ -1181,18 +1211,6 @@ class Analyzer(abc.ABC):
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
             view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
-            if is_dask:
-                view = view.map_partitions(
-                    set_view_metrics,
-                    is_view_process_based=is_view_process_based,
-                    time_granularity=self.time_granularity,
-                )
-            else:
-                view = set_view_metrics(
-                    view,
-                    is_view_process_based=is_view_process_based,
-                    time_granularity=self.time_granularity,
-                )
 
         with log_block("flatten_column_names", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
@@ -1214,13 +1232,21 @@ class Analyzer(abc.ABC):
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
+        with log_block("set_view_metrics", view_key=view_key):
+            flat_view = set_view_metrics(
+                flat_view,
+                is_view_process_based=is_view_process_based,
+                metric_boundaries=metric_boundaries[view_type],
+            )
         with log_block("set_cross_layer_metrics", view_key=view_key):
             flat_view = set_cross_layer_metrics(
                 flat_view,
-                layer_defs=self.preset.layer_defs,
-                layer_deps=self.preset.layer_deps,
                 async_layers=self.preset.async_layers,
+                derived_metrics=self.preset.derived_metrics,
                 is_view_process_based=is_view_process_based,
+                layers=self.layers,
+                layer_deps=self.preset.layer_deps,
+                time_boundary_layer=self.get_time_boundary_layer(),
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)

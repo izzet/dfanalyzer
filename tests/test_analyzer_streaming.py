@@ -12,7 +12,10 @@ pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_analyzer_dftracer_read_zmq(tmp_path: pathlib.Path, epoch_posix_events: List[List[str]]) -> None:
+def test_analyzer_dftracer_read_zmq(
+    tmp_path: pathlib.Path,
+    dftracer_ai_logging_posix_events: List[List[str]],
+) -> None:
     """Test DFTracerAnalyzer.read_zmq by publishing toy JSON lines over ZMQ.
 
     This verifies the stream parses incoming JSON lines into dictionaries
@@ -36,10 +39,7 @@ def test_analyzer_dftracer_read_zmq(tmp_path: pathlib.Path, epoch_posix_events: 
     )
 
     # use realistic epoch lines extracted from the test data
-    if not epoch_posix_events:
-        pytest.skip("no epoch data available in test fixtures")
-
-    events = epoch_posix_events[0]
+    events = dftracer_ai_logging_posix_events[0]
 
     def publisher():
         ctx = zmq.Context()

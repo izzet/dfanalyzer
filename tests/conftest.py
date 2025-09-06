@@ -12,7 +12,7 @@ def extract_test_data():
 
 
 @pytest.fixture(scope="session")
-def epoch_posix_events():
+def dftracer_ai_logging_posix_events():
     """Return up to 3 epochs extracted from a real trace file.
 
     Each epoch is a list of the original JSON lines (strings) starting with an

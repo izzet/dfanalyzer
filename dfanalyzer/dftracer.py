@@ -76,45 +76,25 @@ IGNORED_FUNC_NAMES = [
     "DLIOBenchmark.initialize",
     # 'DLIOBenchmark.run',
     "FileStorage.__init__",
-    "IndexedBinaryMMapReader.__init__",
-    "IndexedBinaryMMapReader.load_index",
-    "IndexedBinaryMMapReader.next",
-    "IndexedBinaryMMapReader.read_index",
-    "NPZReader.__init__",
-    "NPZReader.next",
-    "NPZReader.read_index",
-    "PyTorchCheckpointing.__init__",
-    "PyTorchCheckpointing.finalize",
-    "PyTorchCheckpointing.get_tensor",
-    "SCRPyTorchCheckpointing.__init__",
-    "SCRPyTorchCheckpointing.finalize",
-    "SCRPyTorchCheckpointing.get_tensor",
-    "TFCheckpointing.__init__",
-    "TFCheckpointing.finalize",
-    "TFCheckpointing.get_tensor",
-    "TFDataLoader.__init__",
-    "TFDataLoader.finalize",
-    "TFDataLoader.next",
-    "TFDataLoader.read",
-    "TFFramework.get_loader",
-    "TFFramework.init_loader",
-    "TFFramework.is_nativeio_available",
-    "TFFramework.trace_object",
-    "TFReader.__init__",
-    "TFReader.next",
-    "TFReader.read_index",
-    "TorchDataLoader.__init__",
-    "TorchDataLoader.finalize",
-    "TorchDataLoader.next",
-    "TorchDataLoader.read",
     "TorchDataset.__init__",
-    # 'TorchDataset.worker_init',
-    "TorchFramework.get_loader",
-    "TorchFramework.init_loader",
-    "TorchFramework.is_nativeio_available",
-    "TorchFramework.trace_object",
+    # "TorchDataset.worker_init",
 ]
 IGNORED_FUNC_PATTERNS = [
+    "Checkpointing.__init__",
+    "Checkpointing.finalize",
+    "Checkpointing.get_tensor",
+    "DataLoader.__init__",
+    "DataLoader.finalize",
+    "DataLoader.get_tensor",
+    "DataLoader.next",
+    "Framework.get_loader",
+    "Framework.init_loader",
+    "Framework.is_nativeio_available",
+    "Framework.trace_object",
+    "Reader.__init__",
+    "Reader.load_index",
+    "Reader.next",
+    "Reader.read_index",
     ".save_state",
     "checkpoint_end_",
     "checkpoint_start_",
@@ -342,6 +322,10 @@ def load_json(
 
 
 class DFTracerAnalyzer(Analyzer):
+    def __init__(self, preset, assign_epochs=False, **kwargs):
+        super().__init__(preset, **kwargs)
+        self.assign_epochs = assign_epochs
+
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         with log_block("glob_files"):
             pfw_pattern, pfw_gz_pattern = [], []
@@ -479,6 +463,17 @@ class DFTracerAnalyzer(Analyzer):
             traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
             traces = traces[~traces[COL_FUNC_NAME].str.contains("|".join(IGNORED_FUNC_PATTERNS))]
 
+        # Set epochs
+        with log_block("assign_epochs"):
+            if self.assign_epochs:
+                if "epoch" not in self.preset.layer_defs:
+                    raise ValueError("Epoch layer definition is missing")
+                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
+                epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
+                epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
+                epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
+                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+
         with log_block("wait"):
             _ = wait(traces)
 
@@ -512,6 +507,11 @@ class DFTracerAnalyzer(Analyzer):
 
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
+
+    def get_time_boundary_layer(self):
+        if self.assign_epochs:
+            return "epoch"
+        return super().get_time_boundary_layer()
 
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
@@ -594,10 +594,6 @@ class DFTracerAnalyzer(Analyzer):
         return traces.rename(columns=TRACE_COL_MAPPING)
 
     @staticmethod
-    def _set_epochs(df: pd.DataFrame, epochs: pd.DataFrame):
-        return df.assign(epoch=np.digitize(df["time_range"], bins=epochs["time_range"], right=False))
-
-    @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
         base_condition = df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna()
 
@@ -620,6 +616,24 @@ class DFTracerAnalyzer(Analyzer):
     @staticmethod
     def _sanitize_size(df: pd.DataFrame):
         df["size"] = df["size"].replace(0, pd.NA)
+        return df
+
+    @staticmethod
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
         return df
 
     @staticmethod

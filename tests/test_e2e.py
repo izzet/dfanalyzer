@@ -75,27 +75,32 @@ def _test_e2e(
     if trace_path.endswith("darshan-posix"):
         view_types = ["file_name", "proc_name"]
 
-    dfa = init_with_hydra(
-        hydra_overrides=[
-            f"analyzer={analyzer}",
-            f"analyzer/preset={preset}",
-            f"analyzer.checkpoint={checkpoint}",
-            f"analyzer.checkpoint_dir={checkpoint_dir}",
-            "cluster=external",
-            f"cluster.restart_on_connect={True}",
-            f"cluster.scheduler_address={scheduler_address}",
-            f"hydra.run.dir={tmp_path}",
-            f"hydra.runtime.output_dir={tmp_path}",
-            "input=file",
-            f"input.path={trace_path}",
-            f"view_types=[{','.join(view_types)}]",
-        ]
-    )
+    hydra_overrides = [
+        f"analyzer={analyzer}",
+        f"analyzer/preset={preset}",
+        f"analyzer.checkpoint={checkpoint}",
+        f"analyzer.checkpoint_dir={checkpoint_dir}",
+        "cluster=external",
+        f"cluster.restart_on_connect={True}",
+        f"cluster.scheduler_address={scheduler_address}",
+        f"hydra.run.dir={tmp_path}",
+        f"hydra.runtime.output_dir={tmp_path}",
+        f"input.path={trace_path}",
+        f"view_types=[{','.join(view_types)}]",
+    ]
+
+    assign_epochs = analyzer == "dftracer" and preset == "dlio"
+    if assign_epochs:
+        hydra_overrides.append("analyzer.assign_epochs=True")
+
+    dfa = init_with_hydra(hydra_overrides=hydra_overrides)
 
     assert dfa.hydra_config.analyzer.checkpoint == checkpoint
     assert dfa.hydra_config.analyzer.checkpoint_dir == checkpoint_dir
     assert dfa.hydra_config.analyzer.preset.name == preset
     assert dfa.hydra_config.input.path == trace_path
+    if assign_epochs:
+        assert dfa.hydra_config.analyzer.assign_epochs
 
     # Run the main function
     result = dfa.analyze_file()

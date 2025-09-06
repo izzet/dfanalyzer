@@ -214,6 +214,7 @@ HUMANIZED_METRICS = dict(
 )
 HUMANIZED_VIEW_TYPES = dict(
     app_name='App',
+    epoch='Epoch',
     file_dir='File Directory',
     file_name='File',
     file_pattern='File Pattern',
