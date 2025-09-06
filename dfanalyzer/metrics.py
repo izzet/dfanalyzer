@@ -167,12 +167,15 @@ def set_cross_layer_metrics(
         o_time_frac_total_col = o_time_col.replace(time_metric, 'time_frac_total')
 
         child_time_sum = sum(df[f"{child}_{time_metric}"].fillna(0) for child in child_layers)
-        df[o_time_col] = np.maximum(layer_time - child_time_sum, 0)
-        df[o_time_col] = df[o_time_col].astype('Float64')
+        o_time = np.maximum(layer_time - child_time_sum, 0)
+        o_time_sum = o_time.sum()
 
+        df[o_time_col] = pd.array(o_time, dtype='Float64')
         df[o_time_frac_boundary_col] = df[o_time_col] / df[time_boundary_metric]
         df[o_time_frac_self_col] = df[o_time_col] / layer_time
-        df[o_time_frac_total_col] = df[o_time_col] / df[o_time_col].sum()
+        df[o_time_frac_total_col] = pd.NA
+        if o_time_sum > 0:
+            df[o_time_frac_total_col] = df[o_time_col] / o_time_sum
 
         new_metrics.extend([o_time_col, o_time_frac_self_col, o_time_frac_boundary_col, o_time_frac_total_col])
 
@@ -194,10 +197,13 @@ def set_cross_layer_metrics(
             dm_time_frac_total_col = f"{dm_col}_time_frac_total"
 
             dm_time = df[dm_time_col]
+            dm_time_sum = dm_time.sum()
 
             df[dm_time_frac_boundary_col] = dm_time / df[time_boundary_metric]
             df[dm_time_frac_parent_col] = dm_time / df[f"{layer}_{time_metric}"]
-            df[dm_time_frac_total_col] = dm_time / df[dm_time_col].sum()
+            df[dm_time_frac_total_col] = pd.NA
+            if dm_time_sum > 0:
+                df[dm_time_frac_total_col] = dm_time / dm_time_sum
 
             new_metrics.extend([dm_time_frac_boundary_col, dm_time_frac_parent_col, dm_time_frac_total_col])
 
@@ -214,19 +220,22 @@ def set_cross_layer_metrics(
             u_time_frac_total_col = f"u_{async_layer}_time_frac_total"
 
             layer_time = df[time_col]
-
             u_time = (layer_time - compute_time).clip(lower=0).astype('Float64')
-            df[u_time_col] = u_time
+            u_time_sum = u_time.sum()
+
+            df[u_time_col] = pd.array(u_time, dtype='Float64')
             df[u_time_frac_self_col] = u_time / layer_time
             df[u_time_frac_boundary_col] = u_time / df[time_boundary_metric]
-            df[u_time_frac_total_col] = u_time / u_time.sum()
+            df[u_time_frac_total_col] = pd.NA
+            if u_time_sum > 0:
+                df[u_time_frac_total_col] = u_time / u_time_sum
 
             new_metrics.extend([u_time_col, u_time_frac_boundary_col, u_time_frac_self_col, u_time_frac_total_col])
 
             parent_layer = layer_deps.get(async_layer)
             if parent_layer:
                 u_time_frac_parent_col = f"u_{async_layer}_time_frac_parent"
-                df[u_time_frac_parent_col] = df[u_time_col] / df[f"{parent_layer}_{time_metric}"]
+                df[u_time_frac_parent_col] = u_time / df[f"{parent_layer}_{time_metric}"]
                 new_metrics.append(u_time_frac_parent_col)
 
     df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
