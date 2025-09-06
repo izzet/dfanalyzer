@@ -1064,7 +1064,7 @@ class Analyzer(abc.ABC):
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
 
         hlm_agg = dict(HLM_AGG)
-        hlm_agg.update({col: sum for col in bin_cols})
+        hlm_agg.update({col: "sum" for col in bin_cols})
 
         if isinstance(traces, dd.DataFrame):
             hlm_agg.update({col: unique_set() for col in view_types_diff})
