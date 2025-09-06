@@ -2,14 +2,12 @@ import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 import pytest
-
-from typing import List, Optional, Dict
-
+from dask.distributed import Client, LocalCluster
 from dfanalyzer.analyzer import Analyzer
 from dfanalyzer.config import AnalyzerPresetConfigPOSIX, AnalyzerPresetConfigDLIO
 from dfanalyzer.constants import VIEW_TYPES
-from dask.distributed import Client, LocalCluster
-
+from dfanalyzer.metrics import set_view_metrics
+from typing import List, Optional, Dict
 
 # Ensure this module runs in both smoke and full CI modes
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -451,10 +449,13 @@ def test_compute_view_proc_pandas_basic(dummy_analyzer: DummyAnalyzer):
     cols = out.columns.tolist()
     assert "time_sum" in cols and "count_sum" in cols and "size_sum" in cols
     assert "file_name_nunique" in cols
-    assert "time_per" in cols and "time_util" in cols and "count_per" in cols and "size_per" in cols
-    assert "ops_slope" in cols  # from set_view_metrics
+    # Enrich to compute frac totals and ops metrics
+    enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=True)
+    ecols = enriched.columns.tolist()
+    assert "time_frac_total" in ecols and "count_frac_total" in ecols and "size_frac_total" in ecols
+    assert "ops_slope" in ecols  # from set_view_metrics
 
-    grp = out.reset_index()
+    grp = enriched.reset_index()
     row_p = grp[grp["proc_name"] == "p#h#1#t"].iloc[0]
     # Aggregates
     assert pytest.approx(row_p["time_sum"], rel=1e-6) == 3.0
@@ -462,12 +463,10 @@ def test_compute_view_proc_pandas_basic(dummy_analyzer: DummyAnalyzer):
     assert pytest.approx(row_p["size_sum"], rel=1e-6) == 300.0
     # Min across grouped (proc,file) rows after pre-grouping: zero got summed into 10
     assert pytest.approx(row_p["count_min"], rel=1e-6) == 10.0
-    # Per/util for process-based view uses time_sum
-    assert pytest.approx(row_p["time_util"], rel=1e-6) == 3.0
-    assert pytest.approx(row_p["time_per"], rel=1e-6) == 0.5
-    assert pytest.approx(row_p["count_per"], rel=1e-6) == 0.5
-    assert pytest.approx(row_p["size_per"], rel=1e-6) == 0.5
-    # Ops slope based on per-values should be 1.0 (time_per/count_per)
+    # Frac totals should be 0.5 for both procs; slope 1.0
+    assert pytest.approx(row_p["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["count_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["size_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_p["ops_slope"], rel=1e-6) == 1.0
     # Unique file_name count
     assert row_p["file_name_nunique"] == 1
@@ -494,17 +493,20 @@ def test_compute_view_file_pandas_basic(dummy_analyzer: DummyAnalyzer):
     assert list(out.index.names) == ["file_name"]
     _assert_no_infinities(out)
 
-    grp = out.reset_index()
+    enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=False)
+    grp = enriched.reset_index()
     row_f1 = grp[grp["file_name"] == "f1"].iloc[0]
     row_f2 = grp[grp["file_name"] == "f2"].iloc[0]
     # Process-unaware time metrics use max over per-proc-summed time
     assert pytest.approx(row_f1["time_max"], rel=1e-6) == 3.0
     assert pytest.approx(row_f2["time_max"], rel=1e-6) == 3.0
-    assert pytest.approx(row_f1["time_util"], rel=1e-6) == 3.0
-    assert pytest.approx(row_f2["time_util"], rel=1e-6) == 3.0
-    # Percentages based on time_max when not process-based
-    assert pytest.approx(row_f1["time_per"], rel=1e-6) == 0.5
-    assert pytest.approx(row_f2["time_per"], rel=1e-6) == 0.5
+    # Frac totals 0.5 each
+    assert pytest.approx(row_f1["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f1["count_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["count_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f1["size_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["size_frac_total"], rel=1e-6) == 0.5
     # Unique proc_name count per file
     assert row_f1["proc_name_nunique"] == 1
     assert row_f2["proc_name_nunique"] == 1
@@ -530,6 +532,12 @@ def test_compute_view_proc_dask_basic(dummy_analyzer: DummyAnalyzer):
     out = view_dd.compute() if isinstance(view_dd, dd.DataFrame) else view_dd
     assert list(out.index.names) == ["proc_name"]
     _assert_no_infinities(out)
+    enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=True)
+    grp = enriched.reset_index()
+    row_p = grp[grp["proc_name"] == "p#h#1#t"].iloc[0]
+    assert pytest.approx(row_p["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["count_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["size_frac_total"], rel=1e-6) == 0.5
 
 
 def test_compute_view_file_dask_basic(dummy_analyzer: DummyAnalyzer):
@@ -552,3 +560,9 @@ def test_compute_view_file_dask_basic(dummy_analyzer: DummyAnalyzer):
     out = view_dd.compute() if isinstance(view_dd, dd.DataFrame) else view_dd
     assert list(out.index.names) == ["file_name"]
     _assert_no_infinities(out)
+    enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=False)
+    grp = enriched.reset_index()
+    row_f1 = grp[grp["file_name"] == "f1"].iloc[0]
+    row_f2 = grp[grp["file_name"] == "f2"].iloc[0]
+    assert pytest.approx(row_f1["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["time_frac_total"], rel=1e-6) == 0.5
