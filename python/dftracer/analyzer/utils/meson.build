@@ -14,5 +14,5 @@ py.install_sources(
         'notebook_utils.py',
         'warning_utils.py',
     ],
-    subdir: 'dfanalyzer/utils',
+    subdir: 'dftracer/analyzer/utils',
 )

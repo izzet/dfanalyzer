@@ -4,12 +4,11 @@ import dask
 import dataclasses as dc
 import inflect
 import pandas as pd
-from hydra.core.hydra_config import HydraConfig
 from rich.console import Console
 from rich.table import Table
 from typing import Dict, List, Optional
 
-from .constants import COL_FILE_NAME, COL_PROC_NAME, Layer, MiB
+from .constants import COL_PROC_NAME, Layer, MiB
 from .types import (
     AnalyzerResultType,
     RawStats,

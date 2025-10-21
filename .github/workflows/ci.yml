@@ -78,8 +78,6 @@ jobs:
             -Csetup-args="--prefix=$HOME/.local" \
             -Csetup-args="-Denable_tests=true" \
             -Csetup-args="-Denable_tools=true"
-          # temporary to test dftracer-utils
-          pip install --index-url https://test.pypi.org/simple/ dftracer-utils
 
       - name: Determine test type
         id: test-type
@@ -101,10 +99,10 @@ jobs:
         run: |
           if [[ "${{ steps.test-type.outputs.run_full }}" == "true" ]]; then
             echo "Running FULL test suite"
-            pytest -m full --verbose --cov=dfanalyzer --cov-report=xml
+            pytest -m full --verbose --cov=dftracer.analyzer --cov-report=xml
           else
             echo "Running SMOKE test suite"
-            pytest -m smoke --verbose --cov=dfanalyzer --cov-report=xml
+            pytest -m smoke --verbose --cov=dftracer.analyzer --cov-report=xml
           fi
 
       - name: Run DFAnalyzer with external cluster

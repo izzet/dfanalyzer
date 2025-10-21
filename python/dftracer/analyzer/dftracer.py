@@ -18,7 +18,6 @@ from .analyzer import Analyzer
 from .constants import (
     COL_ACC_PAT,
     COL_COUNT,
-    COL_EPOCH,
     COL_FILE_NAME,
     COL_FUNC_NAME,
     COL_HOST_NAME,
@@ -31,10 +30,9 @@ from .constants import (
     POSIX_IO_CAT_MAPPING,
     POSIX_METADATA_FUNCTIONS,
     IOCategory,
-    Layer,
 )
 from .types import ViewType
-from .utils.log_utils import console_block, log_block
+from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
 

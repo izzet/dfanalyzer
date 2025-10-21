@@ -11,7 +11,7 @@ cpp = meson.get_compiler('cpp')
 py = import('python').find_installation(pure: false)
 py_dep = py.dependency()
 
-subdir('dfanalyzer')
+subdir('python/dftracer/analyzer')
 
 if get_option('enable_tools')
     subdir('tools')

@@ -6,7 +6,7 @@ from hydra.conf import HelpConf, JobConf
 from omegaconf import MISSING
 from typing import Any, Dict, List, Optional
 
-from .constants import COL_TIME_RANGE, VIEW_TYPES
+from .constants import COL_TIME_RANGE
 from .types import ViewMetricBoundaries
 from .utils.env_utils import get_bool_env_var, get_int_env_var
 
@@ -187,21 +187,21 @@ class AnalyzerConfig:
 
 @dc.dataclass
 class DarshanAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.darshan.DarshanAnalyzer"
+    _target_: str = "dftracer.analyzer.darshan.DarshanAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e3
 
 
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
+    _target_: str = "dftracer.analyzer.dftracer.DFTracerAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 
 
 @dc.dataclass
 class RecorderAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.recorder.RecorderAnalyzer"
+    _target_: str = "dftracer.analyzer.recorder.RecorderAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e7
 
@@ -213,7 +213,7 @@ class ClusterConfig:
 
 @dc.dataclass
 class ExternalClusterConfig(ClusterConfig):
-    _target_: str = "dfanalyzer.cluster.ExternalCluster"
+    _target_: str = "dftracer.analyzer.cluster.ExternalCluster"
     restart_on_connect: Optional[bool] = False
     scheduler_address: Optional[str] = MISSING
 
@@ -274,25 +274,25 @@ class OutputConfig:
 
 @dc.dataclass
 class ConsoleOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.ConsoleOutput"
+    _target_: str = "dftracer.analyzer.output.ConsoleOutput"
     show_debug: Optional[bool] = False
     show_header: Optional[bool] = True
 
 
 @dc.dataclass
 class CSVOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.CSVOutput"
+    _target_: str = "dftracer.analyzer.output.CSVOutput"
 
 
 @dc.dataclass
 class SQLiteOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.SQLiteOutput"
+    _target_: str = "dftracer.analyzer.output.SQLiteOutput"
     run_db_path: Optional[str] = ""
 
 
 @dc.dataclass
 class CustomJobConfig(JobConf):
-    name: str = "dfanalyzer"
+    name: str = "dftracer.analyzer"
 
 
 @dc.dataclass
