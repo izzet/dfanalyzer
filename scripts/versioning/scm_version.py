@@ -27,6 +27,15 @@ def parse_describe(desc):
 
 def compute_version(repo):
     if not repo:
+        # No git repo, check for VERSION file (used in sdist)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        version_file = os.path.join(script_dir, 'VERSION.txt')
+        if os.path.exists(version_file):
+            try:
+                with open(version_file, 'r', encoding='utf-8') as f:
+                    return f.read().strip()
+            except Exception:
+                pass
         return '0.0.0'
     # 1) Prefer git describe (if tags exist)
     desc = sh('git', '-C', repo, 'describe', '--tags', '--long', '--dirty')
@@ -68,9 +77,13 @@ def main():
     elif mode == 'tuple':
         print(vt)
     elif mode == 'commit':
-        print('')  # you don’t want +hash
+        print('')
     elif mode == 'write':
         out = sys.argv[3] if len(sys.argv) >= 4 else 'scripts/versioning/VERSION.txt'
+        # Ensure the directory exists
+        out_dir = os.path.dirname(out)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
         with open(out, 'w', encoding='utf-8') as f:
             f.write(ver + '\n')
     else:
