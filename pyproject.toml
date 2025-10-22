@@ -1,10 +1,10 @@
 [build-system]
 build-backend = "mesonpy"
-requires = ["meson-python>=0.15.0"]
+requires = ["meson-python>=0.15.0", "meson>=1.5.0"]
 
 [project]
 name = "dfanalyzer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Analyze, visualize, and understand I/O performance issues in HPC workflows"
 authors = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
 maintainers = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
@@ -75,3 +75,7 @@ quote-style = "preserve"
 
 [tool.spin]
 package = 'dftracer.analyzer'
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+version_file = "python/dftracer/analyzer/_version.py"

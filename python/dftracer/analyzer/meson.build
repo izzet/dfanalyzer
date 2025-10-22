@@ -1,5 +1,6 @@
 py.install_sources(
     [
+        ver_py,
         '__init__.py',
         '__main__.py',
         'analysis.py',
