@@ -1,5 +1,5 @@
 project(
-    'dfanalyzer',
+    'dftracer-analyzer',
     ['c', 'cpp'],
     meson_version: '>= 1.5.0',
     version: run_command(['scripts/versioning/scm_version.py', 'version'], check: true).stdout().strip(),
