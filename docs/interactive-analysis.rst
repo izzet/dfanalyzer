@@ -35,7 +35,7 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
 
 .. code-block:: python
 
-   from dfanalyzer import init_with_hydra
+   from dftracer.analyzer import init_with_hydra
 
    run_dir = f"./unet3d_v100_hdf5"
    time_granularity = 5  # 5 seconds

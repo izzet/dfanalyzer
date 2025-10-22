@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
 
-from .types import Layer, MetricBoundaries, Score
+from .types import Layer, Score
 
 
 INTENSITY_MIN = 1 / 1024

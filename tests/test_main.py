@@ -2,13 +2,13 @@ import pathlib
 import pytest
 import random
 from dask.distributed import LocalCluster
-from dfanalyzer import init_with_hydra
+from dftracer.analyzer import init_with_hydra
 from glob import glob
 
 
 # Full test matrix for comprehensive testing
 full_analyzer_trace_params = [
-    # ("darshan", "posix", "tests/data/extracted/darshan-posix"),
+    ("darshan", "posix", "tests/data/extracted/darshan-posix"),
     ("darshan", "posix", "tests/data/extracted/darshan-posix-dxt"),
     ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio"),
     ("dftracer", "posix", "tests/data/extracted/dftracer-posix"),

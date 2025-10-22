@@ -1,10 +1,10 @@
 [build-system]
 build-backend = "mesonpy"
-requires = ["meson-python>=0.15.0"]
+requires = ["meson-python>=0.15.0", "meson>=1.5.0"]
 
 [project]
-name = "dfanalyzer"
-version = "0.1.0"
+name = "dftracer-analyzer"
+dynamic = ["version"]
 description = "Analyze, visualize, and understand I/O performance issues in HPC workflows"
 authors = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
 maintainers = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
@@ -36,15 +36,16 @@ dependencies = [
     "rich~=14.1.0",
     "strenum>=0.4",
     "structlog>=25",
-    "zindex_py @ git+https://github.com/hariharan-devarajan/zindex.git@fix-pybind-installation",
+    # "dftracer-utils>=0.0.4"
+    "dftracer-utils @ git+https://github.com/LLNL/dftracer-utils.git@5eca77c1d1826045eee7afec1e03f3b13e14e046",
 ]
 
 [project.optional-dependencies]
 darshan = ["darshan>=3.4"]
 
 [project.scripts]
-dfanalyzer = "dfanalyzer.__main__:main"
-dfanalyzer-cluster = "dfanalyzer.cluster:main"
+dfanalyzer = "dftracer.analyzer.__main__:main"
+dfanalyzer-cluster = "dftracer.analyzer.cluster:main"
 
 [project.urls]
 documentation = "https://dfanalyzer.readthedocs.io/en/latest/"
@@ -73,4 +74,8 @@ line-length = 119
 quote-style = "preserve"
 
 [tool.spin]
-package = 'dfanalyzer'
+package = 'dftracer.analyzer'
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+version_file = "python/dftracer/analyzer/_version.py"
