@@ -75,7 +75,7 @@ class DarshanAnalyzer(Analyzer):
             job_time=self.job_time,
             time_granularity=self.time_granularity,
             time_resolution=self.time_resolution,
-            total_count=len(file_name_view),
+            total_event_count=len(file_name_view),
         )
 
         # return file_name_view
