@@ -37,7 +37,7 @@ dependencies = [
     "strenum>=0.4",
     "structlog>=25",
     # "dftracer-utils>=0.0.4"
-    "dftracer-utils @ git+https://github.com/rayandrew/dftracer-utils.git@db4125b660367bff7a0c81c6dec93da9be770f51",
+    "dftracer-utils @ git+https://github.com/LLNL/dftracer-utils.git@5eca77c1d1826045eee7afec1e03f3b13e14e046",
 ]
 
 [project.optional-dependencies]
