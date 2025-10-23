@@ -21,7 +21,7 @@ from .utils.warning_utils import filter_warnings
 
 
 try:
-    __version__ = version("dfanalyzer")
+    __version__ = version("dftracer-analyzer")
 except PackageNotFoundError:
     # package is not installed
     pass
