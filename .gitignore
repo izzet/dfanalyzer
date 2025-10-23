@@ -197,3 +197,4 @@ cython_debug/
 .dfanalyzer
 outputs/
 tmp/
+VERSION.txt

@@ -32,6 +32,13 @@ if ver_out != ''
   endif
 endif
 
+# Write VERSION.txt to scripts/versioning/ before creating dist
+# We need to pass the version explicitly since .git won't be available
+meson.add_dist_script(
+  'sh', '-c',
+  'cd "$MESON_DIST_ROOT" && echo "' + version + '" > scripts/versioning/VERSION.txt'
+)
+
 conf = configuration_data()
 conf.set('VERSION', version)
 conf.set('VERSION_TUPLE', version_tuple_lit)
