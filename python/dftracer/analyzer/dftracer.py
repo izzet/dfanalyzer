@@ -38,21 +38,6 @@ logger = structlog.get_logger()
 
 CAT_POSIX = "POSIX"
 CAT_STDIO = "STDIO"
-COND_CHECKPOINT = {
-    "cat": {"checkpoint"},
-    "name": {"TFCheckpointing.checkpoint"},
-}
-COND_COMPUTE = {
-    "cat": {"compute"},
-    "name": {"TFFramework.compute", "compute", "cpu"},
-}
-COND_READ = {
-    "cat": {"IO"},
-    "name": {
-        "TFReader._parse_image",
-        "TorchDataset.__getitem__",
-    },
-}
 IGNORED_FILE_PATTERNS = [
     "/dev/",
     "/etc/",
@@ -73,48 +58,28 @@ IGNORED_FUNC_NAMES = [
     "DLIOBenchmark.initialize",
     # 'DLIOBenchmark.run',
     "FileStorage.__init__",
-    "IndexedBinaryMMapReader.__init__",
-    "IndexedBinaryMMapReader.load_index",
-    "IndexedBinaryMMapReader.next",
-    "IndexedBinaryMMapReader.read_index",
-    "NPZReader.__init__",
-    "NPZReader.next",
-    "NPZReader.read_index",
-    "PyTorchCheckpointing.__init__",
-    "PyTorchCheckpointing.finalize",
-    "PyTorchCheckpointing.get_tensor",
-    "SCRPyTorchCheckpointing.__init__",
-    "SCRPyTorchCheckpointing.finalize",
-    "SCRPyTorchCheckpointing.get_tensor",
-    "TFCheckpointing.__init__",
-    "TFCheckpointing.finalize",
-    "TFCheckpointing.get_tensor",
-    "TFDataLoader.__init__",
-    "TFDataLoader.finalize",
-    "TFDataLoader.next",
-    "TFDataLoader.read",
-    "TFFramework.get_loader",
-    "TFFramework.init_loader",
-    "TFFramework.is_nativeio_available",
-    "TFFramework.trace_object",
-    "TFReader.__init__",
-    "TFReader.next",
-    "TFReader.read_index",
-    "TorchDataLoader.__init__",
-    "TorchDataLoader.finalize",
-    "TorchDataLoader.next",
-    "TorchDataLoader.read",
     "TorchDataset.__init__",
-    # 'TorchDataset.worker_init',
-    "TorchFramework.get_loader",
-    "TorchFramework.init_loader",
-    "TorchFramework.is_nativeio_available",
-    "TorchFramework.trace_object",
+    # "TorchDataset.worker_init",
 ]
 IGNORED_FUNC_PATTERNS = [
-    '.save_state',
-    'checkpoint_end_',
-    'checkpoint_start_',
+    "Checkpointing.__init__",
+    "Checkpointing.finalize",
+    "Checkpointing.get_tensor",
+    "DataLoader.__init__",
+    "DataLoader.finalize",
+    "DataLoader.get_tensor",
+    "DataLoader.next",
+    "Framework.get_loader",
+    "Framework.init_loader",
+    "Framework.is_nativeio_available",
+    "Framework.trace_object",
+    "Reader.__init__",
+    "Reader.load_index",
+    "Reader.next",
+    "Reader.read_index",
+    ".save_state",
+    "checkpoint_end_",
+    "checkpoint_start_",
 ]
 TRACE_COL_MAPPING = {
     'dur': COL_TIME,
@@ -662,9 +627,9 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _sanitize_size_offset(df: pd.DataFrame):
-        df["size"] = df["size"].replace(0, np.nan)
+        df["size"] = df["size"].replace(0, pd.NA)
         if "offset" in df.columns:
-            df["offset"] = df["offset"].replace(0, np.nan)
+            df["offset"] = df["offset"].replace(0, pd.NA)
         return df
 
     @staticmethod
