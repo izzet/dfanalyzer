@@ -76,6 +76,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'data_loader_fork',
             'reader',
             'reader_posix',
+            'posix',
             # 'reader_posix_lustre',
             # 'reader_posix_ssd',
             # 'checkpoint_posix_lustre',
@@ -89,6 +90,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': {},
             'compute': {},
             'fetch_data': {},
+            'checkpoint': {},
             'data_loader': {
                 'init': 'func_name.str.contains("init")',
                 'item': 'func_name.str.contains("item")',
@@ -100,10 +102,10 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
                 'preprocess': 'func_name.str.contains(".preprocess")',
                 'sample': 'func_name.str.contains(".get_sample")',
             },
+            'posix': DERIVED_POSIX_METRICS,
             'reader_posix': DERIVED_POSIX_METRICS,
             # 'reader_posix_lustre': DERIVED_POSIX_METRICS,
             # 'reader_posix_ssd': DERIVED_POSIX_METRICS,
-            'checkpoint': {},
             'checkpoint_posix': DERIVED_POSIX_METRICS,
             # 'checkpoint_posix_lustre': DERIVED_POSIX_METRICS,
             # 'checkpoint_posix_ssd': DERIVED_POSIX_METRICS,
@@ -119,17 +121,18 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': 'func_name == "DLIOBenchmark._train"',
             'compute': 'cat == "ai_framework"',
             'fetch_data': 'func_name.isin(["<module>.iter", "fetch-data.iter", "loop.iter"])',
+            'checkpoint': 'cat == "checkpoint"',
             'data_loader': 'cat == "data_loader" & ~func_name.isin(["loop.iter", "loop.yield"])',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader"',
+            'posix': 'cat.str.contains("posix|stdio")',
             'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
             # 'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
             # 'reader_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_ssd")',
-            'checkpoint': 'cat == "checkpoint"',
             'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
             # 'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
             # 'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
-            'other_posix': 'cat.isin(["posix", "stdio"])',
+            # 'other_posix': 'cat.isin(["posix", "stdio"]) & func_name != "fork"',
             # 'other_posix_lustre': 'cat.isin(["posix_lustre", "stdio_lustre"])',
             # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
         }
@@ -141,17 +144,18 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': 'training',
             'compute': 'epoch',
             'fetch_data': 'epoch',
+            'checkpoint': 'epoch',
             'data_loader': 'fetch_data',
             'data_loader_fork': 'fetch_data',
             'reader': 'data_loader',
+            'posix': None,
             'reader_posix': 'reader',
             # 'reader_posix_lustre': 'reader',
-            # 'reader_posix_ssd': 'reader_posix',
-            'checkpoint': 'epoch',
+            # 'reader_posix_ssd': 'reader',
             'checkpoint_posix': 'checkpoint',
             # 'checkpoint_posix_lustre': 'checkpoint',
             # 'checkpoint_posix_ssd': 'checkpoint',
-            'other_posix': None,
+            # 'other_posix': None,
             # 'other_posix_lustre': 'other_posix',
             # 'other_posix_ssd': 'other_posix',
         }
@@ -170,12 +174,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
-    unscored_metrics: Optional[List[str]] = dc.field(
-        default_factory=lambda: [
-            'consumer_rate',
-            'producer_rate',
-        ]
-    )
+    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
 @dc.dataclass
@@ -187,17 +186,18 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
             'compute': 'cat == "compute" & func_name == "compute"',
             'fetch_data': 'func_name == "fetch.iter"',
+            'checkpoint': 'cat == "checkpoint"',
             'data_loader': 'cat == "data"',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader" or func_name == "preprocess"',
+            'posix': 'cat.str.contains("posix|stdio")',
             'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
             # 'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
             # 'reader_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_ssd")',
-            'checkpoint': 'cat == "checkpoint"',
             'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
             # 'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
             # 'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
-            'other_posix': 'cat.isin(["posix", "stdio"])',
+            # 'other_posix': 'cat.isin(["posix", "stdio"]) & func_name != "fork"',
             # 'other_posix_lustre': 'cat.isin(["posix_lustre", "stdio_lustre"])',
             # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
         }

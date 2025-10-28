@@ -61,9 +61,9 @@ def set_main_metrics(df: pd.DataFrame):
         intensity_mask = (df[size_col] > 0) & (df[count_col] > 0)
         df.loc[bw_mask, bw_col] = df.loc[bw_mask, size_col] / df.loc[bw_mask, time_col]
         df.loc[intensity_mask, intensity_col] = df.loc[intensity_mask, count_col] / df.loc[intensity_mask, size_col]
-        df[size_col] = df[size_col].astype('Int64')
-        df[bw_col] = df[bw_col].astype('Float64')
-        df[intensity_col] = df[intensity_col].astype('Float64')
+        df[size_col] = pd.to_numeric(df[size_col], errors='coerce').round(0).astype('Int64')
+        df[bw_col] = pd.to_numeric(df[bw_col], errors='coerce').astype('Float64')
+        df[intensity_col] = pd.to_numeric(df[intensity_col], errors='coerce').astype('Float64')
 
     for count_col in count_cols:
         ops_col = count_col.replace('count', 'ops')

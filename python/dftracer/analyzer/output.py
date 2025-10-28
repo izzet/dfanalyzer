@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 from typing import Dict, List, Optional
 
-from .constants import COL_PROC_NAME, Layer, MiB
+from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, Layer, MiB
 from .types import (
     AnalyzerResultType,
     RawStats,
@@ -119,11 +119,14 @@ class Output(abc.ABC):
         return summary
 
     def _humanized_layer_name(self, name: str) -> str:
+        if name in HUMANIZED_LAYERS:
+            return HUMANIZED_LAYERS[name]
         return (
             name.replace('_', ' ')
             .title()
             .replace('Posix', 'POSIX')
             .replace('Stdio', 'STDIO')
+            .replace('Gpfs', '(GPFS)')
             .replace('Lustre', '(Lustre)')
             .replace('Ssd', '(SSD)')
         )

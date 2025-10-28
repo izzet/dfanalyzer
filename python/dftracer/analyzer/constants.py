@@ -204,6 +204,20 @@ HUMANIZED_COLS = dict(
     u_io_time='Unoverlapped I/O Time',
     u_read_io_time='Unoverlapped Read I/O Time',
 )
+HUMANIZED_LAYERS = dict(
+    posix='POSIX - All',
+    posix_reader='POSIX - Reader',
+    posix_checkpoint='POSIX - Checkpoint',
+    posix_other='POSIX - Other',
+    reader_posix='POSIX - Reader',
+    reader_posix_gpfs='POSIX - Reader (GPFS)',
+    reader_posix_lustre='POSIX - Reader (Lustre)',  
+    checkpoint_posix='POSIX - Checkpoint',
+    checkpoint_posix_gpfs='POSIX - Checkpoint (GPFS)',
+    checkpoint_posix_lustre='POSIX - Checkpoint (Lustre)',
+    checkpoint_posix_ssd='POSIX - Checkpoint (SSD)',
+    other_posix='POSIX - Other',
+)
 HUMANIZED_METRICS = dict(
     bw='I/O Bandwidth',
     intensity='I/O Intensity',
