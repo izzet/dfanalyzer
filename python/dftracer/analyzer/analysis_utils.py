@@ -20,10 +20,10 @@ from .constants import (
 )
 
 
-def fix_dtypes(df: pd.DataFrame):
+def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
+    if df.empty:
+        return df
     int_cols = []
-    int_cols.extend([col for col in df.columns if '_bin_' in col])
-    int_cols.extend([col for col in df.columns if col.endswith('_count')])
     int_cols.extend([col for col in df.columns if col.endswith('_nunique')])
     double_cols = []
     double_cols.extend([col for col in df.columns if col.endswith('_bw')])
@@ -33,6 +33,12 @@ def fix_dtypes(df: pd.DataFrame):
     double_cols.extend([col for col in df.columns if col.endswith('_slope')])
     double_cols.extend([col for col in df.columns if col.endswith('_pct')])
     size_cols = [col for col in df.columns if col.endswith('_size')]
+    if time_sliced:
+        double_cols.extend([col for col in df.columns if '_bin_' in col])
+        double_cols.extend([col for col in df.columns if col.endswith('_count')])
+    else:
+        int_cols.extend([col for col in df.columns if '_bin_' in col])
+        int_cols.extend([col for col in df.columns if col.endswith('_count')])
     df[int_cols] = df[int_cols].astype('Int64')
     df[double_cols] = df[double_cols].astype('Float64')
     df[size_cols] = df[size_cols].astype('Int64')
@@ -41,7 +47,7 @@ def fix_dtypes(df: pd.DataFrame):
 
 def fix_size_values(df: pd.DataFrame):
     size_cols = [col for col in df.columns if 'size' in col]
-    df[size_cols] = df[size_cols].replace(0, np.nan)
+    df[size_cols] = df[size_cols].replace(0, pd.NA)
     return df
 
 

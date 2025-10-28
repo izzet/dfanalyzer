@@ -1,14 +1,13 @@
 import abc
-import dask
 import dask.dataframe as dd
 import hashlib
 import itertools as it
 import json
 import math
-import numpy as np
 import os
 import pandas as pd
 import structlog
+from betterset import BetterSet as S
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
@@ -795,8 +794,8 @@ class Analyzer(abc.ABC):
                     continue
                 metric_col = f"{metric}_{col}"
                 hlm[metric_col] = pd.NA
-                if hlm.dtypes[col].name == "object":
-                    hlm[metric_col] = hlm[metric_col].map(lambda x: set())
+                if hlm.dtypes[col].name == "object" and not is_data_col:
+                    hlm[metric_col] = hlm[metric_col].map(lambda x: S())
                 hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
                 if hlm.dtypes[col].name != "object":
                     hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
@@ -907,9 +906,9 @@ class Analyzer(abc.ABC):
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
             .persist()
             .repartition(partition_size=partition_size)
-            .replace(0, np.nan)
+            .replace(0, pd.NA)
         )
-        hlm[bin_cols] = hlm[bin_cols].astype("uint32[pyarrow]")
+        hlm[bin_cols] = hlm[bin_cols].astype("Int32")
         return hlm.persist()
 
     def _compute_main_view(
@@ -939,8 +938,8 @@ class Analyzer(abc.ABC):
                 hlm.groupby(list(view_types))
                 .agg(main_view_agg, split_out=hlm.npartitions)
                 .map_partitions(set_main_metrics)
-                .replace(0, np.nan)
-                .map_partitions(fix_dtypes)
+                .replace(0, pd.NA)
+                .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
                 .persist()
             )
         return main_view
@@ -997,7 +996,7 @@ class Analyzer(abc.ABC):
             view = (
                 pre_view.groupby([view_type])
                 .agg(view_agg)
-                .replace(0, np.nan)
+                .replace(0, pd.NA)
                 .map_partitions(
                     set_view_metrics,
                     is_view_process_based=is_view_process_based,
@@ -1006,7 +1005,11 @@ class Analyzer(abc.ABC):
             )
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
-            view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes).persist()
+            view = (
+                view.map_partitions(set_unique_counts, layer=layer)
+                .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
+                .persist()
+            )
 
         return view
 

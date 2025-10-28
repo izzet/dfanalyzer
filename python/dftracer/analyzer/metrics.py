@@ -54,14 +54,22 @@ def set_main_metrics(df: pd.DataFrame):
         count_col = size_col.replace('size', 'count')
         intensity_col = size_col.replace('size', 'intensity')
         time_col = size_col.replace('size', 'time')
-        df[size_col] = np.where(df[size_col] > 0, df[size_col], np.nan)
-        df[bw_col] = np.where(df[size_col] > 0, df[size_col] / df[time_col], np.nan)
-        df[intensity_col] = np.where(df[size_col] > 0, df[count_col] / df[size_col], np.nan)
+        df[size_col] = df[size_col].where(df[size_col] > 0, pd.NA)
+        df[bw_col] = pd.NA
+        df[intensity_col] = pd.NA
+        bw_mask = (df[size_col] > 0) & (df[time_col] > 0)
+        intensity_mask = (df[size_col] > 0) & (df[count_col] > 0)
+        df.loc[bw_mask, bw_col] = df.loc[bw_mask, size_col] / df.loc[bw_mask, time_col]
+        df.loc[intensity_mask, intensity_col] = df.loc[intensity_mask, count_col] / df.loc[intensity_mask, size_col]
+        df[size_col] = pd.to_numeric(df[size_col], errors='coerce').round(0).astype('Int64')
+        df[bw_col] = pd.to_numeric(df[bw_col], errors='coerce').astype('Float64')
+        df[intensity_col] = pd.to_numeric(df[intensity_col], errors='coerce').astype('Float64')
 
     for count_col in count_cols:
         ops_col = count_col.replace('count', 'ops')
         time_col = count_col.replace('count', 'time')
         df[ops_col] = df[count_col] / df[time_col]
+        df[ops_col] = df[ops_col].astype('Float64')
 
     return df.sort_index(axis=1)
 
