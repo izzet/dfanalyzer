@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dfanalyzer.utils.dask_agg import unique_set, unique_set_flatten
+from dftracer.analyzer.utils.dask_agg import unique_set, unique_set_flatten
 
 # Ensure this module runs in both smoke and full CI modes
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
