@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dfanalyzer.analysis_utils import split_duration_records_vectorized
-from dfanalyzer.constants import (
+from dftracer.analyzer.analysis_utils import split_duration_records_vectorized
+from dftracer.analyzer.constants import (
     COL_TIME,
     COL_TIME_START,
     COL_TIME_RANGE,

@@ -6,7 +6,7 @@ from hydra.conf import HelpConf, JobConf
 from omegaconf import MISSING
 from typing import Any, Dict, List, Optional
 
-from .constants import COL_TIME_RANGE, VIEW_TYPES
+from .constants import COL_TIME_RANGE
 from .types import ViewMetricBoundaries
 from .utils.env_utils import get_bool_env_var, get_int_env_var
 
@@ -75,9 +75,12 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'data_loader',
             'data_loader_fork',
             'reader',
-            # 'reader_posix',
-            'reader_posix_lustre',
+            'reader_posix',
+            'posix',
+            # 'reader_posix_lustre',
             # 'reader_posix_ssd',
+            # 'checkpoint_posix_lustre',
+            # 'checkpoint_posix_ssd',
         ]
     )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
@@ -87,9 +90,10 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': {},
             'compute': {},
             'fetch_data': {},
+            'checkpoint': {},
             'data_loader': {
                 'init': 'func_name.str.contains("init")',
-                'item': 'func_name.str.contains("__getitem__")',
+                'item': 'func_name.str.contains("item")',
             },
             'data_loader_fork': {},
             'reader': {
@@ -98,13 +102,13 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
                 'preprocess': 'func_name.str.contains(".preprocess")',
                 'sample': 'func_name.str.contains(".get_sample")',
             },
-            # 'reader_posix': DERIVED_POSIX_METRICS,
-            'reader_posix_lustre': DERIVED_POSIX_METRICS,
+            'posix': DERIVED_POSIX_METRICS,
+            'reader_posix': DERIVED_POSIX_METRICS,
+            # 'reader_posix_lustre': DERIVED_POSIX_METRICS,
             # 'reader_posix_ssd': DERIVED_POSIX_METRICS,
-            'checkpoint': {},
-            # 'checkpoint_posix': {},
-            'checkpoint_posix_lustre': DERIVED_POSIX_METRICS,
-            'checkpoint_posix_ssd': DERIVED_POSIX_METRICS,
+            'checkpoint_posix': DERIVED_POSIX_METRICS,
+            # 'checkpoint_posix_lustre': DERIVED_POSIX_METRICS,
+            # 'checkpoint_posix_ssd': DERIVED_POSIX_METRICS,
             'other_posix': DERIVED_POSIX_METRICS,
             # 'other_posix_lustre': DERIVED_POSIX_METRICS,
             # 'other_posix_ssd': DERIVED_POSIX_METRICS,
@@ -117,17 +121,18 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': 'func_name == "DLIOBenchmark._train"',
             'compute': 'cat == "ai_framework"',
             'fetch_data': 'func_name.isin(["<module>.iter", "fetch-data.iter", "loop.iter"])',
+            'checkpoint': 'cat == "checkpoint"',
             'data_loader': 'cat == "data_loader" & ~func_name.isin(["loop.iter", "loop.yield"])',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader"',
-            # 'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
-            'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
+            'posix': 'cat.str.contains("posix|stdio")',
+            'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
+            # 'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
             # 'reader_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_ssd")',
-            'checkpoint': 'cat == "checkpoint"',
-            # 'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
-            'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
-            'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
-            'other_posix': 'cat.isin(["posix", "stdio"])',
+            'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
+            # 'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
+            # 'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
+            # 'other_posix': 'cat.isin(["posix", "stdio"]) & func_name != "fork"',
             # 'other_posix_lustre': 'cat.isin(["posix_lustre", "stdio_lustre"])',
             # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
         }
@@ -139,17 +144,18 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'epoch': 'training',
             'compute': 'epoch',
             'fetch_data': 'epoch',
+            'checkpoint': 'epoch',
             'data_loader': 'fetch_data',
             'data_loader_fork': 'fetch_data',
             'reader': 'data_loader',
-            # 'reader_posix': 'reader',
-            'reader_posix_lustre': 'reader',
-            # 'reader_posix_ssd': 'reader_posix',
-            'checkpoint': 'epoch',
-            # 'checkpoint_posix': 'checkpoint',
-            'checkpoint_posix_lustre': 'checkpoint',
-            'checkpoint_posix_ssd': 'checkpoint',
-            'other_posix': None,
+            'posix': None,
+            'reader_posix': 'reader',
+            # 'reader_posix_lustre': 'reader',
+            # 'reader_posix_ssd': 'reader',
+            'checkpoint_posix': 'checkpoint',
+            # 'checkpoint_posix_lustre': 'checkpoint',
+            # 'checkpoint_posix_ssd': 'checkpoint',
+            # 'other_posix': None,
             # 'other_posix_lustre': 'other_posix',
             # 'other_posix_ssd': 'other_posix',
         }
@@ -168,11 +174,33 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
-    unscored_metrics: Optional[List[str]] = dc.field(
-        default_factory=lambda: [
-            'consumer_rate',
-            'producer_rate',
-        ]
+    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
+
+
+@dc.dataclass
+class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'app': 'func_name == "ai_root"',
+            'training': 'cat == "pipeline" & func_name == "train"',
+            'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
+            'compute': 'cat == "compute" & func_name == "compute"',
+            'fetch_data': 'func_name == "fetch.iter"',
+            'checkpoint': 'cat == "checkpoint"',
+            'data_loader': 'cat == "data"',
+            'data_loader_fork': 'cat == "posix" & func_name == "fork"',
+            'reader': 'cat == "reader" or func_name == "preprocess"',
+            'posix': 'cat.str.contains("posix|stdio")',
+            'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
+            # 'reader_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_lustre")',
+            # 'reader_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader_ssd")',
+            'checkpoint_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint")',
+            # 'checkpoint_posix_lustre': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_lustre")',
+            # 'checkpoint_posix_ssd': 'cat.str.contains("posix|stdio") & cat.str.contains("_checkpoint_ssd")',
+            # 'other_posix': 'cat.isin(["posix", "stdio"]) & func_name != "fork"',
+            # 'other_posix_lustre': 'cat.isin(["posix_lustre", "stdio_lustre"])',
+            # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
+        }
     )
 
 
@@ -190,22 +218,21 @@ class AnalyzerConfig:
 
 @dc.dataclass
 class DarshanAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.darshan.DarshanAnalyzer"
+    _target_: str = "dftracer.analyzer.darshan.DarshanAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e3
 
 
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.dftracer.DFTracerAnalyzer"
-    assign_epochs: Optional[bool] = False
+    _target_: str = "dftracer.analyzer.dftracer.DFTracerAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 
 
 @dc.dataclass
 class RecorderAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dfanalyzer.recorder.RecorderAnalyzer"
+    _target_: str = "dftracer.analyzer.recorder.RecorderAnalyzer"
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e7
 
@@ -217,7 +244,7 @@ class ClusterConfig:
 
 @dc.dataclass
 class ExternalClusterConfig(ClusterConfig):
-    _target_: str = "dfanalyzer.cluster.ExternalCluster"
+    _target_: str = "dftracer.analyzer.cluster.ExternalCluster"
     restart_on_connect: Optional[bool] = False
     scheduler_address: Optional[str] = MISSING
 
@@ -278,25 +305,25 @@ class OutputConfig:
 
 @dc.dataclass
 class ConsoleOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.ConsoleOutput"
+    _target_: str = "dftracer.analyzer.output.ConsoleOutput"
     show_debug: Optional[bool] = False
     show_header: Optional[bool] = True
 
 
 @dc.dataclass
 class CSVOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.CSVOutput"
+    _target_: str = "dftracer.analyzer.output.CSVOutput"
 
 
 @dc.dataclass
 class SQLiteOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.SQLiteOutput"
+    _target_: str = "dftracer.analyzer.output.SQLiteOutput"
     run_db_path: Optional[str] = ""
 
 
 @dc.dataclass
 class CustomJobConfig(JobConf):
-    name: str = "dfanalyzer"
+    name: str = "dftracer.analyzer"
 
 
 @dc.dataclass
@@ -364,7 +391,8 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
     cs.store(group="analyzer", name="recorder", node=RecorderAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
-    cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIO)
+    cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
+    cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)

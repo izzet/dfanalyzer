@@ -1,3 +1,4 @@
+from importlib.metadata import PackageNotFoundError, version
 import dask
 import structlog
 from dataclasses import dataclass
@@ -17,6 +18,13 @@ from .recorder import RecorderAnalyzer
 from .types import ViewType
 from .utils.log_utils import configure_logging, log_block
 from .utils.warning_utils import filter_warnings
+
+
+try:
+    __version__ = version("dftracer-analyzer")
+except PackageNotFoundError:
+    # package is not installed
+    pass
 
 filter_warnings()
 
