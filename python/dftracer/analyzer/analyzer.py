@@ -838,6 +838,8 @@ class Analyzer(abc.ABC):
                     if layer_main_views is not None and layer in layer_main_views:
                         layer_main_view = layer_main_views[layer]
                     else:
+                        if hlm is None:
+                            raise ValueError("hlm must be provided when layer_main_views is not supplied")
                         layer_hlm = hlm.copy()
                         if layer_condition:
                             layer_hlm = hlm.query(layer_condition)
