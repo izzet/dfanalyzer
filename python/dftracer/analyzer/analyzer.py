@@ -785,7 +785,7 @@ class Analyzer(abc.ABC):
         return it.chain.from_iterable(map(_iter_permutations, range(len(view_types))))
 
     def _analyze_hlm(
-        self, 
+        self,
         hlm: Optional[dd.DataFrame],
         proc_view_types: List[ViewType],
         metric_boundaries: ViewMetricBoundaries,
