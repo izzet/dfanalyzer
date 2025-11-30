@@ -2,9 +2,9 @@ name: Build and Test
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   push:
-    branches: [main, dev]
+    branches: [main, develop]
     tags:
       - "v*.*.*" # Match version tags like v1.0.0, v0.1.2, etc.
   workflow_dispatch:

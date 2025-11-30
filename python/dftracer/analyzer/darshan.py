@@ -9,6 +9,8 @@ from .analyzer import Analyzer
 from .constants import COL_TIME_END, COL_TIME_START, IOCategory
 from .types import RawStats
 
+DEFAULT_APP_NAME = 'app'
+DEFAULT_HOST_NAME = 'localhost'
 TRACE_COL_MAPPING = {
     'end_time': COL_TIME_END,
     'start_time': COL_TIME_START,
@@ -116,7 +118,7 @@ class DarshanAnalyzer(Analyzer):
             rank = record['rank']
             host_name = record['hostname']
             file_name = report.data['name_records'][file_id]
-            proc_name = f"app#localhost#{rank}#0"
+            proc_name = f"{DEFAULT_APP_NAME}#{DEFAULT_HOST_NAME}#{rank}#0"
 
             # Process read segments
             if not record['read_segments'].empty:
@@ -213,7 +215,9 @@ class DarshanAnalyzer(Analyzer):
                 right_index=True,
             )
             .reset_index()
-            .assign(proc_name=lambda x: 'app#localhost#' + x['rank'].astype(str) + '#0')
+            .assign(app_name=lambda x: DEFAULT_APP_NAME)
+            .assign(host_name=lambda x: DEFAULT_HOST_NAME)
+            .assign(proc_name=lambda x: x['app_name'] + '#' + x['host_name'] + '#' + x['rank'].astype(str) + '#0')
             # .set_index(['proc_name', 'file_name'])
             .drop(columns=['id', 'rank'])
             .query('~(file_name.str.startswith("<") and file_name.str.endswith(">"))')
