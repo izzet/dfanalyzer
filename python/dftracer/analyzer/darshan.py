@@ -6,7 +6,7 @@ import os
 import pandas as pd
 
 from .analyzer import Analyzer
-from .constants import COL_TIME_END, COL_TIME_START, IOCategory
+from .constants import COL_TIME_END, COL_TIME_START, IOCategory, Layer
 from .types import RawStats
 
 DEFAULT_APP_NAME = 'app'
@@ -80,16 +80,19 @@ class DarshanAnalyzer(Analyzer):
             total_event_count=len(file_name_ddf),
             unique_file_count=file_name_ddf['file_name'].nunique(),
             unique_host_count=file_name_ddf['host_name'].nunique(),
-            unique_proc_count=file_name_ddf['proc_name'].nunique(),
+            unique_process_count=file_name_ddf['proc_name'].nunique(),
         )
 
-        # return file_name_view
-        return self._analyze_main_view(
-            main_view=file_name_view,
-            metrics=metrics,
-            view_types=view_types,
+        if len(self.preset.layer_defs) != 1 or Layer.POSIX not in self.preset.layer_defs:
+            raise ValueError(f"Darshan analyzer only supports the '{Layer.POSIX}' layer. Got {self.preset.layer_defs}.")
+
+        return self._analyze_hlm(
+            hlm=None,
+            layer_main_views={Layer.POSIX: file_name_view},
+            logical_view_types=logical_view_types,
+            metric_boundaries=metric_boundaries,
+            proc_view_types=self.ensure_proc_view_type(view_types=view_types),
             raw_stats=raw_stats,
-            exclude_characteristics=exclude_characteristics,
         )
 
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
@@ -215,9 +218,8 @@ class DarshanAnalyzer(Analyzer):
                 right_index=True,
             )
             .reset_index()
-            .assign(app_name=lambda x: DEFAULT_APP_NAME)
             .assign(host_name=lambda x: DEFAULT_HOST_NAME)
-            .assign(proc_name=lambda x: x['app_name'] + '#' + x['host_name'] + '#' + x['rank'].astype(str) + '#0')
+            .assign(proc_name=lambda x: DEFAULT_APP_NAME + '#' + x['host_name'] + '#' + x['rank'].astype(str) + '#0')
             # .set_index(['proc_name', 'file_name'])
             .drop(columns=['id', 'rank'])
             .query('~(file_name.str.startswith("<") and file_name.str.endswith(">"))')

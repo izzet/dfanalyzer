@@ -144,7 +144,7 @@ class Analyzer(abc.ABC):
             An AnalyzerResultType object containing the analysis results.
         """
         # Check if high-level metrics are checkpointed
-        proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
@@ -194,127 +194,21 @@ class Analyzer(abc.ABC):
         # Validate time granularity
         # self.validate_time_granularity(hlm=hlm, view_types=hlm_view_types)
 
-        # Compute layers & views
-        with console_block("Compute views"):
-            with log_block("create_layers_and_views_tasks"):
-                hlms = {}
-                main_views = {}
-                main_indexes = {}
-                views = {}
-                view_keys = set()
-                for layer, layer_condition in self.preset.layer_defs.items():
-                    layer_hlm = hlm.copy()
-                    if layer_condition:
-                        layer_hlm = hlm.query(layer_condition)
-                    layer_main_view = self.compute_main_view(
-                        layer=layer,
-                        hlm=layer_hlm,
-                        view_types=proc_view_types,
-                    )
-                    layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
-                    layer_views = self.compute_views(
-                        layer=layer,
-                        main_view=layer_main_view,
-                        view_types=proc_view_types,
-                    )
-                    if logical_view_types:
-                        layer_logical_views = self.compute_logical_views(
-                            layer=layer,
-                            main_view=layer_main_view,
-                            views=layer_views,
-                            view_types=proc_view_types,
-                        )
-                        layer_views.update(layer_logical_views)
-                    hlms[layer] = layer_hlm
-                    main_views[layer] = layer_main_view
-                    main_indexes[layer] = layer_main_index
-                    views[layer] = layer_views
-                    view_keys.update(layer_views.keys())
-
-            with log_block("compute_views_and_raw_stats"):
-                (views, raw_stats) = compute(views, raw_stats)
-
-        # Restore checkpointed flat views if available
-        checkpointed_flat_views = {}
-        if self.checkpoint:
-            with log_block("restore_flat_view_checkpoints"):
-                checkpointed_flat_views.update(self.restore_flat_views(view_keys=list(view_keys)))
-
-        # Process views to create flat views
-        with console_block("Process views"):
-            flat_views = {}
-            for layer in views:
-                for view_key in views[layer]:
-                    if view_key in checkpointed_flat_views:
-                        flat_views[view_key] = checkpointed_flat_views[view_key]
-                        continue
-                    with log_block("merge_flat_view", view_key=view_key):
-                        view = views[layer][view_key].copy()
-                        view.columns = view.columns.map(lambda col: layer.lower() + "_" + col)
-                        if view_key in flat_views:
-                            flat_views[view_key] = flat_views[view_key].merge(
-                                view,
-                                how="outer",
-                                left_index=True,
-                                right_index=True,
-                            )
-                        else:
-                            flat_views[view_key] = view
-                    try:
-                        df = flat_views[view_key]
-                        mem_bytes = int(df.memory_usage(deep=True).sum()) if hasattr(df, 'memory_usage') else -1
-                        logger.debug(
-                            "Flat view created",
-                            view_key=view_key,
-                            shape=getattr(df, 'shape', None),
-                            mem_bytes=mem_bytes,
-                        )
-                    except Exception:
-                        pass
-
-            # Compute metric boundaries for flat views
-            with log_block("process_flat_views+metric_boundaries"):
-                for view_key in flat_views:
-                    if view_key in checkpointed_flat_views:
-                        continue
-                    view_type = view_key[-1]
-                    top_layer = list(self.preset.layer_defs)[0]
-                    time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
-                    with log_block("calculate_metric_boundary", view_key=view_key):
-                        time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
-                        metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
-                        for layer in self.preset.layer_defs:
-                            metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
-                    with log_block("process_flat_view", view_key=view_key):
-                        # Process flat views to compute metrics and scores
-                        flat_views[view_key] = self._process_flat_view(
-                            flat_view=flat_views[view_key],
-                            view_key=view_key,
-                            metric_boundaries=metric_boundaries,
-                        )
-
-        # Checkpoint flat views if enabled
-        if self.checkpoint:
-            with log_block("write_flat_view_checkpoints"):
-                self.checkpoint_tasks.extend(self.store_flat_views(flat_views=flat_views))
-
-        # Wait for all checkpoint tasks
-        if self.checkpoint:
-            with log_block("wait_for_checkpoints"):
-                wait(self.checkpoint_tasks)
-
-        return AnalyzerResultType(
-            _hlms=hlms,
-            _main_views=main_views,
-            _metric_boundaries=metric_boundaries,
-            _traces=traces,
-            checkpoint_dir=self.checkpoint_dir,
-            flat_views=flat_views,
-            layers=self.layers,
+        # Analyze HLM
+        result = self._analyze_hlm(
+            hlm=hlm,
+            logical_view_types=logical_view_types,
+            metric_boundaries=metric_boundaries,
+            proc_view_types=proc_view_types,
             raw_stats=raw_stats,
-            view_types=view_types,
-            views=views,
         )
+
+        # Attach correct traces & view types
+        result._traces = traces
+        result.view_types = view_types
+
+        # Return result
+        return result
 
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.
@@ -626,6 +520,17 @@ class Analyzer(abc.ABC):
         """
         return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
 
+    def ensure_proc_view_type(self, view_types: List[ViewType]) -> List[ViewType]:
+        """Ensures that COL_PROC_NAME is always included in the list of view types.
+
+        Args:
+            view_types: A list of view types to be used for analysis.
+
+        Returns:
+            A sorted list of view types that always includes COL_PROC_NAME.
+        """
+        return list(sorted(set(view_types).union({COL_PROC_NAME})))
+
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
 
@@ -886,6 +791,166 @@ class Analyzer(abc.ABC):
             return it.permutations(view_types, r + 1)
 
         return it.chain.from_iterable(map(_iter_permutations, range(len(view_types))))
+
+    def _analyze_hlm(
+        self,
+        hlm: Optional[dd.DataFrame],
+        proc_view_types: List[ViewType],
+        metric_boundaries: ViewMetricBoundaries,
+        raw_stats: RawStats,
+        logical_view_types: bool,
+        layer_main_views: Optional[Dict[Layer, dd.DataFrame]] = None,
+    ) -> AnalyzerResultType:
+        """
+        Analyze the high-level metrics (HLM) and compute views for each layer.
+
+        This method computes the main views and additional views for each layer, either from the provided
+        high-level metrics DataFrame (`hlm`) or from precomputed main views (`layer_main_views`). At least
+        one of `hlm` or `layer_main_views` must be provided. If `layer_main_views` is given and contains
+        a main view for a layer, it will be used; otherwise, the main view will be computed from `hlm`.
+
+        Args:
+            hlm (dd.DataFrame): The high-level metrics Dask DataFrame. Required unless all main views are provided
+                in `layer_main_views`.
+            proc_view_types (List[ViewType]): List of view types to process for each layer.
+            metric_boundaries (ViewMetricBoundaries): Boundaries for metrics used in view computation.
+            raw_stats (RawStats): Raw statistics to be computed alongside the views.
+            logical_view_types (bool): Whether to compute logical views in addition to main views.
+            layer_main_views (Optional[Dict[Layer, dd.DataFrame]]): Optional dictionary mapping each layer to its
+                precomputed main view. If not provided, main views will be computed from `hlm`.
+
+        Returns:
+            AnalyzerResultType: The result of the analysis, including computed views and statistics.
+
+        Raises:
+            ValueError: If neither `hlm` nor `layer_main_views` is provided for a required layer.
+        """
+        # Compute layers & views
+        with console_block("Compute views"):
+            with log_block("create_layers_and_views_tasks"):
+                hlms = {}
+                main_views = {}
+                main_indexes = {}
+                views = {}
+                view_keys = set()
+                for layer, layer_condition in self.preset.layer_defs.items():
+                    layer_hlm = None
+                    if layer_main_views is not None and layer in layer_main_views:
+                        layer_main_view = layer_main_views[layer]
+                    else:
+                        if hlm is None:
+                            raise ValueError("hlm must be provided when layer_main_views is not supplied")
+                        layer_hlm = hlm.copy()
+                        if layer_condition:
+                            layer_hlm = hlm.query(layer_condition)
+                        layer_main_view = self.compute_main_view(
+                            layer=layer,
+                            hlm=layer_hlm,
+                            view_types=proc_view_types,
+                        )
+                    layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
+                    layer_views = self.compute_views(
+                        layer=layer,
+                        main_view=layer_main_view,
+                        view_types=proc_view_types,
+                    )
+                    if logical_view_types:
+                        layer_logical_views = self.compute_logical_views(
+                            layer=layer,
+                            main_view=layer_main_view,
+                            views=layer_views,
+                            view_types=proc_view_types,
+                        )
+                        layer_views.update(layer_logical_views)
+                    hlms[layer] = layer_hlm
+                    main_views[layer] = layer_main_view
+                    main_indexes[layer] = layer_main_index
+                    views[layer] = layer_views
+                    view_keys.update(layer_views.keys())
+
+            with log_block("compute_views_and_raw_stats"):
+                (views, raw_stats) = compute(views, raw_stats)
+
+        # Restore checkpointed flat views if available
+        checkpointed_flat_views = {}
+        if self.checkpoint:
+            with log_block("restore_flat_view_checkpoints"):
+                checkpointed_flat_views.update(self.restore_flat_views(view_keys=list(view_keys)))
+
+        # Process views to create flat views
+        with console_block("Process views"):
+            flat_views = {}
+            for layer in views:
+                for view_key in views[layer]:
+                    if view_key in checkpointed_flat_views:
+                        flat_views[view_key] = checkpointed_flat_views[view_key]
+                        continue
+                    with log_block("merge_flat_view", view_key=view_key):
+                        view = views[layer][view_key].copy()
+                        view.columns = view.columns.map(lambda col: layer.lower() + "_" + col)
+                        if view_key in flat_views:
+                            flat_views[view_key] = flat_views[view_key].merge(
+                                view,
+                                how="outer",
+                                left_index=True,
+                                right_index=True,
+                            )
+                        else:
+                            flat_views[view_key] = view
+                    try:
+                        df = flat_views[view_key]
+                        mem_bytes = int(df.memory_usage(deep=True).sum()) if hasattr(df, 'memory_usage') else -1
+                        logger.debug(
+                            "Flat view created",
+                            view_key=view_key,
+                            shape=getattr(df, 'shape', None),
+                            mem_bytes=mem_bytes,
+                        )
+                    except Exception as e:
+                        logger.exception("Failed to log flat view details", exc_info=e)
+
+            # Compute metric boundaries for flat views
+            with log_block("process_flat_views+metric_boundaries"):
+                for view_key in flat_views:
+                    if view_key in checkpointed_flat_views:
+                        continue
+                    view_type = view_key[-1]
+                    top_layer = list(self.preset.layer_defs)[0]
+                    time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
+                    with log_block("calculate_metric_boundary", view_key=view_key):
+                        time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
+                        metric_boundaries.setdefault(view_type, {})
+                        for layer in self.preset.layer_defs:
+                            metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
+                    with log_block("process_flat_view", view_key=view_key):
+                        # Process flat views to compute metrics and scores
+                        flat_views[view_key] = self._process_flat_view(
+                            flat_view=flat_views[view_key],
+                            view_key=view_key,
+                            metric_boundaries=metric_boundaries,
+                        )
+
+        # Checkpoint flat views if enabled
+        if self.checkpoint:
+            with log_block("write_flat_view_checkpoints"):
+                self.checkpoint_tasks.extend(self.store_flat_views(flat_views=flat_views))
+
+        # Wait for all checkpoint tasks
+        if self.checkpoint:
+            with log_block("wait_for_checkpoints"):
+                wait(self.checkpoint_tasks)
+
+        return AnalyzerResultType(
+            _hlms=hlms,
+            _main_views=main_views,
+            _metric_boundaries=metric_boundaries,
+            checkpoint_dir=self.checkpoint_dir,
+            flat_views=flat_views,
+            layers=self.layers,
+            raw_stats=raw_stats,
+            view_types=proc_view_types,
+            views=views,
+        )
 
     def _compute_high_level_metrics(
         self,
