@@ -91,7 +91,7 @@ class DarshanAnalyzer(Analyzer):
             layer_main_views={Layer.POSIX: file_name_view},
             logical_view_types=logical_view_types,
             metric_boundaries=metric_boundaries,
-            proc_view_types=self.ensure_proc_view_type(view_types=view_types), 
+            proc_view_types=self.ensure_proc_view_type(view_types=view_types),
             raw_stats=raw_stats,
         )
 
