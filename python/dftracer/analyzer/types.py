@@ -198,7 +198,7 @@ class AnalyzerResultType:
     raw_stats: RawStats
     view_types: List[ViewType]
     views: Dict[Layer, Views]
-    _hlms: Dict[Layer, dd.DataFrame] 
+    _hlms: Dict[Layer, dd.DataFrame]
     _main_views: Dict[Layer, dd.DataFrame]
     _metric_boundaries: ViewMetricBoundaries
     _traces: Optional[dd.DataFrame] = None
