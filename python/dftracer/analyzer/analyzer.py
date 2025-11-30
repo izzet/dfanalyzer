@@ -896,8 +896,8 @@ class Analyzer(abc.ABC):
                             shape=getattr(df, 'shape', None),
                             mem_bytes=mem_bytes,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception("Failed to log flat view details", exc_info=e)
 
             # Compute metric boundaries for flat views
             with log_block("process_flat_views+metric_boundaries"):
