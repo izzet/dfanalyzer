@@ -793,6 +793,30 @@ class Analyzer(abc.ABC):
         logical_view_types: bool,
         layer_main_views: Optional[Dict[Layer, dd.DataFrame]] = None,
     ) -> AnalyzerResultType:
+        """
+        Analyze the high-level metrics (HLM) and compute views for each layer.
+
+        This method computes the main views and additional views for each layer, either from the provided
+        high-level metrics DataFrame (`hlm`) or from precomputed main views (`layer_main_views`). At least
+        one of `hlm` or `layer_main_views` must be provided. If `layer_main_views` is given and contains
+        a main view for a layer, it will be used; otherwise, the main view will be computed from `hlm`.
+
+        Args:
+            hlm (dd.DataFrame): The high-level metrics Dask DataFrame. Required unless all main views are provided
+                in `layer_main_views`.
+            proc_view_types (List[ViewType]): List of view types to process for each layer.
+            metric_boundaries (ViewMetricBoundaries): Boundaries for metrics used in view computation.
+            raw_stats (RawStats): Raw statistics to be computed alongside the views.
+            logical_view_types (bool): Whether to compute logical views in addition to main views.
+            layer_main_views (Optional[Dict[Layer, dd.DataFrame]]): Optional dictionary mapping each layer to its
+                precomputed main view. If not provided, main views will be computed from `hlm`.
+
+        Returns:
+            AnalyzerResultType: The result of the analysis, including computed views and statistics.
+
+        Raises:
+            ValueError: If neither `hlm` nor `layer_main_views` is provided for a required layer.
+        """
         # Compute layers & views
         with console_block("Compute views"):
             with log_block("create_layers_and_views_tasks"):
