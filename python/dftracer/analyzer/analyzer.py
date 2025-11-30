@@ -198,8 +198,8 @@ class Analyzer(abc.ABC):
         result = self._analyze_hlm(
             hlm=hlm,
             logical_view_types=logical_view_types,
-            metric_boundaries=metric_boundaries, 
-            proc_view_types=proc_view_types, 
+            metric_boundaries=metric_boundaries,
+            proc_view_types=proc_view_types,
             raw_stats=raw_stats,
         )
 
