@@ -554,16 +554,6 @@ class DFTracerAnalyzer(Analyzer):
                 traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
             ]
 
-        # Set proc names
-        traces[COL_PROC_NAME] = (
-            "app#"
-            + traces[COL_HOST_NAME].astype(str)
-            + "#"
-            + traces["pid"].astype(str)
-            + "#"
-            + traces["tid"].astype(str)
-        )
-
         # Set epochs
         with log_block("assign_epochs"):
             if self.assign_epochs:
@@ -625,6 +615,10 @@ class DFTracerAnalyzer(Analyzer):
 
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
+
+    @staticmethod
+    def _set_epochs(df: pd.DataFrame, epochs: pd.DataFrame):
+        return df.assign(epoch=np.digitize(df["time_range"], bins=epochs["time_range"], right=False))
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
