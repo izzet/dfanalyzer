@@ -192,16 +192,16 @@ class OutputType:
 
 @dc.dataclass
 class AnalyzerResultType:
-    _hlms: Dict[Layer, dd.DataFrame]
-    _main_views: Dict[Layer, dd.DataFrame]
-    _metric_boundaries: ViewMetricBoundaries
-    _traces: Optional[dd.DataFrame]
     checkpoint_dir: str
     flat_views: Dict[ViewKey, pd.DataFrame]
     layers: List[Layer]
     raw_stats: RawStats
     view_types: List[ViewType]
     views: Dict[Layer, Views]
+    _hlms: Dict[Layer, dd.DataFrame] 
+    _main_views: Dict[Layer, dd.DataFrame]
+    _metric_boundaries: ViewMetricBoundaries
+    _traces: Optional[dd.DataFrame] = None
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
         return self._hlms[layer]
