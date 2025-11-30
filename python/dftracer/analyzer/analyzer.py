@@ -909,7 +909,7 @@ class Analyzer(abc.ABC):
                     time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
                     with log_block("calculate_metric_boundary", view_key=view_key):
                         time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
-                        metric_boundaries[view_type] = metric_boundaries.get(view_type, {})
+                        metric_boundaries.setdefault(view_type, {})
                         for layer in self.preset.layer_defs:
                             metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
                     with log_block("process_flat_view", view_key=view_key):
