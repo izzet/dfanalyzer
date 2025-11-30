@@ -521,6 +521,14 @@ class Analyzer(abc.ABC):
         return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
 
     def ensure_proc_view_type(self, view_types: List[ViewType]) -> List[ViewType]:
+        """Ensures that COL_PROC_NAME is always included in the list of view types.
+
+        Args:
+            view_types: A list of view types to be used for analysis.
+
+        Returns:
+            A sorted list of view types that always includes COL_PROC_NAME.
+        """
         return list(sorted(set(view_types).union({COL_PROC_NAME})))
 
     def get_stats_checkpoint_name(self):
