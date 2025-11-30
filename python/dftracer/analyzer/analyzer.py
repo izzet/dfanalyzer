@@ -786,7 +786,7 @@ class Analyzer(abc.ABC):
 
     def _analyze_hlm(
         self, 
-        hlm: dd.DataFrame,
+        hlm: Optional[dd.DataFrame],
         proc_view_types: List[ViewType],
         metric_boundaries: ViewMetricBoundaries,
         raw_stats: RawStats,
