@@ -1,6 +1,6 @@
 import numpy as np
 from enum import Enum, auto
-from strenum import StrEnum
+from strenum import LowercaseStrEnum, StrEnum
 
 
 class AccessPattern(Enum):
@@ -31,7 +31,7 @@ class IOCategory(Enum):
     SYNC = 7
 
 
-class Layer(StrEnum):
+class Layer(LowercaseStrEnum):
     APP = auto()
     DATALOADER = auto()
     NETCDF = auto()
