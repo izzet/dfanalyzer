@@ -226,6 +226,7 @@ class DarshanAnalyzerConfig(AnalyzerConfig):
 @dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dftracer.analyzer.dftracer.DFTracerAnalyzer"
+    assign_epochs: Optional[bool] = False
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
 

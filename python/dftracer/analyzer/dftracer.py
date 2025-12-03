@@ -294,6 +294,10 @@ def load_objects_str(
 
 
 class DFTracerAnalyzer(Analyzer):
+    def __init__(self, preset, assign_epochs=False, **kwargs):
+        super().__init__(preset, **kwargs)
+        self.assign_epochs = assign_epochs
+
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         with log_block("glob_files"):
             pfw_pattern, pfw_gz_pattern = [], []
@@ -550,6 +554,17 @@ class DFTracerAnalyzer(Analyzer):
                 traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
             ]
 
+        # Set epochs
+        with log_block("assign_epochs"):
+            if self.assign_epochs:
+                if "epoch" not in self.preset.layer_defs:
+                    raise ValueError("Epoch layer definition is missing")
+                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
+                epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
+                epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
+                epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
+                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+
         # Ignore redundant function calls
         with log_block("filter_functions"):
             traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
@@ -630,6 +645,24 @@ class DFTracerAnalyzer(Analyzer):
         df["size"] = df["size"].replace(0, pd.NA)
         if "offset" in df.columns:
             df["offset"] = df["offset"].replace(0, pd.NA)
+        return df
+
+    @staticmethod
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
         return df
 
     @staticmethod
