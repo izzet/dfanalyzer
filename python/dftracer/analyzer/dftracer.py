@@ -713,6 +713,24 @@ class DFTracerAnalyzer(Analyzer):
         return df
 
     @staticmethod
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
+        return df
+
+    @staticmethod
     def _set_proc_names(df: pd.DataFrame):
         df[COL_PROC_NAME] = (
             "app#" + df[COL_HOST_NAME].astype(str) + "#" + df["pid"].astype(str) + "#" + df["tid"].astype(str)
