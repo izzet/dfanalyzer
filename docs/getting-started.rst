@@ -12,7 +12,7 @@ To install DFAnalyzer through ``pip`` (recommended for most users):
    # This might involve using your system's package manager or a tool like Spack.
    # Example using Spack to prepare the environment:
    # spack -e tools install
-   pip install dfanalyzer
+   pip install dftracer-analyzer
 
 To install DFAnalyzer from source (for developers or custom builds):
 

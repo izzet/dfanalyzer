@@ -1,9 +1,9 @@
 # Data Flow Analyzer
 
-<!-- ![Build and Test](https://github.com/LLNL/dfanalyzer/actions/workflows/ci.yml/badge.svg)
-![PyPI - Version](https://img.shields.io/pypi/v/dfanalyzer?label=PyPI)
-![PyPI - Wheel](https://img.shields.io/pypi/wheel/dfanalyzer?label=Wheel)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/dfanalyzer?label=Python) -->
+![Build and Test](https://github.com/LLNL/dfanalyzer/actions/workflows/ci.yml/badge.svg)
+![PyPI - Version](https://img.shields.io/pypi/v/dftracer-analyzer?label=PyPI)
+![PyPI - Wheel](https://img.shields.io/pypi/wheel/dftracer-analyzer?label=Wheel)
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/dftracer-analyzer?label=Python)
 
 ## Overview
 
@@ -18,7 +18,7 @@ To install DFAnalyzer through `pip` (recommended for most users):
 # This might involve using your system's package manager or a tool like Spack.
 # Example using Spack to prepare the environment:
 # spack -e tools install
-pip install dfanalyzer
+pip install dftracer-analyzer
 ```
 
 To install DFAnalyzer from source (for developers or custom builds):
