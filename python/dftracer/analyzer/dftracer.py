@@ -636,7 +636,7 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
-        base_condition = (df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna())
+        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
     
         # Step 1: Map file purpose suffixes first
         purpose_updates = {
