@@ -617,8 +617,73 @@ class DFTracerAnalyzer(Analyzer):
         return traces["pid"].nunique()
 
     @staticmethod
-    def _set_epochs(df: pd.DataFrame, epochs: pd.DataFrame):
-        return df.assign(epoch=np.digitize(df["time_range"], bins=epochs["time_range"], right=False))
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
+        return df
+
+    @staticmethod
+    def _fix_file_posix_category(df: pd.DataFrame):
+        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
+    
+        # Step 1: Map file purpose suffixes first
+        purpose_updates = {
+            "/data": "_reader",
+            "/checkpoint": "_checkpoint"
+        }
+        
+        for path, suffix in purpose_updates.items():
+            mask = base_condition & df["file_name"].str.contains(path)
+            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
+        
+        # Step 2: Map filesystem suffixes
+        filesystem_updates = {
+            "/lustre": "_lustre",
+            "/ssd": "_ssd"
+        }
+        
+        for path, suffix in filesystem_updates.items():
+            mask = base_condition & df["file_name"].str.contains(path)
+            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
+
+        return df
+
+    @staticmethod
+    def _sanitize_size_offset(df: pd.DataFrame):
+        df["size"] = df["size"].replace(0, np.nan)
+        if "offset" in df.columns:
+            df["offset"] = df["offset"].replace(0, np.nan)
+        return df
+
+    @staticmethod
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
+        return df
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
