@@ -1000,7 +1000,7 @@ class Analyzer(abc.ABC):
                 if any(map(col.endswith, view_types_diff)):
                     main_view_agg[col] = unique_set_flatten()
                 elif col not in HLM_EXTRA_COLS:
-                    main_view_agg[col] = sum
+                    main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
             main_view = (
                 hlm.groupby(list(view_types))
