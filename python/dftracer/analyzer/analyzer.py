@@ -534,6 +534,9 @@ class Analyzer(abc.ABC):
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
 
+    def get_time_boundary_layer(self):
+        return list(self.preset.layer_defs)[0]
+
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         """Computes the total number of I/O events in the traces.
 
