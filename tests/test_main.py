@@ -112,7 +112,7 @@ def _test_e2e(
         f"Expected {len(dfa.hydra_config.analyzer.preset.layer_defs)} layers, got {len(result.layers)}"
     )
     if checkpoint:
-        assert any(glob(f"{result.checkpoint_dir}/*.json")), "No checkpoint found"
+        assert any(glob(f"{result.checkpoint_dir}/*.parquet")), "No checkpoint found"
 
     # Shutdown the Dask client and cluster
     dfa.shutdown()
