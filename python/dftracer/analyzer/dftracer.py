@@ -9,7 +9,6 @@ import os
 import pandas as pd
 import portion as I
 import structlog
-import sys
 from dftracer.utils import Indexer, Reader
 from dask.distributed import wait
 from typing import Callable, Dict, List, Optional
