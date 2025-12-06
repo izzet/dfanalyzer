@@ -188,6 +188,10 @@ def set_cross_layer_metrics(
         for dm in derived_metrics[layer]:
             dm_col = f"{layer}_{dm}"
             dm_time_col = f"{dm_col}_{time_metric}"
+
+            if dm_time_col not in df.columns:
+                continue
+
             dm_time_frac_boundary_col = f"{dm_col}_time_frac_{time_boundary_layer}"
             dm_time_frac_parent_col = f"{dm_col}_time_frac_parent"
             dm_time_frac_total_col = f"{dm_col}_time_frac_total"
@@ -198,6 +202,7 @@ def set_cross_layer_metrics(
             df[dm_time_frac_boundary_col] = dm_time / df[time_boundary_metric]
             df[dm_time_frac_parent_col] = dm_time / df[f"{layer}_{time_metric}"]
             df[dm_time_frac_total_col] = pd.NA
+
             if dm_time_sum > 0:
                 df[dm_time_frac_total_col] = dm_time / dm_time_sum
 
