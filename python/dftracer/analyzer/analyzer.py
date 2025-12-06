@@ -58,9 +58,9 @@ CHECKPOINT_MAIN_VIEW = "_main_view"
 CHECKPOINT_RAW_STATS = "_raw_stats"
 CHECKPOINT_VIEW = "_view"
 HLM_AGG = {
-    "time": sum,
-    "count": sum,
-    "size": sum,
+    "time": "sum",
+    "count": "sum",
+    "size": "sum",
 }
 HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 PARTITION_SIZE = "128MB"
@@ -967,7 +967,7 @@ class Analyzer(abc.ABC):
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
         hlm_agg = dict(HLM_AGG)
-        hlm_agg.update({col: sum for col in bin_cols})
+        hlm_agg.update({col: "sum" for col in bin_cols})
         hlm_agg.update({col: unique_set() for col in view_types_diff})
         hlm = (
             traces.groupby(hlm_groupby)
@@ -1030,16 +1030,16 @@ class Analyzer(abc.ABC):
             view_agg = {}
             for col in records.columns:
                 if "_bin_" in col:
-                    view_agg[col] = [sum]
+                    view_agg[col] = ["sum"]
                 elif any(map(col.endswith, view_types_diff)):
                     view_agg[col] = [unique_set_flatten()]
                 elif col in it.chain.from_iterable(self.logical_views.values()):
                     view_agg[col] = [unique_set_flatten()]
                 elif pd.api.types.is_numeric_dtype(records[col].dtype):
                     view_agg[col] = [
-                        sum,
-                        min,
-                        max,
+                        "sum",
+                        "min",
+                        "max",
                         "mean",
                         "std",
                     ]
