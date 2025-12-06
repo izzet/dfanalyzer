@@ -1086,13 +1086,21 @@ class Analyzer(abc.ABC):
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
+        with log_block("set_view_metrics", view_key=view_key):
+            flat_view = set_view_metrics(
+                flat_view,
+                is_view_process_based=is_view_process_based,
+                metric_boundaries=metric_boundaries[view_type],
+            )
         with log_block("set_cross_layer_metrics", view_key=view_key):
             flat_view = set_cross_layer_metrics(
                 flat_view,
-                layer_defs=self.preset.layer_defs,
-                layer_deps=self.preset.layer_deps,
                 async_layers=self.preset.async_layers,
+                derived_metrics=self.preset.derived_metrics,
                 is_view_process_based=is_view_process_based,
+                layers=self.layers,
+                layer_deps=self.preset.layer_deps,
+                time_boundary_layer=self.get_time_boundary_layer(),
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
