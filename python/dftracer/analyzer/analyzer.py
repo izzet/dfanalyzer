@@ -1061,16 +1061,7 @@ class Analyzer(abc.ABC):
                 pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = (
-                pre_view.groupby([view_type])
-                .agg(view_agg)
-                .replace(0, pd.NA)
-                .map_partitions(
-                    set_view_metrics,
-                    is_view_process_based=is_view_process_based,
-                    time_granularity=self.time_granularity,
-                )
-            )
+            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
             view = (
