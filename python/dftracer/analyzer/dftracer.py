@@ -131,12 +131,12 @@ def get_io_cat(func_name: str):
 
 def io_columns():
     columns = {
-        "fhash": "string[pyarrow]",
-        "hhash": "string[pyarrow]",
-        "image_id": "uint64[pyarrow]",
-        "io_cat": "uint8[pyarrow]",
-        "size": "uint64[pyarrow]",
-        "offset": "uint64[pyarrow]",
+        "file_hash": "string",
+        "host_hash": "string",
+        "image_id": "Int64",
+        "io_cat": "Int8",
+        "size": "Int64",
+        "offset": "Int64",
     }
     return columns
 
@@ -146,7 +146,7 @@ def io_function(json_dict: dict):
     d[COL_IO_CAT] = IOCategory.OTHER.value
     if "args" in json_dict:
         if "fhash" in json_dict["args"]:
-            d["fhash"] = str(json_dict["args"]["fhash"])
+            d["file_hash"] = str(json_dict["args"]["fhash"])
         if "size_sum" in json_dict["args"]:
             d["size"] = int(json_dict["args"]["size_sum"])
         elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
@@ -177,10 +177,6 @@ def io_function(json_dict: dict):
     return d
 
 
-def is_pyarrow_dtype_supported() -> bool:
-    return sys.version_info >= (3, 9)
-
-
 def load_indexed_gzip_files(filename, start, end):
     index_file = f"{filename}.idx"
     reader = Reader(filename, index_file)
@@ -209,7 +205,7 @@ def load_objects_dict(
                 final_dict["tid"] = json_dict["tid"]
             if "args" in json_dict:
                 if "hhash" in json_dict["args"]:
-                    final_dict["hhash"] = str(json_dict["args"]["hhash"])
+                    final_dict["host_hash"] = str(json_dict["args"]["hhash"])
                 # if "level" in val["args"]:
                 #     d["level"] = int(val["args"]["level"])
                 # if (
@@ -374,175 +370,23 @@ class DFTracerAnalyzer(Analyzer):
         elif len(pfw_pattern) > 0:
             main_bag = pfw_bag
         if main_bag:
-            columns = {
-                "name": "string",
-                "cat": "string",
-                "type": "Int8",
-                "pid": "Int64",
-                "tid": "Int64",
-                "ts": "Int64",
-                "te": "Int64",
-                "dur": "Int64",
-                "tinterval": "Int64" if self.time_approximate else "string",
-                "trange": "Int64",
-                "level": "Int8",
-            }
-            if is_pyarrow_dtype_supported():
-                columns = {
-                    "name": "string[pyarrow]",
-                    "cat": "string[pyarrow]",
-                    "type": "uint8[pyarrow]",
-                    "pid": "uint64[pyarrow]",
-                    "tid": "uint64[pyarrow]",
-                    "ts": "uint64[pyarrow]",
-                    "te": "uint64[pyarrow]",
-                    "dur": "uint64[pyarrow]",
-                    "tinterval": "uint64[pyarrow]",
-                    "trange": "uint64[pyarrow]",
-                    "level": "uint8[pyarrow]",
-                }
-                if self.time_approximate:
-                    columns["tinterval"] = "string[pyarrow]"
-            columns.update(io_columns())
-            file_hash_columns = {
-                "name": "string",
-                "hash": "string",
-                "pid": "Int64",
-                "tid": "Int64",
-                "hhash": "string",
-            }
-            hostname_hash_columns = {
-                "name": "string",
-                "hash": "string",
-                "pid": "Int64",
-                "tid": "Int64",
-                "hhash": "string",
-            }
-            string_hash_columns = {
-                "name": "string",
-                "hash": "string",
-                "pid": "Int64",
-                "tid": "Int64",
-                "hhash": "string",
-            }
-            other_metadata_columns = {
-                "name": "string",
-                "value": "string",
-                "pid": "Int64",
-                "tid": "Int64",
-                "hhash": "string",
-            }
-            if is_pyarrow_dtype_supported():
-                file_hash_columns = {
-                    'name': "string[pyarrow]",
-                    'hash': "string[pyarrow]",
-                    'pid': "uint64[pyarrow]",
-                    'tid': "uint64[pyarrow]",
-                    'hhash': "string[pyarrow]",
-                }
-                hostname_hash_columns = {
-                    'name': "string[pyarrow]",
-                    'hash': "string[pyarrow]",
-                    'pid': "uint64[pyarrow]",
-                    'tid': "uint64[pyarrow]",
-                    'hhash': "string[pyarrow]",
-                }
-                string_hash_columns = {
-                    'name': "string[pyarrow]",
-                    'hash': "string[pyarrow]",
-                    'pid': "uint64[pyarrow]",
-                    'tid': "uint64[pyarrow]",
-                    'hhash': "string[pyarrow]",
-                }
-                other_metadata_columns = {
-                    'name': "string[pyarrow]",
-                    'value': "string[pyarrow]",
-                    'pid': "uint64[pyarrow]",
-                    'tid': "uint64[pyarrow]",
-                    'hhash': "string[pyarrow]",
-                }
-            columns.update(file_hash_columns)
-            columns.update(hostname_hash_columns)
-            columns.update(string_hash_columns)
-            columns.update(other_metadata_columns)
-            columns.update(extra_columns or {})
-            with log_block("to_dataframe+filter_events"):
-                self.all_events = main_bag.to_dataframe(meta=columns)
-                events = self.all_events.query("type == 0")
-            self.file_hash = (
-                self.all_events.query("type == 1")[list(file_hash_columns.keys())].groupby("hash").first().persist()
-            )
-            self.host_hash = (
-                self.all_events.query("type == 2")[list(hostname_hash_columns.keys())]
-                .groupby("hash")
-                .first()
-                .persist()
-            )
-            self.string_hash = (
-                self.all_events.query("type == 3")[list(string_hash_columns.keys())].groupby("hash").first().persist()
-            )
-            self.metadata = self.all_events.query("type == 4")[list(other_metadata_columns.keys())].persist()
-            with log_block("repartition+persist+indexing"):
-                self.n_partition = math.ceil(total_size / (128 * 1024**2))
-                logger.debug("Number of partitions used", n_partition=self.n_partition)
-                self.events = events.repartition(npartitions=self.n_partition).persist()
-                _ = wait(self.events)
-                self.events["ts"] = self.events["ts"] - self.events["ts"].min()
-                self.events["te"] = self.events["ts"] + self.events["dur"]
-                self.events["trange"] = self.events["ts"] // (self.time_granularity * self.time_resolution)
-                if is_pyarrow_dtype_supported():
-                    self.events["ts"] = self.events["ts"].astype("uint64[pyarrow]")
-                    self.events["te"] = self.events["te"].astype("uint64[pyarrow]")
-                    self.events["trange"] = self.events["trange"].astype("uint16[pyarrow]")
-                else:
-                    self.events["ts"] = self.events["ts"].astype("Int64")
-                    self.events["te"] = self.events["te"].astype("Int64")
-                    self.events["trange"] = self.events["trange"].astype("Int16")
-                self.events = self.events.persist()
-                _ = wait(
-                    [
-                        self.file_hash,
-                        self.host_hash,
-                        self.string_hash,
-                        self.metadata,
-                        self.events,
-                    ]
-                )
+            self._columns = self._get_columns(extra_columns)
+            with log_block("to_dataframe"):
+                raw_traces = main_bag.to_dataframe(meta=self._columns)
+            with log_block("_handle_metadata"):
+                traces = self._handle_metadata(raw_traces)
+            self._npartitions = math.ceil(total_size / (128 * 1024**2))
+            logger.debug(f"Number of partitions used are {self._npartitions}")
+            with log_block("repartition+persist"):
+                traces = traces.repartition(npartitions=self._npartitions).persist()
+            with log_block("_fix_time+persist"):
+                traces = self._fix_time(traces).persist()
+            with log_block("wait_all"):
+                wait([traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata])
         else:
             logger.error("Unable to load traces")
             exit(1)
-        # ===============================================
-        with log_block("normalize_durations"):
-            self.events["dur"] = self.events["dur"] / self.time_resolution
-
-        file_hashes = self.file_hash[["name"]].rename(columns={"name": COL_FILE_NAME})
-        host_hhash_empty = self.host_hash["hhash"].isna().all().compute()
-        if host_hhash_empty:
-            host_hashes = self.host_hash[["name"]].rename(columns={"name": COL_HOST_NAME})
-        else:
-            host_hashes = self.host_hash.set_index("hhash")[["name"]].rename(columns={"name": COL_HOST_NAME})
-
-        with log_block("join_hashes"):
-            self.events = (
-                self.events.merge(
-                    file_hashes,
-                    how="left",
-                    left_on="fhash",
-                    right_index=True,
-                )
-                .merge(
-                    host_hashes,
-                    how="left",
-                    left_on="hhash",
-                    right_index=True,
-                )
-                .drop(columns=["fhash", "hhash"])
-            )
-
-        with log_block("finalize+rename_columns+persist"):
-            self.events = self.events.rename(columns=TRACE_COL_MAPPING).persist()
-            _ = wait(self.events)
-            return self.events
+        return self._rename_columns(traces)
 
     def postread_trace(
         self,
@@ -613,6 +457,12 @@ class DFTracerAnalyzer(Analyzer):
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
 
+    def get_unique_file_count(self, traces: dd.DataFrame):
+        return traces["file_hash"].nunique()
+    
+    def get_unique_host_count(self, traces: dd.DataFrame):
+        return traces["host_hash"].nunique()
+
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
 
@@ -637,23 +487,17 @@ class DFTracerAnalyzer(Analyzer):
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
         base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
-    
+
         # Step 1: Map file purpose suffixes first
-        purpose_updates = {
-            "/data": "_reader",
-            "/checkpoint": "_checkpoint"
-        }
-        
+        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
+
         for path, suffix in purpose_updates.items():
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-        
+
         # Step 2: Map filesystem suffixes
-        filesystem_updates = {
-            "/lustre": "_lustre",
-            "/ssd": "_ssd"
-        }
-        
+        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
+
         for path, suffix in filesystem_updates.items():
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
@@ -705,6 +549,89 @@ class DFTracerAnalyzer(Analyzer):
 
         return df
 
+    def _fix_time(self, traces: dd.DataFrame) -> dd.DataFrame:
+        traces["ts"] = traces["ts"] - traces["ts"].min()
+        traces["te"] = traces["ts"] + traces["dur"]
+        traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
+        traces["ts"] = traces["ts"].astype("Int64")
+        traces["te"] = traces["te"].astype("Int64")
+        traces["trange"] = traces["trange"].astype("Int16")
+        traces["dur"] = traces["dur"] / self.time_resolution
+        return traces
+
+    def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
+        columns = {
+            "name": "string",
+            "cat": "string",
+            "type": "Int8",
+            "pid": "Int64",
+            "tid": "Int64",
+            "ts": "Int64",
+            "te": "Int64",
+            "dur": "Int64",
+            "tinterval": "Int64" if self.time_approximate else "string",
+            "trange": "Int64",
+            "level": "Int8",
+        }
+        metadata_columns = {
+            "hash": "string",
+            "host_hash": "string",
+            "value": "string",
+        }
+        columns.update(io_columns())
+        columns.update(metadata_columns)
+        columns.update(extra_columns or {})
+        logger.debug("get_columns", columns=columns)
+        return columns
+
+    def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
+        # print('=' * 33)
+        # print('Handling metadata:\n')
+        # print('>Raw traces:\n')
+        # print(raw_traces)
+        is_dask = isinstance(raw_traces, dd.DataFrame)
+        traces = raw_traces.query("type == 0")
+        file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
+        host_hashes = raw_traces.query("type == 2")[["name", "hash"]].groupby("hash").first()
+        string_hashes = raw_traces.query("type == 3")[["name", "hash"]].groupby("hash").first()
+        metadata = raw_traces.query("type == 4")[["name", "value"]]
+        file_hashes.index = file_hashes.index.astype(str)
+        host_hashes.index = host_hashes.index.astype(str)
+        string_hashes.index = string_hashes.index.astype(str)
+        if is_dask:
+            file_hashes = file_hashes.persist()
+            host_hashes = host_hashes.persist()
+            string_hashes = string_hashes.persist()
+            metadata = metadata.persist()
+        # print('file_hash dtype', traces["file_hash"].dtype)
+        # print('host_hash dtype', traces["host_hash"].dtype)
+        # print('file_hash index dtype', file_hashes.index.dtype)
+        # print('host_hash index dtype', host_hashes.index.dtype)
+        traces = traces.merge(
+            file_hashes.rename(columns={"name": COL_FILE_NAME}),
+            how="left",
+            left_on="file_hash",
+            right_index=True,
+        )
+        traces = traces.merge(
+            host_hashes.rename(columns={"name": COL_HOST_NAME}),
+            how="left",
+            left_on="host_hash",
+            right_index=True,
+        )
+        self._file_hashes = file_hashes
+        self._host_hashes = host_hashes
+        self._string_hashes = string_hashes
+        self._metadata = metadata
+        # print('>Traces:\n')
+        # print(traces)
+        # print('=' * 33)
+        return traces
+
+    @staticmethod
+    def _rename_columns(traces: dd.DataFrame) -> dd.DataFrame:
+        return traces.rename(columns=TRACE_COL_MAPPING)
+
     @staticmethod
     def _sanitize_size_offset(df: pd.DataFrame):
         df["size"] = df["size"].replace(0, pd.NA)
@@ -733,7 +660,12 @@ class DFTracerAnalyzer(Analyzer):
     @staticmethod
     def _set_proc_names(df: pd.DataFrame):
         df[COL_PROC_NAME] = (
-            "app#" + df[COL_HOST_NAME].astype(str) + "#" + df["pid"].astype(str) + "#" + df["tid"].astype(str)
+            "app#"
+            + df[COL_HOST_NAME].astype(str).fillna("unknown")
+            + "#"
+            + df["pid"].astype(str)
+            + "#"
+            + df["tid"].astype(str)
         )
         return df
 
