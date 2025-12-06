@@ -81,11 +81,11 @@ IGNORED_FUNC_PATTERNS = [
     "checkpoint_start_",
 ]
 TRACE_COL_MAPPING = {
-    'dur': COL_TIME,
-    'name': COL_FUNC_NAME,
-    'te': COL_TIME_END,
-    'trange': COL_TIME_RANGE,
-    'ts': COL_TIME_START,
+    "dur": COL_TIME,
+    "name": COL_FUNC_NAME,
+    "te": COL_TIME_END,
+    "trange": COL_TIME_RANGE,
+    "ts": COL_TIME_START,
 }
 
 
