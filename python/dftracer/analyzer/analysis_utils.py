@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pandas as pd
 import re
+import structlog
 from typing import Union
 
 from .constants import (
@@ -18,6 +19,8 @@ from .constants import (
     SIZE_BINS,
     SIZE_BIN_SUFFIXES,
 )
+
+logger = structlog.get_logger()
 
 
 def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
@@ -56,7 +59,7 @@ def set_app_name(df: pd.DataFrame):
         app_name=lambda df: df.index.get_level_values(COL_PROC_NAME)
         .str.split(PROC_NAME_SEPARATOR)
         .str[0]
-        .astype("string[pyarrow]"),
+        .astype("string"),
     )
 
 
@@ -65,7 +68,7 @@ def set_host_name(df: pd.DataFrame):
         app_name=lambda df: df.index.get_level_values(COL_PROC_NAME)
         .str.split(PROC_NAME_SEPARATOR)
         .str[1]
-        .astype("string[pyarrow]"),
+        .astype("string"),
     )
 
 
@@ -73,7 +76,7 @@ def set_file_dir(df: pd.DataFrame):
     if COL_FILE_NAME not in df.index.names:
         return df
     return df.assign(
-        file_dir=df.index.get_level_values(COL_FILE_NAME).map(os.path.dirname).astype("string[pyarrow]"),
+        file_dir=df.index.get_level_values(COL_FILE_NAME).map(os.path.dirname).astype("string"),
     )
 
 
@@ -85,7 +88,7 @@ def set_file_pattern(df: pd.DataFrame):
         return re.sub('[0-9]+', FILE_PATTERN_PLACEHOLDER, file_name)
 
     return df.assign(
-        file_pattern=df.index.get_level_values(COL_FILE_NAME).map(_apply_regex).astype("string[pyarrow]"),
+        file_pattern=df.index.get_level_values(COL_FILE_NAME).map(_apply_regex).astype("string"),
     )
 
 
@@ -144,8 +147,17 @@ def set_unique_counts(df: pd.DataFrame, layer: str):
         if COL_FILE_NAME in unique_col and 'posix' not in layer:
             continue
         nunique_col = unique_col.replace('_unique', '_nunique')
-        # Handle null values before applying len() - null values should map to 0
-        df[nunique_col] = df[unique_col].map(lambda x: len(x) if pd.notna(x) else 0).astype('uint64[pyarrow]')
+        if df[unique_col].isnull().all():
+            if df[unique_col].dtype != 'object':
+                logger.warning(
+                    "Column '%s' is not of object dtype (actual: %s) and all values are null during 'set_unique_counts'",
+                    unique_col,
+                    df[unique_col].dtype,
+                )
+            df[nunique_col] = 0
+        else:
+            df[nunique_col] = df[unique_col].map(len)
+        df[nunique_col] = df[nunique_col].astype('Int32')
     return df.drop(columns=unique_cols)
 
 
@@ -155,7 +167,10 @@ def split_duration_records_vectorized(
     time_resolution: float,
 ) -> pd.DataFrame:
     # Convert duration column to numpy array
-    durations = df[COL_TIME].to_numpy()
+    durations = df[COL_TIME].fillna(0).to_numpy()
+
+    if durations.size == 0:
+        return df
 
     # Calculate number of chunks needed for each row
     n_chunks = np.ceil(durations / time_granularity).astype(int)
