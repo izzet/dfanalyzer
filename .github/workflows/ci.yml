@@ -133,7 +133,7 @@ jobs:
           wait $cluster_pid 2>/dev/null || true
 
       - name: Run C++ tooling tests
-        if: steps.test_type.outputs.test_type == "full"
+        if: steps.test_type.outputs.test_type == 'full'
         run: |
           rm -rf build
           meson build --prefix=$HOME/.local -Denable_tests=true -Denable_tools=true
