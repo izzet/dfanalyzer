@@ -1,3 +1,4 @@
+import os
 import pathlib
 import pytest
 import random
@@ -88,6 +89,10 @@ def _test_e2e(
         f"trace_path={trace_path}",
         f"view_types=[{','.join(view_types)}]",
     ]
+
+    # Allow enabling debug logs for investigation via env var
+    if os.getenv("DFANALYZER_DEBUG", "").lower() in {"1", "true", "yes"}:
+        hydra_overrides.append("debug=True")
 
     assign_epochs = analyzer == "dftracer" and preset == "dlio"
     if assign_epochs:

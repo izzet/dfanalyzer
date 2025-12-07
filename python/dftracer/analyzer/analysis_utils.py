@@ -4,7 +4,7 @@ import os
 import pandas as pd
 import re
 import structlog
-from typing import Union
+from typing import List, Union
 
 from .constants import (
     COL_COUNT,
@@ -52,6 +52,10 @@ def fix_size_values(df: pd.DataFrame):
     size_cols = [col for col in df.columns if 'size' in col]
     df[size_cols] = df[size_cols].replace(0, pd.NA)
     return df
+
+
+def fix_std_cols(df: pd.DataFrame, std_cols: List[str]):
+    return df.assign(**{col: pd.to_numeric(df[col], errors="coerce").astype("float64") for col in std_cols})
 
 
 def set_app_name(df: pd.DataFrame):

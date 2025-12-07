@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .analysis_utils import (
     fix_dtypes,
+    fix_std_cols,
     set_file_dir,
     set_file_pattern,
     set_size_bins,
@@ -1054,6 +1055,11 @@ class Analyzer(abc.ABC):
                         f"Developer must add explicit handling for this data type in _compute_view method."
                     )
             view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+
+        with log_block("fix_std_cols", layer=layer, view_key=view_key):
+            # Fix std columns to avoid pandas extension dtypes producing object arrays inside Dask.
+            std_cols = [col for col, aggs in view_agg.items() if isinstance(aggs, list) and "std" in aggs]
+            records = records.map_partitions(fix_std_cols, std_cols=std_cols)
 
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
