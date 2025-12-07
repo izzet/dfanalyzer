@@ -55,6 +55,25 @@ def fix_size_values(df: pd.DataFrame):
 
 
 def fix_std_cols(df: pd.DataFrame, std_cols: List[str]):
+    """
+    Convert specified standard deviation columns to float64 dtype.
+
+    This function is needed to ensure that columns representing standard deviations
+    are stored as float64, which avoids issues with object arrays in Dask and ensures
+    consistent numeric operations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame.
+    std_cols : List[str]
+        List of column names to convert to float64.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with specified columns converted to float64 dtype.
+    """
     return df.assign(**{col: pd.to_numeric(df[col], errors="coerce").astype("float64") for col in std_cols})
 
 
