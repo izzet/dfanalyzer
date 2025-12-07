@@ -143,15 +143,15 @@ def set_cross_layer_metrics(
     compute_time_metric = f"compute_{time_metric}"
     time_boundary_metric = f"{time_boundary_layer}_{time_metric}"
 
-    new_metrics: List[str] = []
+    # Collect new columns and assign them in batch to avoid fragmentation warnings
+    x_layer_metrics: Dict[str, pd.Series] = {}
 
     # Set relational time metrics for layers
     for layer in layers:
         layer_time = df[f"{layer}_{time_metric}"]
 
         time_frac_boundary_col = f"{layer}_time_frac_{time_boundary_layer}"
-        df[time_frac_boundary_col] = layer_time / df[time_boundary_metric]
-        new_metrics.append(time_frac_boundary_col)
+        x_layer_metrics[time_frac_boundary_col] = layer_time / df[time_boundary_metric]
 
         child_layers = [child for child, parent in layer_deps.items() if parent == layer]
         if not child_layers:
@@ -166,22 +166,20 @@ def set_cross_layer_metrics(
         o_time = np.maximum(layer_time - child_time_sum, 0)
         o_time_sum = o_time.sum()
 
-        df[o_time_col] = pd.array(o_time, dtype='Float64')
-        df[o_time_frac_boundary_col] = df[o_time_col] / df[time_boundary_metric]
-        df[o_time_frac_self_col] = df[o_time_col] / layer_time
-        df[o_time_frac_total_col] = pd.NA
+        o_time_series = pd.array(o_time, dtype='Float64')
+        x_layer_metrics[o_time_col] = o_time_series
+        x_layer_metrics[o_time_frac_boundary_col] = o_time_series / df[time_boundary_metric]
+        x_layer_metrics[o_time_frac_self_col] = o_time_series / layer_time
+        x_layer_metrics[o_time_frac_total_col] = pd.NA
         if o_time_sum > 0:
-            df[o_time_frac_total_col] = df[o_time_col] / o_time_sum
-
-        new_metrics.extend([o_time_col, o_time_frac_self_col, o_time_frac_boundary_col, o_time_frac_total_col])
+            x_layer_metrics[o_time_frac_total_col] = o_time_series / o_time_sum
 
         layer_has_time = layer_time.sum() > 0
         for child_layer in child_layers:
             time_frac_parent_col = f"{child_layer}_time_frac_parent"
-            df[time_frac_parent_col] = pd.NA
+            x_layer_metrics[time_frac_parent_col] = pd.NA
             if layer_has_time:
-                df[time_frac_parent_col] = df[f"{child_layer}_{time_metric}"] / layer_time
-            new_metrics.append(time_frac_parent_col)
+                x_layer_metrics[time_frac_parent_col] = df[f"{child_layer}_{time_metric}"] / layer_time
 
     # Set relational time metrics for derived metrics
     for layer in derived_metrics:
@@ -199,14 +197,12 @@ def set_cross_layer_metrics(
             dm_time = df[dm_time_col]
             dm_time_sum = dm_time.sum()
 
-            df[dm_time_frac_boundary_col] = dm_time / df[time_boundary_metric]
-            df[dm_time_frac_parent_col] = dm_time / df[f"{layer}_{time_metric}"]
-            df[dm_time_frac_total_col] = pd.NA
+            x_layer_metrics[dm_time_frac_boundary_col] = dm_time / df[time_boundary_metric]
+            x_layer_metrics[dm_time_frac_parent_col] = dm_time / df[f"{layer}_{time_metric}"]
+            x_layer_metrics[dm_time_frac_total_col] = pd.NA
 
             if dm_time_sum > 0:
-                df[dm_time_frac_total_col] = dm_time / dm_time_sum
-
-            new_metrics.extend([dm_time_frac_boundary_col, dm_time_frac_parent_col, dm_time_frac_total_col])
+                x_layer_metrics[dm_time_frac_total_col] = dm_time / dm_time_sum
 
     # Set unoverlapped times if there is compute time
     if compute_time_metric in df.columns:
@@ -224,22 +220,23 @@ def set_cross_layer_metrics(
             u_time = (layer_time - compute_time).clip(lower=0).astype('Float64')
             u_time_sum = u_time.sum()
 
-            df[u_time_col] = pd.array(u_time, dtype='Float64')
-            df[u_time_frac_self_col] = u_time / layer_time
-            df[u_time_frac_boundary_col] = u_time / df[time_boundary_metric]
-            df[u_time_frac_total_col] = pd.NA
+            u_time_series = pd.array(u_time, dtype='Float64')
+            x_layer_metrics[u_time_col] = u_time_series
+            x_layer_metrics[u_time_frac_self_col] = u_time_series / layer_time
+            x_layer_metrics[u_time_frac_boundary_col] = u_time_series / df[time_boundary_metric]
+            x_layer_metrics[u_time_frac_total_col] = pd.NA
             if u_time_sum > 0:
-                df[u_time_frac_total_col] = u_time / u_time_sum
-
-            new_metrics.extend([u_time_col, u_time_frac_boundary_col, u_time_frac_self_col, u_time_frac_total_col])
+                x_layer_metrics[u_time_frac_total_col] = u_time_series / u_time_sum
 
             parent_layer = layer_deps.get(async_layer)
             if parent_layer:
                 u_time_frac_parent_col = f"u_{async_layer}_time_frac_parent"
-                df[u_time_frac_parent_col] = u_time / df[f"{parent_layer}_{time_metric}"]
-                new_metrics.append(u_time_frac_parent_col)
+                x_layer_metrics[u_time_frac_parent_col] = u_time_series / df[f"{parent_layer}_{time_metric}"]
 
-    df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
+    if x_layer_metrics:
+        df = df.assign(**x_layer_metrics)
+        x_layer_cols = list(x_layer_metrics.keys())
+        df[x_layer_cols] = df[x_layer_cols].replace([np.inf, -np.inf], pd.NA).astype('Float64')
 
     return df.sort_index(axis=1)
 
