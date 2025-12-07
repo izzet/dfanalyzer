@@ -137,8 +137,6 @@ def set_cross_layer_metrics(
     is_view_process_based: bool,
     time_boundary_layer: str,
 ) -> pd.DataFrame:
-    df = df.copy()
-
     time_metric = 'time_sum' if is_view_process_based else 'time_max'
     compute_time_metric = f"compute_{time_metric}"
     time_boundary_metric = f"{time_boundary_layer}_{time_metric}"
@@ -234,6 +232,7 @@ def set_cross_layer_metrics(
                 x_layer_metrics[u_time_frac_parent_col] = u_time_series / df[f"{parent_layer}_{time_metric}"]
 
     if x_layer_metrics:
+        df = df.copy()
         df = df.assign(**x_layer_metrics)
         x_layer_cols = list(x_layer_metrics.keys())
         df[x_layer_cols] = df[x_layer_cols].replace([np.inf, -np.inf], pd.NA).astype('Float64')
