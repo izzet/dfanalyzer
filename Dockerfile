@@ -18,7 +18,6 @@ RUN apt-get update && \
     libopenmpi-dev \
     libparquet-dev \
     libreadline-dev \
-    meson \
     ninja-build \
     nlohmann-json3-dev \
     openmpi-bin \
@@ -32,7 +31,7 @@ WORKDIR /dfanalyzer
 COPY . .
 
 RUN pip install --upgrade pip && \
-    pip install build meson-python setuptools streamlit wheel && \
+    pip install build "meson>=1.5.0,<1.10.0" meson-python setuptools streamlit wheel && \
     pip install .[darshan] -Csetup-args="-Denable_tools=true"
 
 ENTRYPOINT ["dfanalyzer"]
