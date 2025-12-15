@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .analysis_utils import (
     fix_dtypes,
+    fix_std_cols,
     set_file_dir,
     set_file_pattern,
     set_size_bins,
@@ -58,9 +59,9 @@ CHECKPOINT_MAIN_VIEW = "_main_view"
 CHECKPOINT_RAW_STATS = "_raw_stats"
 CHECKPOINT_VIEW = "_view"
 HLM_AGG = {
-    "time": sum,
-    "count": sum,
-    "size": sum,
+    "time": "sum",
+    "count": "sum",
+    "size": "sum",
 }
 HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 PARTITION_SIZE = "128MB"
@@ -534,6 +535,9 @@ class Analyzer(abc.ABC):
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
 
+    def get_time_boundary_layer(self):
+        return list(self.preset.layer_defs)[0]
+
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         """Computes the total number of I/O events in the traces.
 
@@ -964,7 +968,7 @@ class Analyzer(abc.ABC):
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
         hlm_agg = dict(HLM_AGG)
-        hlm_agg.update({col: sum for col in bin_cols})
+        hlm_agg.update({col: "sum" for col in bin_cols})
         hlm_agg.update({col: unique_set() for col in view_types_diff})
         hlm = (
             traces.groupby(hlm_groupby)
@@ -997,7 +1001,7 @@ class Analyzer(abc.ABC):
                 if any(map(col.endswith, view_types_diff)):
                     main_view_agg[col] = unique_set_flatten()
                 elif col not in HLM_EXTRA_COLS:
-                    main_view_agg[col] = sum
+                    main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
             main_view = (
                 hlm.groupby(list(view_types))
@@ -1027,16 +1031,16 @@ class Analyzer(abc.ABC):
             view_agg = {}
             for col in records.columns:
                 if "_bin_" in col:
-                    view_agg[col] = [sum]
+                    view_agg[col] = ["sum"]
                 elif any(map(col.endswith, view_types_diff)):
                     view_agg[col] = [unique_set_flatten()]
                 elif col in it.chain.from_iterable(self.logical_views.values()):
                     view_agg[col] = [unique_set_flatten()]
                 elif pd.api.types.is_numeric_dtype(records[col].dtype):
                     view_agg[col] = [
-                        sum,
-                        min,
-                        max,
+                        "sum",
+                        "min",
+                        "max",
                         "mean",
                         "std",
                     ]
@@ -1052,22 +1056,18 @@ class Analyzer(abc.ABC):
                     )
             view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
+        with log_block("fix_std_cols", layer=layer, view_key=view_key):
+            # Fix std columns to avoid pandas extension dtypes producing object arrays inside Dask.
+            std_cols = [col for col, aggs in view_agg.items() if isinstance(aggs, list) and "std" in aggs]
+            records = records.map_partitions(fix_std_cols, std_cols=std_cols)
+
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
             if view_type != COL_PROC_NAME:
                 pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = (
-                pre_view.groupby([view_type])
-                .agg(view_agg)
-                .replace(0, pd.NA)
-                .map_partitions(
-                    set_view_metrics,
-                    is_view_process_based=is_view_process_based,
-                    time_granularity=self.time_granularity,
-                )
-            )
+            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
             view = (
@@ -1086,13 +1086,21 @@ class Analyzer(abc.ABC):
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
+        with log_block("set_view_metrics", view_key=view_key):
+            flat_view = set_view_metrics(
+                flat_view,
+                is_view_process_based=is_view_process_based,
+                metric_boundaries=metric_boundaries[view_type],
+            )
         with log_block("set_cross_layer_metrics", view_key=view_key):
             flat_view = set_cross_layer_metrics(
                 flat_view,
-                layer_defs=self.preset.layer_defs,
-                layer_deps=self.preset.layer_deps,
                 async_layers=self.preset.async_layers,
+                derived_metrics=self.preset.derived_metrics,
                 is_view_process_based=is_view_process_based,
+                layers=self.layers,
+                layer_deps=self.preset.layer_deps,
+                time_boundary_layer=self.get_time_boundary_layer(),
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)

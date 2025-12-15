@@ -1,3 +1,4 @@
+import os
 import pathlib
 import pytest
 import random
@@ -89,6 +90,10 @@ def _test_e2e(
         f"view_types=[{','.join(view_types)}]",
     ]
 
+    # Allow enabling debug logs for investigation via env var
+    if os.getenv("DFANALYZER_DEBUG", "").lower() in {"1", "true", "yes"}:
+        hydra_overrides.append("debug=True")
+
     assign_epochs = analyzer == "dftracer" and preset == "dlio"
     if assign_epochs:
         hydra_overrides.append("analyzer.assign_epochs=True")
@@ -112,7 +117,7 @@ def _test_e2e(
         f"Expected {len(dfa.hydra_config.analyzer.preset.layer_defs)} layers, got {len(result.layers)}"
     )
     if checkpoint:
-        assert any(glob(f"{result.checkpoint_dir}/*.json")), "No checkpoint found"
+        assert any(glob(f"{result.checkpoint_dir}/*.parquet")), "No checkpoint found"
 
     # Shutdown the Dask client and cluster
     dfa.shutdown()
