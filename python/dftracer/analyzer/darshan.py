@@ -6,9 +6,11 @@ import os
 import pandas as pd
 
 from .analyzer import Analyzer
-from .constants import COL_TIME_END, COL_TIME_START, IOCategory
+from .constants import COL_TIME_END, COL_TIME_START, IOCategory, Layer
 from .types import RawStats
 
+DEFAULT_APP_NAME = 'app'
+DEFAULT_HOST_NAME = 'localhost'
 TRACE_COL_MAPPING = {
     'end_time': COL_TIME_END,
     'start_time': COL_TIME_START,
@@ -73,16 +75,23 @@ class DarshanAnalyzer(Analyzer):
             job_time=self.job_time,
             time_granularity=self.time_granularity,
             time_resolution=self.time_resolution,
-            total_count=len(file_name_view),
+            total_event_count=len(file_name_ddf),
+            unique_file_count=file_name_ddf['file_name'].nunique(),
+            unique_host_count=file_name_ddf['host_name'].nunique(),
+            unique_process_count=file_name_ddf['proc_name'].nunique(),
         )
 
-        # return file_name_view
-        return self._analyze_main_view(
-            main_view=file_name_view,
-            metrics=metrics,
-            view_types=view_types,
+        if len(self.preset.layer_defs) != 1 or Layer.POSIX not in self.preset.layer_defs:
+            raise ValueError(f"Darshan analyzer only supports the '{Layer.POSIX}' layer. Got {self.preset.layer_defs}.")
+
+        return self._analyze_hlm(
+            hlm=None,
+            is_dask=True,
+            layer_main_views={Layer.POSIX: file_name_view},
+            logical_view_types=logical_view_types,
+            metric_boundaries=metric_boundaries,
+            proc_view_types=self.ensure_proc_view_type(view_types=view_types),
             raw_stats=raw_stats,
-            exclude_characteristics=exclude_characteristics,
         )
 
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
@@ -111,7 +120,7 @@ class DarshanAnalyzer(Analyzer):
             rank = record['rank']
             host_name = record['hostname']
             file_name = report.data['name_records'][file_id]
-            proc_name = f"app#localhost#{rank}#0"
+            proc_name = f"{DEFAULT_APP_NAME}#{DEFAULT_HOST_NAME}#{rank}#0"
 
             # Process read segments
             if not record['read_segments'].empty:
@@ -130,6 +139,7 @@ class DarshanAnalyzer(Analyzer):
                             'file_name': file_name,
                             'proc_name': proc_name,
                             'size': lengths[i],
+                            'offset': offsets[i],
                             'end_time': end_times[i],
                             'start_time': start_times[i],
                             'func_name': 'read',
@@ -160,6 +170,7 @@ class DarshanAnalyzer(Analyzer):
                             'file_name': file_name,
                             'proc_name': proc_name,
                             'size': lengths[i],
+                            'offset': offsets[i],
                             'end_time': end_times[i],
                             'start_time': start_times[i],
                             'func_name': 'write',
@@ -208,7 +219,8 @@ class DarshanAnalyzer(Analyzer):
                 right_index=True,
             )
             .reset_index()
-            .assign(proc_name=lambda x: 'app#localhost#' + x['rank'].astype(str) + '#0')
+            .assign(host_name=lambda x: DEFAULT_HOST_NAME)
+            .assign(proc_name=lambda x: DEFAULT_APP_NAME + '#' + x['host_name'] + '#' + x['rank'].astype(str) + '#0')
             # .set_index(['proc_name', 'file_name'])
             .drop(columns=['id', 'rank'])
             .query('~(file_name.str.startswith("<") and file_name.str.endswith(">"))')

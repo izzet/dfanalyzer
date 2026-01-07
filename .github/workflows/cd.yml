@@ -1,0 +1,78 @@
+name: Deploy
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        python: ["3.9", "3.10", "3.11", "3.12"]
+    name: ${{ matrix.python }}-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            ca-certificates \
+            lsb-release \
+            wget
+          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            cmake \
+            git \
+            libarrow-dev \
+            libhdf5-dev \
+            libncurses-dev \
+            libopenmpi-dev \
+            libparquet-dev \
+            libreadline-dev \
+            ninja-build \
+            nlohmann-json3-dev \
+            openmpi-bin \
+            openmpi-common
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade auditwheel build "meson>=1.5.0,<1.10.0" meson-python patchelf setuptools wheel
+      - name: Build DFAnalyzer
+        run: |
+          python3 -m build -Csetup-args="--prefix=$HOME/.local" -Csetup-args="-Denable_tools=true" .
+          target_platform=$(auditwheel show dist/*.whl | grep manylinux_ | awk -F'"' '{print $2}')
+          auditwheel repair dist/*.whl --plat $target_platform --wheel-dir dist/
+          rm dist/*linux_x86_64.whl
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dists-${{ strategy.job-index }}
+          path: dist/
+  pypi-publish:
+    runs-on: ubuntu-22.04
+    needs:
+      - release-build
+    steps:
+      - name: Retrieve release distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-dists-*
+          path: dist/
+          merge-multiple: true
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_TOKEN }}

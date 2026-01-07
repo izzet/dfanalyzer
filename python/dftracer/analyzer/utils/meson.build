@@ -14,5 +14,5 @@ py.install_sources(
         'streaming.py',
         'warning_utils.py',
     ],
-    subdir: 'dfanalyzer/utils',
+    subdir: 'dftracer/analyzer/utils',
 )

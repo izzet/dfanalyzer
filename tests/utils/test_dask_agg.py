@@ -3,7 +3,7 @@ import pandas as pd
 import dask.dataframe as dd
 import pytest
 
-from dfanalyzer.utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
+from dftracer.analyzer.utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]

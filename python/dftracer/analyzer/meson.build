@@ -1,5 +1,6 @@
 py.install_sources(
     [
+        ver_py,
         '__init__.py',
         '__main__.py',
         'analysis.py',
@@ -16,7 +17,7 @@ py.install_sources(
         'recorder.py',
         'types.py',
     ],
-    subdir: 'dfanalyzer',
+    subdir: 'dftracer/analyzer',
 )
 
 subdir('utils')

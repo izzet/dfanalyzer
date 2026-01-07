@@ -1,4 +1,4 @@
-import dfanalyzer.utils.warning_utils  # noqa: F401
+import dftracer.analyzer.utils.warning_utils  # noqa: F401
 import hydra
 import signal
 import structlog

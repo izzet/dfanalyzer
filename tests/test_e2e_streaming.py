@@ -4,8 +4,8 @@ import pytest
 import threading
 import time
 import zmq
-from dfanalyzer import init_with_hydra
-from dfanalyzer.utils.streaming import is_streaming_available
+from dftracer.analyzer import init_with_hydra
+from dftracer.analyzer.utils.streaming import is_streaming_available
 from typing import List
 
 # Ensure this module runs in both smoke and full CI modes

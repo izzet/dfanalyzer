@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dfanalyzer.metrics import (
+from dftracer.analyzer.metrics import (
     set_cross_layer_metrics,
     set_main_metrics,
     set_quantile_metrics,

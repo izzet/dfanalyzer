@@ -4,7 +4,7 @@ import os
 import pandas as pd
 import re
 import structlog
-from typing import Union
+from typing import List, Union
 
 from .constants import (
     COL_COUNT,
@@ -23,10 +23,10 @@ from .constants import (
 logger = structlog.get_logger()
 
 
-def fix_dtypes(df: pd.DataFrame):
+def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
+    if df.empty:
+        return df
     int_cols = []
-    int_cols.extend([col for col in df.columns if '_bin_' in col])
-    int_cols.extend([col for col in df.columns if col.endswith('_count')])
     int_cols.extend([col for col in df.columns if col.endswith('_nunique')])
     double_cols = []
     double_cols.extend([col for col in df.columns if col.endswith('_bw')])
@@ -36,16 +36,55 @@ def fix_dtypes(df: pd.DataFrame):
     double_cols.extend([col for col in df.columns if col.endswith('_slope')])
     double_cols.extend([col for col in df.columns if col.endswith('_pct')])
     size_cols = [col for col in df.columns if col.endswith('_size')]
+    if time_sliced:
+        double_cols.extend([col for col in df.columns if '_bin_' in col])
+        double_cols.extend([col for col in df.columns if col.endswith('_count')])
+    else:
+        int_cols.extend([col for col in df.columns if '_bin_' in col])
+        int_cols.extend([col for col in df.columns if col.endswith('_count')])
     df[int_cols] = df[int_cols].astype('Int64')
     df[double_cols] = df[double_cols].astype('Float64')
     df[size_cols] = df[size_cols].astype('Int64')
     return df
 
 
+def fix_hlm_dtypes(df: pd.DataFrame, time_sliced: bool = False):
+    df["time"] = pd.to_numeric(df["time"], errors="coerce").astype("Float64")
+    df["size"] = pd.to_numeric(df["size"], errors="coerce").astype("Int64")
+    if time_sliced:
+        df["count"] = pd.to_numeric(df["count"], errors="coerce").astype("Float64")
+    else:
+        df["count"] = pd.to_numeric(df["count"], errors="coerce").astype("Int64")
+    return df
+
+
 def fix_size_values(df: pd.DataFrame):
     size_cols = [col for col in df.columns if 'size' in col]
-    df[size_cols] = df[size_cols].replace(0, np.nan)
+    df[size_cols] = df[size_cols].replace(0, pd.NA)
     return df
+
+
+def fix_std_cols(df: pd.DataFrame, std_cols: List[str]):
+    """
+    Convert specified standard deviation columns to float64 dtype.
+
+    This function is needed to ensure that columns representing standard deviations
+    are stored as float64, which avoids issues with object arrays in Dask and ensures
+    consistent numeric operations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame.
+    std_cols : List[str]
+        List of column names to convert to float64.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with specified columns converted to float64 dtype.
+    """
+    return df.assign(**{col: pd.to_numeric(df[col], errors="coerce").astype("float64") for col in std_cols})
 
 
 def set_app_name(df: pd.DataFrame):

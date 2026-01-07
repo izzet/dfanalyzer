@@ -5,10 +5,10 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import tempfile
-from dfanalyzer import init_with_hydra
-from dfanalyzer.constants import XFER_SIZE_BIN_LABELS
-from dfanalyzer.rules import KnownCharacteristics
-from dfanalyzer.types import Characteristics, RawStats
+from dftracer.analyzer import init_with_hydra
+from dftracer.analyzer.constants import XFER_SIZE_BIN_LABELS
+from dftracer.analyzer.rules import KnownCharacteristics
+from dftracer.analyzer.types import Characteristics, RawStats
 
 DEFAULT_THRESHOLD = 45
 DEFAULT_TIME_GRANULARITY_IN_SECONDS = 5  # 5 seconds

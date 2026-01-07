@@ -9,8 +9,7 @@ import os
 import pandas as pd
 import portion as I
 import structlog
-import sys
-import zindex_py as zindex
+from dftracer.utils import Indexer, Reader
 from dask.distributed import wait
 from typing import Callable, Dict, List, Optional
 
@@ -35,27 +34,12 @@ from .constants import (
     IOCategory,
 )
 from .types import ViewType
-from .utils.log_utils import console_block, log_block
+from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
 
 CAT_POSIX = "POSIX"
 CAT_STDIO = "STDIO"
-COND_CHECKPOINT = {
-    "cat": {"checkpoint"},
-    "name": {"TFCheckpointing.checkpoint"},
-}
-COND_COMPUTE = {
-    "cat": {"compute"},
-    "name": {"TFFramework.compute", "compute", "cpu"},
-}
-COND_READ = {
-    "cat": {"IO"},
-    "name": {
-        "TFReader._parse_image",
-        "TorchDataset.__getitem__",
-    },
-}
 IGNORED_FILE_PATTERNS = [
     "/dev/",
     "/etc/",
@@ -109,55 +93,34 @@ TRACE_COL_MAPPING = {
 
 
 def create_index(filename):
-    index_file = f"{filename}.zindex"
+    index_file = f"{filename}.idx"
     if not os.path.exists(index_file):
-        status = zindex.create_index(
-            filename,
-            index_file=f"file:{index_file}",
-            regex="id:\b([0-9]+)",
-            numeric=True,
-            unique=True,
-            debug=False,
-            verbose=False,
-        )
-        logger.debug("Creating index", filename=filename, status=status)
+        indexer = Indexer(filename, index_file, checkpoint_size=32 * 1024 * 1024)
+        indexer.build()
+        logger.debug("Creating index", filename=filename)
     return filename
 
 
-def generate_line_batches(filename, max_line):
-    batch_size = 1024 * 16
-    for start in range(0, max_line, batch_size):
-        end = min((start + batch_size - 1), (max_line - 1))
+def generate_batches(filename, max_bytes):
+    batch_size = 4 * 1024 * 1024  # 4 MB
+    for start in range(0, max_bytes, batch_size):
+        # this range is intended since DFTracerJsonLinesBytesReader do
+        # line boundary algorithm internally to chop incomplete line
+        end = min(start + batch_size, max_bytes)
         logger.debug("Created batch", filename=filename, start=start, end=end)
         yield filename, start, end
 
 
-def get_linenumber(filename):
-    index_file = f"{filename}.zindex"
-    line_number = zindex.get_max_line(
-        filename,
-        index_file=index_file,
-        debug=False,
-        verbose=False,
-    )
-    logger.debug("File has lines", filename=filename, line_number=line_number)
-    return (filename, line_number)
-
-
 def get_size(filename):
+    size = 0
     if filename.endswith(".pfw"):
         size = os.stat(filename).st_size
     elif filename.endswith(".pfw.gz"):
-        index_file = f"{filename}.zindex"
-        line_number = zindex.get_max_line(
-            filename,
-            index_file=index_file,
-            debug=False,
-            verbose=False,
-        )
-        size = line_number * 256
+        index_file = f"{filename}.idx"
+        indexer = Indexer(filename, index_file)
+        size = indexer.get_max_bytes()
     logger.debug("File has size", filename=filename, size=size / 1024**3)
-    return int(size)
+    return filename, int(size)
 
 
 def get_io_cat(func_name: str):
@@ -217,34 +180,23 @@ def io_function(json_dict: dict):
 
 
 def load_indexed_gzip_files(filename, start, end):
-    index_file = f"{filename}.zindex"
-    json_lines = zindex.zquery(
-        filename,
-        index_file=index_file,
-        raw=f"select a.line from LineOffsets a where a.line >= {start} AND a.line <= {end};",
-        debug=False,
-        verbose=False,
-    )
+    index_file = f"{filename}.idx"
+    reader = Reader(filename, index_file)
+    json_lines = reader.read_line_bytes_json(start, end)
     logger.debug("Read json lines", filename=filename, start=start, end=end, num_lines=len(json_lines))
     return json_lines
 
 
-def load_json(
-    line: str,
+def load_objects_dict(
+    json_dict: dict,
     time_approximate: bool,
     extra_columns: Optional[Dict[str, str]],
     extra_columns_fn: Optional[Callable[[dict], dict]],
 ):
     final_dict = {}
-    # print(f"Processing line: {line}")
-    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
-        if line[0] == ",":
-            line = line[1:]
-        json_dict = {}
+    logger.debug("Loading dict", json_dict=json_dict)
+    if json_dict is not None:
         try:
-            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
-            json_dict = json.loads(unicode_line, strict=False)
-            logger.debug("Loading dict", json_dict=json_dict)
             if "name" in json_dict:
                 final_dict["name"] = json_dict["name"]
             if "cat" in json_dict:
@@ -299,8 +251,10 @@ def load_json(
             else:
                 final_dict["type"] = 0  # 0->regular event
                 if "dur" in json_dict:
-                    json_dict["dur"] = int(json_dict["dur"])
-                    json_dict["ts"] = int(json_dict["ts"])
+                    if type(json_dict["dur"]) is not int:
+                        json_dict["dur"] = int(json_dict["dur"])
+                    if type(json_dict["ts"]) is not int:
+                        json_dict["ts"] = int(json_dict["ts"])
                     final_dict["ts"] = json_dict["ts"]
                     final_dict["dur"] = json_dict["dur"]
                     final_dict["te"] = final_dict["ts"] + final_dict["dur"]
@@ -310,12 +264,28 @@ def load_json(
                         )
                 final_dict.update(io_function(json_dict))
                 final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-                # check if all extra columns are present
-                if extra_columns and not all(col in final_dict for col in extra_columns):
-                    missing_cols = [col for col in extra_columns if col not in final_dict]
-                    raise ValueError(f"Missing extra columns: {missing_cols}")
-            logger.debug("Built a dictionary for line", final_dict=final_dict)
+            # check if all extra columns are present
+            if extra_columns and not all(col in final_dict for col in extra_columns):
+                missing_cols = [col for col in extra_columns if col not in final_dict]
+                raise ValueError(f"Missing extra columns: {missing_cols}")
+            logger.debug("Built a dictionary for dict", final_dict=final_dict)
             yield final_dict
+        except ValueError as error:
+            logger.error("Processing dict failed", dict=json_dict, error=error)
+    return {}
+
+
+def load_objects_str(
+    line: str,
+    time_approximate: bool,
+    extra_columns: Optional[Dict[str, str]],
+    extra_columns_fn: Optional[Callable[[dict], dict]],
+):
+    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
+        try:
+            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
+            json_dict = json.loads(unicode_line, strict=False)
+            yield from load_objects_dict(json_dict, time_approximate, extra_columns, extra_columns_fn)
         except ValueError as error:
             logger.error("Processing line failed", line=line, error=error)
     return {}
@@ -345,19 +315,19 @@ class DFTracerAnalyzer(Analyzer):
                 db.from_sequence(pfw_gz_pattern).map(create_index).compute()
                 logger.info("Created index for files", num_files=len(pfw_gz_pattern))
         with log_block("sum_total_size"):
-            total_size = db.from_sequence(all_files).map(get_size).sum().compute()
+            sizes = db.from_sequence(all_files).map(get_size).compute()
+            total_size = sum(size for _, size in sizes)
             logger.info("Total size of all files", total_size=total_size)
         gz_bag = None
         pfw_bag = None
         if len(pfw_gz_pattern) > 0:
             with log_block("gzip_index_and_batches"):
-                max_line_numbers = db.from_sequence(pfw_gz_pattern).map(get_linenumber).compute()
-                logger.debug("Max lines per file", max_line_numbers=max_line_numbers)
+                logger.debug("Max bytes per file", sizes=sizes)
                 json_line_delayed = []
                 total_lines = 0
-                for filename, max_line in max_line_numbers:
-                    total_lines += max_line
-                    for _, start, end in generate_line_batches(filename, max_line):
+                for filename, max_bytes in sizes:
+                    total_lines += max_bytes
+                    for _, start, end in generate_batches(filename, max_bytes):
                         json_line_delayed.append((filename, start, end))
 
                 logger.info(
@@ -368,13 +338,12 @@ class DFTracerAnalyzer(Analyzer):
                 )
                 json_line_bags = []
                 for filename, start, end in json_line_delayed:
-                    num_lines = end - start + 1
-                    json_line_bags.append(dask.delayed(load_indexed_gzip_files, nout=num_lines)(filename, start, end))
+                    json_line_bags.append(dask.delayed(load_indexed_gzip_files)(filename, start, end))
                 json_lines = db.concat(json_line_bags)
             with log_block("parse_gzip_json_lines"):
                 gz_bag = (
                     json_lines.map(
-                        load_json,
+                        load_objects_dict,
                         time_approximate=self.time_approximate,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
@@ -388,7 +357,7 @@ class DFTracerAnalyzer(Analyzer):
                 pfw_bag = (
                     db.read_text(pfw_pattern)
                     .map(
-                        load_json,
+                        load_objects_str,
                         time_approximate=self.time_approximate,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
@@ -458,6 +427,17 @@ class DFTracerAnalyzer(Analyzer):
             else:
                 traces[COL_FILE_NAME] = traces[COL_FILE_HASH].astype(str).replace("nan", "")
 
+        # Set epochs
+        with log_block("assign_epochs"):
+            if self.assign_epochs:
+                if "epoch" not in self.preset.layer_defs:
+                    raise ValueError("Epoch layer definition is missing")
+                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
+                epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
+                epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
+                epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
+                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+
         # Ignore redundant function calls
         with log_block("filter_functions"):
             traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
@@ -515,7 +495,7 @@ class DFTracerAnalyzer(Analyzer):
 
     def get_unique_file_count(self, traces: dd.DataFrame):
         return traces["file_hash"].nunique()
-    
+
     def get_unique_host_count(self, traces: dd.DataFrame):
         return traces["host_hash"].nunique()
 
@@ -602,8 +582,42 @@ class DFTracerAnalyzer(Analyzer):
         return traces
 
     @staticmethod
-    def _rename_columns(traces: dd.DataFrame) -> dd.DataFrame:
-        return traces.rename(columns=TRACE_COL_MAPPING)
+    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
+        df["epoch"] = pd.NA
+
+        # Iterate over each epoch boundary to find matching events
+        for _, epoch_boundary in epoch_boundaries.iterrows():
+            pid = epoch_boundary["pid"]
+            start = epoch_boundary["time_start"]
+            end = epoch_boundary["time_end"]
+
+            # Find rows in the partition that match the pid and fall within the time interval
+            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
+
+            # Assign the epoch number to the matching rows
+            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
+
+        return df
+
+    @staticmethod
+    def _fix_file_posix_category(df: pd.DataFrame):
+        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
+
+        # Step 1: Map file purpose suffixes first
+        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
+
+        for path, suffix in purpose_updates.items():
+            mask = base_condition & df["file_name"].str.contains(path)
+            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
+
+        # Step 2: Map filesystem suffixes
+        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
+
+        for path, suffix in filesystem_updates.items():
+            mask = base_condition & df["file_name"].str.contains(path)
+            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
+
+        return df
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
@@ -624,6 +638,89 @@ class DFTracerAnalyzer(Analyzer):
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
 
         return df
+
+    def _fix_time(self, traces: dd.DataFrame) -> dd.DataFrame:
+        traces["ts"] = traces["ts"] - traces["ts"].min()
+        traces["te"] = traces["ts"] + traces["dur"]
+        traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
+        traces["ts"] = traces["ts"].astype("Int64")
+        traces["te"] = traces["te"].astype("Int64")
+        traces["trange"] = traces["trange"].astype("Int16")
+        traces["dur"] = traces["dur"] / self.time_resolution
+        return traces
+
+    def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
+        columns = {
+            "name": "string",
+            "cat": "string",
+            "type": "Int8",
+            "pid": "Int64",
+            "tid": "Int64",
+            "ts": "Int64",
+            "te": "Int64",
+            "dur": "Int64",
+            "tinterval": "Int64" if self.time_approximate else "string",
+            "trange": "Int64",
+            "level": "Int8",
+        }
+        metadata_columns = {
+            "hash": "string",
+            "host_hash": "string",
+            "value": "string",
+        }
+        columns.update(io_columns())
+        columns.update(metadata_columns)
+        columns.update(extra_columns or {})
+        logger.debug("get_columns", columns=columns)
+        return columns
+
+    def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
+        # print('=' * 33)
+        # print('Handling metadata:\n')
+        # print('>Raw traces:\n')
+        # print(raw_traces)
+        is_dask = isinstance(raw_traces, dd.DataFrame)
+        traces = raw_traces.query("type == 0")
+        file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
+        host_hashes = raw_traces.query("type == 2")[["name", "hash"]].groupby("hash").first()
+        string_hashes = raw_traces.query("type == 3")[["name", "hash"]].groupby("hash").first()
+        metadata = raw_traces.query("type == 4")[["name", "value"]]
+        file_hashes.index = file_hashes.index.astype(str)
+        host_hashes.index = host_hashes.index.astype(str)
+        string_hashes.index = string_hashes.index.astype(str)
+        if is_dask:
+            file_hashes = file_hashes.persist()
+            host_hashes = host_hashes.persist()
+            string_hashes = string_hashes.persist()
+            metadata = metadata.persist()
+        # print('file_hash dtype', traces["file_hash"].dtype)
+        # print('host_hash dtype', traces["host_hash"].dtype)
+        # print('file_hash index dtype', file_hashes.index.dtype)
+        # print('host_hash index dtype', host_hashes.index.dtype)
+        traces = traces.merge(
+            file_hashes.rename(columns={"name": COL_FILE_NAME}),
+            how="left",
+            left_on="file_hash",
+            right_index=True,
+        )
+        traces = traces.merge(
+            host_hashes.rename(columns={"name": COL_HOST_NAME}),
+            how="left",
+            left_on="host_hash",
+            right_index=True,
+        )
+        self._file_hashes = file_hashes
+        self._host_hashes = host_hashes
+        self._string_hashes = string_hashes
+        self._metadata = metadata
+        # print('>Traces:\n')
+        # print(traces)
+        # print('=' * 33)
+        return traces
+
+    @staticmethod
+    def _rename_columns(traces: dd.DataFrame) -> dd.DataFrame:
+        return traces.rename(columns=TRACE_COL_MAPPING)
 
     @staticmethod
     def _sanitize_size(df: pd.DataFrame):

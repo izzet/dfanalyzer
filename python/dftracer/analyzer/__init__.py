@@ -1,4 +1,4 @@
-import dfanalyzer.utils.warning_utils  # noqa: F401
+import dftracer.analyzer.utils.warning_utils  # noqa: F401
 import dask
 import structlog
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ from distributed import Client
 from hydra import compose, initialize
 from hydra.core.hydra_config import DictConfig, HydraConfig
 from hydra.utils import instantiate
+from importlib.metadata import PackageNotFoundError, version
 from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Union, Optional
 
@@ -19,6 +20,11 @@ from .recorder import RecorderAnalyzer
 from .types import ViewType
 from .utils.log_utils import configure_logging, log_block
 
+try:
+    __version__ = version("dftracer-analyzer")
+except PackageNotFoundError:
+    # package is not installed
+    pass
 
 # TODO(izzet): Suppress Dask warnings that are not relevant to the user
 dask.config.set({"dataframe.query-planning-warning": False})

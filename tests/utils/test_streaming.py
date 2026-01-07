@@ -1,6 +1,6 @@
 import pytest
 
-from dfanalyzer.utils.streaming import is_streaming_available
+from dftracer.analyzer.utils.streaming import is_streaming_available
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]

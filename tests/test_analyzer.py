@@ -3,10 +3,10 @@ import pandas as pd
 import dask.dataframe as dd
 import pytest
 from dask.distributed import Client, LocalCluster
-from dfanalyzer.analyzer import Analyzer
-from dfanalyzer.config import AnalyzerPresetConfigPOSIX, AnalyzerPresetConfigDLIO
-from dfanalyzer.constants import VIEW_TYPES
-from dfanalyzer.metrics import set_view_metrics
+from dftracer.analyzer.analyzer import Analyzer
+from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX, AnalyzerPresetConfigDLIO
+from dftracer.analyzer.constants import VIEW_TYPES
+from dftracer.analyzer.metrics import set_view_metrics
 from typing import List, Optional, Dict
 
 # Ensure this module runs in both smoke and full CI modes
@@ -74,7 +74,7 @@ def _assert_groupby_and_aggs_basic(out: pd.DataFrame, view_types: List[str]) -> 
     assert pytest.approx(read_rows["count"].iloc[0]) == 10.0
     assert pytest.approx(read_rows["size"].iloc[0]) == 100.0
     write_rows = grp[(grp["proc_name"] == "p#h#1#t") & (grp["func_name"] == "write")]
-    assert np.isnan(write_rows["count"].iloc[0])
+    assert pd.isna(write_rows["count"].iloc[0])
     assert out["size_bin_0"].dtype.name == "Int32"
     assert out["size_bin_1"].dtype.name == "Int32"
 
@@ -103,6 +103,8 @@ def _assert_empty_input(out: pd.DataFrame, view_types: List[str]) -> None:
 def _build_hlm(analyzer: "DummyAnalyzer", pdf: pd.DataFrame, view_types: List[str], as_dask: bool):
     traces = dd.from_pandas(pdf, npartitions=2) if as_dask else pdf
     hlm = analyzer._compute_high_level_metrics(traces=traces, view_types=view_types, partition_size="64MB")
+    if as_dask:
+        return hlm
     return hlm.compute() if isinstance(hlm, dd.DataFrame) else hlm
 
 
@@ -208,7 +210,7 @@ def test_hlm_minimal_required_columns(dummy_analyzer: DummyAnalyzer):
     hlm = dummy_analyzer._compute_high_level_metrics(traces=pdf, view_types=["file_name"], partition_size="64MB")
     out = hlm
     row = out.reset_index().iloc[0]
-    assert np.isnan(row["time"])  # zero normalized to NaN
+    assert pd.isna(row["time"])  # zero normalized to NaN
     assert row["count"] == 1
     assert row["size"] == 10
 
@@ -292,7 +294,7 @@ def test_hlm_minimal_required_columns_dask(dummy_analyzer: DummyAnalyzer):
     hlm = dummy_analyzer._compute_high_level_metrics(traces=ddf, view_types=["file_name"], partition_size="64MB")
     out = hlm.compute()
     row = out.reset_index().iloc[0]
-    assert np.isnan(row["time"])  # zero normalized to NaN
+    assert pd.isna(row["time"])  # zero normalized to NaN
     assert row["count"] == 1
     assert row["size"] == 10
 

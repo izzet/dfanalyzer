@@ -1,16 +1,18 @@
 import glob
+import os
 import pathlib
 import pytest
 import random
 from dask.distributed import LocalCluster
-from dfanalyzer import init_with_hydra
+from dftracer.analyzer import init_with_hydra
 
 
 # Full test matrix for comprehensive testing
 full_analyzer_trace_params = [
-    # ("darshan", "posix", "tests/data/extracted/darshan-posix"),
+    ("darshan", "posix", "tests/data/extracted/darshan-posix"),
     ("darshan", "posix", "tests/data/extracted/darshan-posix-dxt"),
-    ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio"),
+    ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio-ai-logging"),
+    ("dftracer", "dlio-pre-ai-logging", "tests/data/extracted/dftracer-dlio"),
     ("dftracer", "posix", "tests/data/extracted/dftracer-posix"),
     ("recorder", "posix", "tests/data/extracted/recorder-posix-parquet"),
 ]
@@ -89,6 +91,10 @@ def _test_e2e(
         f"view_types=[{','.join(view_types)}]",
     ]
 
+    # Allow enabling debug logs for investigation via env var
+    if os.getenv("DFANALYZER_DEBUG", "").lower() in {"1", "true", "yes"}:
+        hydra_overrides.append("debug=True")
+
     assign_epochs = analyzer == "dftracer" and preset == "dlio"
     if assign_epochs:
         hydra_overrides.append("analyzer.assign_epochs=True")
@@ -112,7 +118,7 @@ def _test_e2e(
         f"Expected {len(dfa.hydra_config.analyzer.preset.layer_defs)} layers, got {len(result.layers)}"
     )
     if checkpoint:
-        assert any(glob.glob(f"{result.checkpoint_dir}/*.json")), "No checkpoint found"
+        assert any(glob.glob(f"{result.checkpoint_dir}/*.parquet")), "No checkpoint found"
 
     # Shutdown the Dask client and cluster
     dfa.shutdown()

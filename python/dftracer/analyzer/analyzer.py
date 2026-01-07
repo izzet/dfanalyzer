@@ -5,16 +5,18 @@ import hashlib
 import itertools as it
 import json
 import math
-import numpy as np
 import os
 import pandas as pd
 import structlog
+from betterset import BetterSet as S
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .analysis_utils import (
     fix_dtypes,
+    fix_hlm_dtypes,
+    fix_std_cols,
     set_file_dir,
     set_file_pattern,
     set_size_bins,
@@ -155,7 +157,7 @@ class Analyzer(abc.ABC):
             An AnalyzerResultType object containing the analysis results.
         """
         # Check if high-level metrics are checkpointed
-        proc_view_types = list(sorted(set(view_types).union({COL_PROC_NAME})))
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         traces = None
         raw_stats = None
@@ -192,9 +194,25 @@ class Analyzer(abc.ABC):
                         fallback=lambda: None,
                     )
 
+        # Compute high-level metrics
+        is_dask = isinstance(traces, dd.DataFrame)
+        with console_block("Compute high-level metrics"):
+            with log_block("compute_high_level_metrics"):
+                hlm = self.compute_high_level_metrics(
+                    checkpoint_name=hlm_checkpoint_name,
+                    traces=traces,
+                    view_types=view_types,
+                )
+
+            if is_dask:
+                with log_block("persist"):
+                    (hlm, raw_stats) = dask.persist(hlm, raw_stats)
+                with log_block("wait"):
+                    wait([hlm, raw_stats])
+
         return self._analyze_trace(
             traces=traces,
-            view_types=proc_view_types,
+            proc_view_types=proc_view_types,
             logical_view_types=logical_view_types,
             raw_stats=raw_stats,
             metric_boundaries=metric_boundaries,
@@ -644,6 +662,17 @@ class Analyzer(abc.ABC):
         """
         return traces[COL_TIME_END].max() - traces[COL_TIME_START].min()
 
+    def ensure_proc_view_type(self, view_types: List[ViewType]) -> List[ViewType]:
+        """Ensures that COL_PROC_NAME is always included in the list of view types.
+
+        Args:
+            view_types: A list of view types to be used for analysis.
+
+        Returns:
+            A sorted list of view types that always includes COL_PROC_NAME.
+        """
+        return list(sorted(set(view_types).union({COL_PROC_NAME})))
+
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
 
@@ -815,8 +844,8 @@ class Analyzer(abc.ABC):
                     continue
                 metric_col = f"{metric}_{col}"
                 hlm[metric_col] = pd.NA
-                if hlm.dtypes[col].name == "object":
-                    hlm[metric_col] = hlm[metric_col].map(lambda x: set())
+                if hlm.dtypes[col].name == "object" and not is_data_col:
+                    hlm[metric_col] = hlm[metric_col].map(lambda x: S())
                 hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
                 if hlm.dtypes[col].name != "object":
                     hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
@@ -908,33 +937,16 @@ class Analyzer(abc.ABC):
 
         return it.chain.from_iterable(map(_iter_permutations, range(len(view_types))))
 
-    def _analyze_trace(
+    def _analyze_hlm(
         self,
-        traces: DataFrameType,
-        view_types: List[ViewType],
-        logical_view_types: bool,
-        raw_stats: RawStats,
+        hlm: Optional[DataFrameType],
+        proc_view_types: List[ViewType],
         metric_boundaries: ViewMetricBoundaries,
-    ):
-        is_dask = isinstance(traces, dd.DataFrame)
-        # print("Is Dask DataFrame:", is_dask)
-
-        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=view_types)
-        # Compute high-level metrics
-        with console_block("Compute high-level metrics"):
-            with log_block("compute_high_level_metrics"):
-                hlm = self.compute_high_level_metrics(
-                    checkpoint_name=hlm_checkpoint_name,
-                    traces=traces,
-                    view_types=view_types,
-                )
-
-            if is_dask:
-                with log_block("persist"):
-                    (hlm, raw_stats) = dask.persist(hlm, raw_stats)
-                with log_block("wait"):
-                    wait([hlm, raw_stats])
-
+        raw_stats: RawStats,
+        logical_view_types: bool,
+        layer_main_views: Optional[Dict[Layer, DataFrameType]] = None,
+        is_dask: bool = True,
+    ) -> AnalyzerResultType:
         # Compute layers & views
         with console_block("Compute views"):
             with log_block("create_layers_and_views_tasks"):
@@ -944,26 +956,32 @@ class Analyzer(abc.ABC):
                 views = {}
                 view_keys = set()
                 for layer, layer_condition in self.preset.layer_defs.items():
-                    layer_hlm = hlm.copy()
-                    if layer_condition:
-                        layer_hlm = hlm.query(layer_condition)
-                    layer_main_view = self.compute_main_view(
-                        layer=layer,
-                        hlm=layer_hlm,
-                        view_types=view_types,
-                    )
+                    layer_hlm = None
+                    if layer_main_views is not None and layer in layer_main_views:
+                        layer_main_view = layer_main_views[layer]
+                    else:
+                        if hlm is None:
+                            raise ValueError("hlm must be provided when layer_main_views is not supplied")
+                        layer_hlm = hlm.copy()
+                        if layer_condition:
+                            layer_hlm = hlm.query(layer_condition)
+                        layer_main_view = self.compute_main_view(
+                            layer=layer,
+                            hlm=layer_hlm,
+                            view_types=proc_view_types,
+                        )
                     layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
                     layer_views = self.compute_views(
                         layer=layer,
                         main_view=layer_main_view,
-                        view_types=view_types,
+                        view_types=proc_view_types,
                     )
                     if logical_view_types:
                         layer_logical_views = self.compute_logical_views(
                             layer=layer,
                             main_view=layer_main_view,
                             views=layer_views,
-                            view_types=view_types,
+                            view_types=proc_view_types,
                         )
                         layer_views.update(layer_logical_views)
                     hlms[layer] = layer_hlm
@@ -1021,15 +1039,12 @@ class Analyzer(abc.ABC):
             # Process flat views
             with log_block("process_flat_views"):
                 for view_key in flat_views:
-                    if view_key in checkpointed_flat_views:
-                        continue
-                    with log_block("process_flat_view", view_key=view_key):
-                        # Process flat views to compute metrics and scores
-                        flat_views[view_key] = self._process_flat_view(
-                            flat_view=flat_views[view_key],
-                            view_key=view_key,
-                            metric_boundaries=metric_boundaries,
-                        )
+                    # Process flat views to compute metrics and scores
+                    flat_views[view_key] = self._process_flat_view(
+                        flat_view=flat_views[view_key],
+                        view_key=view_key,
+                        metric_boundaries=metric_boundaries,
+                    )
 
         # Checkpoint flat views if enabled
         if self.checkpoint:
@@ -1041,18 +1056,57 @@ class Analyzer(abc.ABC):
             with log_block("wait_for_checkpoints"):
                 wait(self.checkpoint_tasks)
 
-        result = AnalyzerResultType(
+        return AnalyzerResultType(
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
-            _traces=traces,
             checkpoint_dir=self.checkpoint_dir,
             flat_views=flat_views,
             layers=self.layers,
             raw_stats=raw_stats,
-            view_types=view_types,
+            view_types=proc_view_types,
             views=views,
         )
+
+    def _analyze_trace(
+        self,
+        traces: DataFrameType,
+        proc_view_types: List[ViewType],
+        logical_view_types: bool,
+        raw_stats: RawStats,
+        metric_boundaries: ViewMetricBoundaries,
+    ):
+        is_dask = isinstance(traces, dd.DataFrame)
+        hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
+
+        # Compute high-level metrics
+        with console_block("Compute high-level metrics"):
+            with log_block("compute_high_level_metrics"):
+                hlm = self.compute_high_level_metrics(
+                    checkpoint_name=hlm_checkpoint_name,
+                    traces=traces,
+                    view_types=proc_view_types,
+                )
+
+            if is_dask:
+                with log_block("persist"):
+                    (hlm, raw_stats) = dask.persist(hlm, raw_stats)
+                with log_block("wait"):
+                    wait([hlm, raw_stats])
+
+                # Analyze HLM
+        result = self._analyze_hlm(
+            hlm=hlm,
+            is_dask=is_dask,
+            logical_view_types=logical_view_types,
+            metric_boundaries=metric_boundaries,
+            proc_view_types=proc_view_types,
+            raw_stats=raw_stats,
+        )
+
+        # Attach correct traces & view types
+        result._traces = traces
+        result.view_types = proc_view_types
 
         return result
 
@@ -1073,19 +1127,20 @@ class Analyzer(abc.ABC):
 
         if isinstance(traces, dd.DataFrame):
             hlm_agg.update({col: unique_set() for col in view_types_diff})
-            # print("hlm_agg dask", hlm_agg)
             hlm = (
                 traces.groupby(hlm_groupby)
                 .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
                 .persist()
                 .repartition(partition_size=partition_size)
-                .replace(0, np.nan)
+                .replace(0, pd.NA)
+                .map_partitions(fix_hlm_dtypes)
                 .persist()
             )
         else:
             hlm_agg.update({col: unique_set_pd for col in view_types_diff})
-            # print("hlm_agg pandas", hlm_agg)
-            hlm = traces.groupby(hlm_groupby).agg(hlm_agg).replace(0, np.nan)
+            hlm = traces.groupby(hlm_groupby).agg(hlm_agg)
+            hlm = hlm.replace(0, pd.NA)
+            hlm = fix_hlm_dtypes(hlm)
 
         hlm[bin_cols] = hlm[bin_cols].astype("Int32")
 
@@ -1137,13 +1192,13 @@ class Analyzer(abc.ABC):
                     hlm.groupby(list(view_types))
                     .agg(main_view_agg, split_out=hlm.npartitions)
                     .map_partitions(set_main_metrics)
-                    .replace(0, np.nan)
+                    .replace(0, pd.NA)
                     .map_partitions(fix_dtypes)
                     .persist()
                 )
             else:
                 main_view = hlm.groupby(list(view_types)).agg(main_view_agg)
-                main_view = set_main_metrics(main_view).replace(0, np.nan)
+                main_view = set_main_metrics(main_view).replace(0, pd.NA)
                 main_view = fix_dtypes(main_view)
 
         return main_view
@@ -1208,6 +1263,14 @@ class Analyzer(abc.ABC):
                 view_agg.update({col: [unique_set()] for col in local_view_types_diff})
             else:
                 view_agg.update({col: [unique_set_pd] for col in local_view_types_diff})
+
+        with log_block("fix_std_cols", layer=layer, view_key=view_key):
+            # Fix std columns to avoid pandas extension dtypes producing object arrays inside Dask.
+            std_cols = [col for col, aggs in view_agg.items() if isinstance(aggs, list) and "std" in aggs]
+            if is_dask:
+                records = records.map_partitions(fix_std_cols, std_cols=std_cols)
+            else:
+                records = fix_std_cols(records, std_cols=std_cols)
 
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
