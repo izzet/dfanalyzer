@@ -15,15 +15,17 @@ def extract_test_data():
 def dftracer_ai_logging_posix_events():
     """Return up to 3 epochs extracted from a real trace file.
 
-    Each epoch is a list of the original JSON lines (strings) starting with an
-    epoch.start metadata message, containing some POSIX events in between, and
-    finishing with an epoch.end metadata message.
+    Each epoch is a list of the original JSON lines (strings) captured from the
+    trace until an epoch.block event is seen.
     """
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     _ensure_extracted_data(data_dir)
 
-    ai_logging_dir = os.path.join(data_dir, "extracted", "dftracer-ai-logging")
-    file_path = os.path.join(ai_logging_dir, "trace-0-of-8.pfw")
+    ai_logging_dir = os.path.join(data_dir, "extracted", "dftracer-dlio-ai-logging")
+    matches = sorted(glob.glob(os.path.join(ai_logging_dir, "*.pfw")))
+    if not matches:
+        raise FileNotFoundError(f"No .pfw files found in: {ai_logging_dir}")
+    file_path = matches[0]
 
     if not os.path.exists(file_path):
         # If the test data isn't present, skip tests that request this fixture.
@@ -31,7 +33,7 @@ def dftracer_ai_logging_posix_events():
 
     epochs = []
     events = None
-    posix_count = 0
+    end_count = 0
     with open(file_path, "r", encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
@@ -43,31 +45,23 @@ def dftracer_ai_logging_posix_events():
                 # ignore non-json lines
                 continue
 
-            # detect metadata epoch.start (example: ph == 'M' and args.name == 'epoch.start')
-            if j.get("ph") == "M" and j.get("args", {}).get("name") == "epoch.start":
-                # start a new epoch capture; use a plain list for events
-                events = [line]
-                posix_count = 0
-                continue
+            # begin collecting immediately to retain metadata before epoch.start
+            if events is None:
+                events = []
 
             if events is not None:
-                # detect epoch.end metadata; always include it and close the epoch
-                if j.get("ph") == "M" and j.get("args", {}).get("name") == "epoch.end":
+                # detect epoch.block; always include it and close the epoch
+                if j.get("name") == "epoch.block":
                     events.append(line)
                     epochs.append(events)
                     events = None
-                    posix_count = 0
+                    end_count += 1
                     continue
 
-                # Only include POSIX events (cat == 'POSIX'), limit to first 100
-                if j.get("cat") == "POSIX":
-                    if posix_count < 100:
-                        events.append(line)
-                        posix_count += 1
-                    # else: drop additional POSIX events beyond 100
+                events.append(line)
 
-            # stop when we have three epochs
-            if len(epochs) >= 3:
+            # stop when we have three epoch.block events
+            if end_count >= 3:
                 break
 
     return epochs
