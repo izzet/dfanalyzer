@@ -567,7 +567,7 @@ class Analyzer(abc.ABC):
         for view_key in flat_views:
             view_cols = flat_views[view_key].columns
             view_type = view_key[-1]
-            time_layer = self.get_time_boundary_layer()
+            time_layer = self.preset.time_boundary_layer
             time_metric = "time_sum" if self.is_view_process_based(view_key) else "time_max"
             with log_block("calculate_time_boundary", view_key=view_key):
                 if self.time_sliced and view_type == COL_TIME_RANGE:
@@ -675,9 +675,6 @@ class Analyzer(abc.ABC):
 
     def get_stats_checkpoint_name(self):
         return self.get_checkpoint_name(CHECKPOINT_RAW_STATS)
-
-    def get_time_boundary_layer(self):
-        return list(self.preset.layer_defs)[0]
 
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         """Computes the total number of I/O events in the traces.
@@ -1323,7 +1320,7 @@ class Analyzer(abc.ABC):
                 is_view_process_based=is_view_process_based,
                 layers=self.layers,
                 layer_deps=self.preset.layer_deps,
-                time_boundary_layer=self.get_time_boundary_layer(),
+                time_boundary_layer=self.preset.time_boundary_layer,
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)

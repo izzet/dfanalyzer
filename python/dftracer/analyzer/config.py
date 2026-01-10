@@ -37,6 +37,7 @@ class AnalyzerPresetConfig:
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
+    time_boundary_layer: str = MISSING
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
@@ -66,6 +67,7 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
+    time_boundary_layer: str = "posix"
 
 
 @dc.dataclass
@@ -174,7 +176,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio-pre-ai-logging"
-    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
+    time_boundary_layer: str = "app"
 
 
 @dc.dataclass

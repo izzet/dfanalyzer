@@ -488,11 +488,6 @@ class DFTracerAnalyzer(Analyzer):
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
 
-    def get_time_boundary_layer(self):
-        if self.assign_epochs:
-            return "epoch"
-        return super().get_time_boundary_layer()
-
     def get_unique_file_count(self, traces: dd.DataFrame):
         return traces["file_hash"].nunique()
 
