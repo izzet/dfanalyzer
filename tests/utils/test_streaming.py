@@ -7,8 +7,8 @@ pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_epoch_window_buffers_until_epoch_end():
-    """Verify incoming dicts are buffered after epoch.start and emitted on epoch.end."""
+def test_epoch_window_buffers_until_epoch_block():
+    """Verify incoming dicts are buffered after epoch.start and emitted on epoch.block."""
     from streamz import Stream
 
     source = Stream()
@@ -25,13 +25,13 @@ def test_epoch_window_buffers_until_epoch_end():
     source.emit({"name": "data", "value": 1, "pid": 1})
     source.emit({"name": "data", "value": 2, "pid": 1})
 
-    # End epoch should flush the buffer for pid=1
-    source.emit({"name": "epoch.end", "pid": 1})
+    # epoch.block should flush the buffer for pid=1
+    source.emit({"name": "epoch.block", "pid": 1})
 
     assert len(collected) == 1
     buffer = collected[0]
     assert isinstance(buffer, list)
-    # epoch.start + 2 data + epoch.end => 4 items
+    # epoch.start + 2 data + epoch.block => 4 items
     assert len(buffer) == 4
     # All items in the emitted buffer should have epoch set to 1
     assert all(item.get("epoch") == 1 for item in buffer)
@@ -50,13 +50,13 @@ def test_epoch_window_multiple_epochs():
     # First epoch for pid=1
     source.emit({"name": "epoch.start", "pid": 1})
     source.emit({"name": "data", "value": 10, "pid": 1})
-    source.emit({"name": "epoch.end", "pid": 1})
+    source.emit({"name": "epoch.block", "pid": 1})
 
     # Second epoch for pid=1
     source.emit({"name": "epoch.start", "pid": 1})
     source.emit({"name": "data", "value": 20, "pid": 1})
     source.emit({"name": "data", "value": 21, "pid": 1})
-    source.emit({"name": "epoch.end", "pid": 1})
+    source.emit({"name": "epoch.block", "pid": 1})
 
     assert len(collected) == 2
     first_buf, second_buf = collected
@@ -66,7 +66,7 @@ def test_epoch_window_multiple_epochs():
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
 def test_epoch_window_pid_waits_for_all_pids():
-    """Verify that the pid-aware window waits until all seen pids send epoch.end."""
+    """Verify that the pid-aware window waits until all seen pids send epoch.block."""
     from streamz import Stream
 
     source = Stream()
@@ -81,20 +81,20 @@ def test_epoch_window_pid_waits_for_all_pids():
     source.emit({"name": "data", "value": 1, "pid": 10})
     source.emit({"name": "data", "value": 2, "pid": 20})
 
-    # epoch.end from pid 10 only -> should NOT emit yet
-    source.emit({"name": "epoch.end", "pid": 10})
+    # epoch.block from pid 10 only -> should NOT emit yet
+    source.emit({"name": "epoch.block", "pid": 10})
     assert collected == []
 
-    # epoch.end from pid 20 -> now emit
-    source.emit({"name": "epoch.end", "pid": 20})
+    # epoch.block from pid 20 -> now emit
+    source.emit({"name": "epoch.block", "pid": 20})
     assert len(collected) == 1
     buf = collected[0]
     assert all(item.get("epoch") == 1 for item in buf)
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_epoch_window_pid_missing_pid_emits_immediately():
-    """If epoch.end has no pid, it should raise an error (pid required)."""
+def test_epoch_window_pid_missing_pid_raises():
+    """If epoch.block has no pid, it should raise an error (pid required)."""
     from streamz import Stream
 
     source = Stream()
@@ -106,9 +106,9 @@ def test_epoch_window_pid_missing_pid_emits_immediately():
     source.emit({"name": "epoch.start", "pid": 1})
     source.emit({"name": "data", "value": 1, "pid": 1})
 
-    # epoch.end without pid should raise
+    # epoch.block without pid should raise
     with pytest.raises(ValueError):
-        source.emit({"name": "epoch.end"})
+        source.emit({"name": "epoch.block"})
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
@@ -130,7 +130,7 @@ def test_repeat_epoch_start_increments_epoch():
     source.emit({"name": "data", "pid": 1, "value": "x2"})
 
     # ending should close epoch1 first (earliest seen)
-    source.emit({"name": "epoch.end", "pid": 1})
+    source.emit({"name": "epoch.block", "pid": 1})
     assert len(collected) == 1
     emitted = collected[0]
     vals = [item.get("value") for item in emitted]
@@ -140,7 +140,7 @@ def test_repeat_epoch_start_increments_epoch():
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
 def test_pid_end_without_prior_seen_no_emit():
-    """If a pid sends epoch.end without prior start/seen, nothing should emit."""
+    """If a pid sends epoch.block without prior start/seen, nothing should emit."""
     from streamz import Stream
 
     source = Stream()
@@ -150,7 +150,7 @@ def test_pid_end_without_prior_seen_no_emit():
 
     # pid 99 never started or sent any data -> still raises because no seen epoch
     with pytest.raises(ValueError):
-        source.emit({"name": "epoch.end", "pid": 99})
+        source.emit({"name": "epoch.block", "pid": 99})
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
@@ -166,7 +166,7 @@ def test_data_without_pid_raises():
 
 
 @pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_overlapping_epochs_fast_process_starts_next_before_slow_finishes():
+def test_overlapping_epochs_fast_process_waits_for_slowest_block():
     """Fast process can start next epoch while slow finishes previous; emission uses slowest end."""
     from streamz import Stream
 
@@ -182,7 +182,7 @@ def test_overlapping_epochs_fast_process_starts_next_before_slow_finishes():
     source.emit({"name": "data", "pid": 2, "value": "b1"})
 
     # pid2 ends quickly
-    source.emit({"name": "epoch.end", "pid": 2})
+    source.emit({"name": "epoch.block", "pid": 2})
     assert collected == []
 
     # pid1 starts next epoch before ending previous
@@ -190,7 +190,7 @@ def test_overlapping_epochs_fast_process_starts_next_before_slow_finishes():
     source.emit({"name": "data", "pid": 1, "value": "a2"})
 
     # now pid1 ends epoch1 -> should trigger emission for epoch1 only
-    source.emit({"name": "epoch.end", "pid": 1})
+    source.emit({"name": "epoch.block", "pid": 1})
 
     assert len(collected) == 1
     emitted = collected[0]

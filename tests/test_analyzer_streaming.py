@@ -90,7 +90,7 @@ def test_analyzer_dftracer_read_zmq(
         # messages should be dicts with at least 'name' and 'pid' for our toy msgs
         assert all(isinstance(x, dict) for x in collected), "Parsed items are not dicts"
         names = [x.get("name") for x in collected]
-        assert "epoch.start" in names or "epoch.end" in names or "read" in names
+        assert "epoch.start" in names or "epoch.block" in names or "read" in names
     finally:
         try:
             dfa.shutdown()

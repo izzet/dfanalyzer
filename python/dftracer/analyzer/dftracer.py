@@ -263,7 +263,8 @@ def load_objects_dict(
                             I.closed(json_dict["ts"], json_dict["ts"] + json_dict["dur"])
                         )
                 final_dict.update(io_function(json_dict))
-                final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
+                if extra_columns and extra_columns_fn:
+                    final_dict.update(extra_columns_fn(json_dict))
             # check if all extra columns are present
             if extra_columns and not all(col in final_dict for col in extra_columns):
                 missing_cols = [col for col in extra_columns if col not in final_dict]
@@ -415,6 +416,7 @@ class DFTracerAnalyzer(Analyzer):
         is_dask = isinstance(traces, dd.DataFrame)
 
         if not is_dask and traces.empty:
+            logger.warning("No traces found for postread_trace")
             return traces
 
         # Ignore redundant files
@@ -427,17 +429,6 @@ class DFTracerAnalyzer(Analyzer):
             else:
                 traces[COL_FILE_NAME] = traces[COL_FILE_HASH].astype(str).replace("nan", "")
 
-        # Set epochs
-        with log_block("assign_epochs"):
-            if self.assign_epochs:
-                if "epoch" not in self.preset.layer_defs:
-                    raise ValueError("Epoch layer definition is missing")
-                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
-                epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
-                epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
-                epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
-                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
-
         # Ignore redundant function calls
         with log_block("filter_functions"):
             traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
@@ -448,14 +439,20 @@ class DFTracerAnalyzer(Analyzer):
             if self.assign_epochs:
                 if "epoch" not in self.preset.layer_defs:
                     raise ValueError("Epoch layer definition is missing")
-                epochs = traces.query(self.preset.layer_defs["epoch"]).compute()
+                epochs = traces.query(self.preset.layer_defs["epoch"])
+                if is_dask:
+                    epochs = epochs.compute()
                 epochs_with_index = epochs.sort_values(["pid", "time_start"]).reset_index(drop=True)
                 epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
                 epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
-                traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+                if is_dask:
+                    traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
+                else:
+                    traces = self._set_epochs(traces, epoch_boundaries=epoch_boundaries)
 
         with log_block("wait"):
-            _ = wait(traces)
+            if is_dask:
+                wait(traces)
 
         with log_block("set_basic_columns"):
             traces[COL_ACC_PAT] = 0
@@ -485,6 +482,43 @@ class DFTracerAnalyzer(Analyzer):
             .map(self.postread_trace, view_types=view_types)
         )
 
+    def normalize_stream_event(
+        self,
+        event: dict,
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+    ) -> dict:
+        logger.debug(
+            "stream.normalize_input",
+            name=event.get("name"),
+            ph=event.get("ph"),
+            args_name=event.get("args", {}).get("name"),
+        )
+        normalized_event = next(
+            load_objects_dict(
+                event,
+                time_approximate=self.time_approximate,
+                extra_columns=extra_columns,
+                extra_columns_fn=extra_columns_fn,
+            )
+        )
+        return normalized_event
+
+    def handle_stream_events(
+        self,
+        events: List[dict],
+        view_types: List[ViewType],
+        extra_columns: Optional[Dict[str, str]] = None,
+    ) -> pd.DataFrame:
+        columns = self._get_columns(extra_columns)
+        traces = pd.DataFrame(events, columns=columns)
+        traces = self._handle_metadata(traces)
+        traces = self._fix_time(traces)
+        traces = self._rename_columns(traces)
+        traces = traces.assign(time_range=1)
+        traces = self.postread_trace(traces=traces, view_types=view_types)
+        return traces
+
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
 
@@ -496,123 +530,6 @@ class DFTracerAnalyzer(Analyzer):
 
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
-
-    def _fix_time(self, traces: dd.DataFrame) -> dd.DataFrame:
-        traces["ts"] = traces["ts"] - traces["ts"].min()
-        traces["te"] = traces["ts"] + traces["dur"]
-        traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
-        traces["ts"] = traces["ts"].astype("Int64")
-        traces["te"] = traces["te"].astype("Int64")
-        traces["trange"] = traces["trange"].astype("Int16")
-        traces["dur"] = traces["dur"] / self.time_resolution
-        return traces
-
-    def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
-        columns = {
-            "name": "string",
-            "cat": "string",
-            "type": "Int8",
-            "pid": "Int64",
-            "tid": "Int64",
-            "ts": "Int64",
-            "te": "Int64",
-            "dur": "Int64",
-            "tinterval": "Int64" if self.time_approximate else "string",
-            "trange": "Int64",
-            "level": "Int8",
-        }
-        metadata_columns = {
-            "hash": "string",
-            "host_hash": "string",
-            "value": "string",
-        }
-        columns.update(io_columns())
-        columns.update(metadata_columns)
-        columns.update(extra_columns or {})
-        logger.debug("get_columns", columns=columns)
-        return columns
-
-    def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
-        # print('=' * 33)
-        # print('Handling metadata:\n')
-        # print('>Raw traces:\n')
-        # print(raw_traces)
-        is_dask = isinstance(raw_traces, dd.DataFrame)
-        traces = raw_traces.query("type == 0")
-        file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
-        host_hashes = raw_traces.query("type == 2")[["name", "hash"]].groupby("hash").first()
-        string_hashes = raw_traces.query("type == 3")[["name", "hash"]].groupby("hash").first()
-        metadata = raw_traces.query("type == 4")[["name", "value"]]
-        file_hashes.index = file_hashes.index.astype(str)
-        host_hashes.index = host_hashes.index.astype(str)
-        string_hashes.index = string_hashes.index.astype(str)
-        if is_dask:
-            file_hashes = file_hashes.persist()
-            host_hashes = host_hashes.persist()
-            string_hashes = string_hashes.persist()
-            metadata = metadata.persist()
-        # print('file_hash dtype', traces["file_hash"].dtype)
-        # print('host_hash dtype', traces["host_hash"].dtype)
-        # print('file_hash index dtype', file_hashes.index.dtype)
-        # print('host_hash index dtype', host_hashes.index.dtype)
-        traces = traces.merge(
-            file_hashes.rename(columns={"name": COL_FILE_NAME}),
-            how="left",
-            left_on="file_hash",
-            right_index=True,
-        )
-        traces = traces.merge(
-            host_hashes.rename(columns={"name": COL_HOST_NAME}),
-            how="left",
-            left_on="host_hash",
-            right_index=True,
-        )
-        self._file_hashes = file_hashes
-        self._host_hashes = host_hashes
-        self._string_hashes = string_hashes
-        self._metadata = metadata
-        # print('>Traces:\n')
-        # print(traces)
-        # print('=' * 33)
-        return traces
-
-    @staticmethod
-    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
-        df["epoch"] = pd.NA
-
-        # Iterate over each epoch boundary to find matching events
-        for _, epoch_boundary in epoch_boundaries.iterrows():
-            pid = epoch_boundary["pid"]
-            start = epoch_boundary["time_start"]
-            end = epoch_boundary["time_end"]
-
-            # Find rows in the partition that match the pid and fall within the time interval
-            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
-
-            # Assign the epoch number to the matching rows
-            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
-
-        return df
-
-    @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
-        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
-
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        # Step 2: Map filesystem suffixes
-        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
-
-        for path, suffix in filesystem_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        return df
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
@@ -642,6 +559,11 @@ class DFTracerAnalyzer(Analyzer):
         traces["te"] = traces["te"].astype("Int64")
         traces["trange"] = traces["trange"].astype("Int16")
         traces["dur"] = traces["dur"] / self.time_resolution
+        logger.debug(
+            "Fixed time columns",
+            time_granularity=self.time_granularity,
+            time_resolution=self.time_resolution,
+        )
         return traces
 
     def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
@@ -670,10 +592,6 @@ class DFTracerAnalyzer(Analyzer):
         return columns
 
     def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
-        # print('=' * 33)
-        # print('Handling metadata:\n')
-        # print('>Raw traces:\n')
-        # print(raw_traces)
         is_dask = isinstance(raw_traces, dd.DataFrame)
         traces = raw_traces.query("type == 0")
         file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
@@ -688,10 +606,6 @@ class DFTracerAnalyzer(Analyzer):
             host_hashes = host_hashes.persist()
             string_hashes = string_hashes.persist()
             metadata = metadata.persist()
-        # print('file_hash dtype', traces["file_hash"].dtype)
-        # print('host_hash dtype', traces["host_hash"].dtype)
-        # print('file_hash index dtype', file_hashes.index.dtype)
-        # print('host_hash index dtype', host_hashes.index.dtype)
         traces = traces.merge(
             file_hashes.rename(columns={"name": COL_FILE_NAME}),
             how="left",
@@ -708,9 +622,7 @@ class DFTracerAnalyzer(Analyzer):
         self._host_hashes = host_hashes
         self._string_hashes = string_hashes
         self._metadata = metadata
-        # print('>Traces:\n')
-        # print(traces)
-        # print('=' * 33)
+        logger.debug("Handled metadata")
         return traces
 
     @staticmethod

@@ -14,10 +14,10 @@ from .analyzer import Analyzer
 from .cluster import ClusterType, ExternalCluster
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
-from .input import FileInput, ZMQInput
-from .output import ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput
+from .input import FileInput, MofkaInput, ZMQInput
+from .output import ConsoleOutput, CSVOutput, MofkaOutput, SQLiteOutput, ZMQOutput
 from .recorder import RecorderAnalyzer
-from .types import ViewType
+from .types import AnalyzerResultType, ViewType
 from .utils.log_utils import configure_logging, log_block
 
 try:
@@ -35,8 +35,8 @@ except ModuleNotFoundError:
     DarshanAnalyzer = Analyzer
 
 AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
-InputType = Union[FileInput, ZMQInput]
-OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput]
+InputType = Union[FileInput, ZMQInput, MofkaInput]
+OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput, MofkaOutput]
 
 
 @dataclass
@@ -79,6 +79,28 @@ class DFAnalyzerInstance:
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
+            view_types=self.hydra_config.view_types if not view_types else view_types,
+        )
+
+    def analyze_mofka(
+        self,
+        view_types: Optional[List[ViewType]] = None,
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+    ):
+        """Analyze the Mofka trace using the configured analyzer."""
+        if not isinstance(self.input, MofkaInput):
+            raise ValueError("Input is not MofkaInput")
+        return self.analyzer.analyze_mofka(
+            exclude_characteristics=self.hydra_config.exclude_characteristics,
+            extra_columns_fn=extra_columns_fn,
+            extra_columns=extra_columns,
+            group_file=self.input.group_file,
+            logical_view_types=self.hydra_config.logical_view_types,
+            metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
+            output_handler=output_handler,
+            topic_name=self.input.topic_name,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )
 

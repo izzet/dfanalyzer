@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 from . import AnalyzerType, ClusterType, InputType, OutputType
 from .cluster import ExternalCluster
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, init_hydra_config_store
-from .input import FileInput, ZMQInput
+from .input import FileInput, MofkaInput, ZMQInput
 from .utils.log_utils import configure_logging, console_block, log_block
 
 init_hydra_config_store()
@@ -82,6 +82,18 @@ def main(cfg: Config) -> None:
             signal.pause()
         except KeyboardInterrupt:
             print("\nShutting down streaming analysis...")
+    elif isinstance(input, MofkaInput):
+        if not hasattr(output, "handle_result"):
+            raise ValueError("Output does not support handle_result for Mofka input")
+        analyzer.analyze_mofka(
+            group_file=input.group_file,
+            topic_name=input.topic_name,
+            exclude_characteristics=cfg.exclude_characteristics,
+            logical_view_types=cfg.logical_view_types,
+            metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
+            view_types=cfg.view_types,
+            output_handler=output.handle_result,
+        )
     else:
         raise ValueError(f"Unsupported input configuration type: {type(cfg.input)}")
 

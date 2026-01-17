@@ -16,7 +16,7 @@ try:
 
         Parameters (constructor kwargs / call args on the Stream API):
         - epoch_start_name: name of the start event (default: "epoch.start")
-        - epoch_end_name: name of the end event (default: "epoch.end")
+        - epoch_end_name: name of the end event (default: "epoch.block")
         - process_key: key in the incoming dict to use as the pid (default: "pid").
 
         The emitted value is the buffered list of elements for the epoch.
@@ -28,7 +28,7 @@ try:
             self,
             upstream,
             epoch_start_name: str = "epoch.start",
-            epoch_end_name: str = "epoch.end",
+            epoch_end_name: str = "epoch.block",
             process_key: str = "pid",
             **kwargs,
         ):

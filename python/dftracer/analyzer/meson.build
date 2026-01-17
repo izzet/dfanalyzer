@@ -20,4 +20,5 @@ py.install_sources(
     subdir: 'dftracer/analyzer',
 )
 
+subdir('streaming')
 subdir('utils')

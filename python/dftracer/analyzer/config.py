@@ -317,6 +317,13 @@ class ZMQInputConfig(InputConfig):
 
 
 @dc.dataclass
+class MofkaInputConfig(InputConfig):
+    _target_: str = "dftracer.analyzer.input.MofkaInput"
+    group_file: str = MISSING
+    topic_name: str = MISSING
+
+
+@dc.dataclass
 class OutputConfig:
     pass
 
@@ -351,6 +358,13 @@ class SQLiteOutputConfig(OutputConfig):
 class ZMQOutputConfig(OutputConfig):
     _target_: str = "dfanalyzer.output.ZMQOutput"
     address: str = MISSING
+
+
+@dc.dataclass
+class MofkaOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.MofkaOutput"
+    group_file: str = MISSING
+    topic_name: str = MISSING
 
 
 @dc.dataclass
@@ -432,8 +446,10 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="cluster", name="slurm", node=SLURMClusterConfig)
     cs.store(group="input", name="file", node=FileInputConfig)
     cs.store(group="input", name="zmq", node=ZMQInputConfig)
+    cs.store(group="input", name="mofka", node=MofkaInputConfig)
     cs.store(group="output", name="console", node=ConsoleOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
     cs.store(group="output", name="zmq", node=ZMQOutputConfig)
+    cs.store(group="output", name="mofka", node=MofkaOutputConfig)
     return cs

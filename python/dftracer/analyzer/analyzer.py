@@ -57,6 +57,7 @@ from .utils.log_utils import console_block, log_block
 from .utils.pandas_agg import unique_set_flatten_pd, unique_set_pd
 from .utils.pandas_utils import flatten_column_names
 from .utils.streaming import Stream, is_streaming_available
+from .streaming.epoch_buffer import EpochBuffer
 
 
 CHECKPOINT_FLAT_VIEW = "_flat_view"
@@ -252,6 +253,85 @@ class Analyzer(abc.ABC):
         )
         return analysis_stream
 
+    def analyze_mofka(
+        self,
+        group_file: str,
+        topic_name: str,
+        view_types: List[ViewType],
+        exclude_characteristics: List[str] = [],
+        logical_view_types: bool = False,
+        metric_boundaries: ViewMetricBoundaries = {},
+        epoch_start_name: str = "epoch.start",
+        epoch_end_name: str = "epoch.block",
+        process_key: str = "pid",
+        stop_name: str = "end",
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+    ) -> None:
+        from .streaming.mofka_io import open_consumer
+
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+        buffer = EpochBuffer(
+            epoch_start_name=epoch_start_name,
+            epoch_end_name=epoch_end_name,
+            process_key=process_key,
+        )
+        output_handler = output_handler or (lambda result: None)
+
+        driver, consumer = open_consumer(group_file, topic_name)
+        logger.debug("Mofka consumer started", topic=topic_name)
+        try:
+            while True:
+                mofka_event = consumer.pull().wait(timeout_ms=-1)
+                if mofka_event is None:
+                    raise RuntimeError("Mofka consumer returned no event")
+                event = mofka_event.metadata
+                if not isinstance(event, dict):
+                    raise ValueError(f"Invalid event metadata type: {type(event)}")
+                logger.debug("mofka.raw_event", name=event.get("name"), ph=event.get("ph"))
+
+                # Remove 'epoch' from extra_columns as it is handled by EpochBuffer
+                normalized_extra_columns = extra_columns.copy() if extra_columns else None
+                if normalized_extra_columns and "epoch" in normalized_extra_columns:
+                    normalized_extra_columns.pop("epoch")
+
+                normalized_event = self.normalize_stream_event(
+                    event=event,
+                    extra_columns=normalized_extra_columns,
+                    extra_columns_fn=extra_columns_fn,
+                )
+                logger.debug("mofka.normalized_event", name=normalized_event.get("name"))
+
+                if normalized_event.get("name") == stop_name:
+                    logger.info("Mofka stop event received", name=stop_name)
+                    break
+
+                epoch_events = buffer.push(normalized_event)
+                if epoch_events:
+                    logger.debug("mofka.epoch_emitted", count=len(epoch_events))
+                if not epoch_events:
+                    continue
+
+                traces = self.handle_stream_events(
+                    events=epoch_events,
+                    view_types=proc_view_types,
+                    extra_columns=extra_columns,
+                )
+                result = self._analyze_trace(
+                    traces=traces,
+                    proc_view_types=proc_view_types,
+                    logical_view_types=logical_view_types,
+                    raw_stats={},
+                    metric_boundaries=metric_boundaries,
+                )
+                logger.debug("mofka.analysis_complete", flat_views=len(result.flat_views))
+
+                output_handler(result)
+        finally:
+            del consumer
+            del driver
+
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
@@ -374,6 +454,23 @@ class Analyzer(abc.ABC):
             A Stream with any post-processing applied.
         """
         return trace_stream
+
+    def normalize_stream_event(
+        self,
+        event: dict,
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+    ) -> dict:
+        return event
+
+    def handle_stream_events(
+        self,
+        events: List[dict],
+        view_types: List[ViewType],
+        extra_columns: Optional[Dict[str, str]] = None,
+    ) -> pd.DataFrame:
+        traces = pd.DataFrame(events)
+        return self.postread_trace(traces=traces, view_types=view_types)
 
     def compute_job_time(self, traces: dd.DataFrame) -> float:
         """Computes the total job execution time from the traces.
@@ -1032,6 +1129,13 @@ class Analyzer(abc.ABC):
             # Compute time boundaries for flat views
             with log_block("compute_time_boundaries"):
                 metric_boundaries.update(self.compute_time_boundaries(flat_views))
+                with open("metric_boundaries.json", "w") as f:
+                    json.dump(
+                        metric_boundaries,
+                        f,
+                        cls=NpEncoder,
+                        indent=4,
+                    )
 
             # Process flat views
             with log_block("process_flat_views"):
@@ -1042,6 +1146,7 @@ class Analyzer(abc.ABC):
                         view_key=view_key,
                         metric_boundaries=metric_boundaries,
                     )
+                    flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
 
         # Checkpoint flat views if enabled
         if self.checkpoint:
