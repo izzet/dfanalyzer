@@ -703,10 +703,10 @@ class Analyzer(abc.ABC):
                     continue
                 metric_col = f"{metric}_{col}"
                 hlm[metric_col] = pd.NA
-                if hlm.dtypes[col].name == "object" and not is_data_col:
+                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_data_col:
                     hlm[metric_col] = hlm[metric_col].map(lambda x: S())
                 hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
-                if hlm.dtypes[col].name != "object":
+                if not pd.api.types.is_string_dtype(hlm.dtypes[col]):
                     hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
         return hlm
 
