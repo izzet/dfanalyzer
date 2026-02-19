@@ -71,6 +71,42 @@ def dftracer_ai_logging_posix_events():
     return epochs
 
 
+def _detect_fabric_protocol():
+    """Detect the best available fabric protocol for bedrock.
+
+    Checks for CXI fabric availability (used on Cray EX systems with Slingshot).
+    Returns 'ofi+cxi' if CXI devices are found, otherwise falls back to 'tcp'.
+
+    Environment variables that can override detection:
+    - DFANALYZER_MOFKA_FABRIC_PROTOCOL: Force a specific protocol (e.g., 'ofi+cxi', 'tcp')
+    - DFANALYZER_MOFKA_FORCE_TCP: If set to '1', force TCP regardless of fabric detection
+    """
+    # Allow environment variable override
+    if os.environ.get("DFANALYZER_MOFKA_FABRIC_PROTOCOL"):
+        return os.environ["DFANALYZER_MOFKA_FABRIC_PROTOCOL"]
+
+    # Allow forcing TCP for testing/debugging
+    if os.environ.get("DFANALYZER_MOFKA_FORCE_TCP") == "1":
+        return "tcp"
+
+    # Check for CXI devices (Cray EX / Slingshot interconnect)
+    # CXI devices typically appear as /dev/cxi* or /dev/hfi*
+    cxi_devices = glob.glob("/dev/cxi*") + glob.glob("/dev/hfi*")
+    if cxi_devices:
+        return "ofi+cxi"
+
+    # Check for libfabric CXI provider availability
+    try:
+        result = subprocess.run(["fi_info", "-p", "cxi"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return "ofi+cxi"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fall back to TCP for local development or systems without CXI
+    return "tcp"
+
+
 def _ensure_extracted_data(data_dir: str) -> None:
     """Ensure any tar.gz files under data_dir are extracted into data_dir/extracted.
 
@@ -118,8 +154,11 @@ def bedrock_mofka():
     if os.path.exists(group_file):
         os.remove(group_file)
 
+    # Detect the best available fabric protocol
+    protocol = _detect_fabric_protocol()
+
     proc = subprocess.Popen(
-        [bedrock, "tcp", "-c", config_path, "-v", "trace"],
+        [bedrock, protocol, "-c", config_path, "-v", "trace"],
         stdout=open(log_path, "w"),
         stderr=subprocess.STDOUT,
         cwd=tests_root,
