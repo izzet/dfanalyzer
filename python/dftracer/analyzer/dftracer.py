@@ -393,23 +393,6 @@ class DFTracerAnalyzer(Analyzer):
         # ===============================================
         return self._rename_columns(traces)
 
-    def read_zmq(self, trace_address, extra_columns, extra_columns_fn):
-        trace_stream = super().read_zmq(
-            trace_address=trace_address,
-            extra_columns=extra_columns,
-            extra_columns_fn=extra_columns_fn,
-        )
-        return trace_stream.map(
-            lambda line: next(
-                load_json(
-                    line,
-                    time_approximate=self.time_approximate,
-                    extra_columns=extra_columns,
-                    extra_columns_fn=extra_columns_fn,
-                )
-            )
-        )
-
     def postread_trace(self, traces, view_types):
         # print("Post-reading trace", traces)
         # print("Post-reading trace columns", traces.columns)
@@ -470,17 +453,6 @@ class DFTracerAnalyzer(Analyzer):
             traces = self._sanitize_size(traces)
 
         return traces
-
-    def postread_zmq(self, trace_stream, view_types, extra_columns, extra_columns_fn):
-        columns = self._get_columns(extra_columns)
-        return (
-            trace_stream.map(lambda traces: pd.DataFrame(traces, columns=columns))
-            .map(self._handle_metadata)
-            .map(self._fix_time)
-            .map(self._rename_columns)
-            .map(lambda df: df.assign(time_range=1))
-            .map(self.postread_trace, view_types=view_types)
-        )
 
     def normalize_stream_event(
         self,

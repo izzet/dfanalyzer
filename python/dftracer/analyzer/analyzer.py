@@ -56,7 +56,6 @@ from .utils.json_encoders import NpEncoder
 from .utils.log_utils import console_block, log_block
 from .utils.pandas_agg import unique_set_flatten_pd, unique_set_pd
 from .utils.pandas_utils import flatten_column_names
-from .utils.streaming import Stream, is_streaming_available
 from .streaming.epoch_buffer import EpochBuffer
 
 
@@ -224,34 +223,108 @@ class Analyzer(abc.ABC):
         address: str,
         view_types: List[ViewType],
         exclude_characteristics: List[str] = [],
-        extra_columns: Optional[Dict[str, str]] = None,
-        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-    ) -> Stream:
-        extra_columns = {"epoch": "Int8"}
-        extra_columns_fn = lambda json_dict: {"epoch": json_dict.get("epoch", None)}
-        analysis_stream = self.read_zmq(
-            trace_address=address,
-            extra_columns=extra_columns,
-            extra_columns_fn=extra_columns_fn,
+        epoch_start_name: str = "epoch.start",
+        epoch_end_name: str = "epoch.block",
+        process_key: str = "pid",
+        stop_name: str = "end",
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+    ) -> None:
+        from .streaming.zmq_io import open_consumer
+
+        context, consumer = open_consumer(address)
+        logger.debug("ZMQ consumer started", address=address)
+        try:
+            self._analyze_stream(
+                pull_event=consumer.recv_json,
+                view_types=view_types,
+                exclude_characteristics=exclude_characteristics,
+                logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries,
+                epoch_start_name=epoch_start_name,
+                epoch_end_name=epoch_end_name,
+                process_key=process_key,
+                stop_name=stop_name,
+                extra_columns=extra_columns,
+                extra_columns_fn=extra_columns_fn,
+                output_handler=output_handler,
+                stream_name="zmq",
+            )
+        finally:
+            consumer.close(linger=0)
+            context.term()
+
+    def _analyze_stream(
+        self,
+        pull_event: Callable[[], Optional[dict]],
+        view_types: List[ViewType],
+        exclude_characteristics: List[str] = [],
+        logical_view_types: bool = False,
+        metric_boundaries: ViewMetricBoundaries = {},
+        epoch_start_name: str = "epoch.start",
+        epoch_end_name: str = "epoch.block",
+        process_key: str = "pid",
+        stop_name: str = "end",
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        stream_name: str = "stream",
+    ) -> None:
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+        buffer = EpochBuffer(
+            epoch_start_name=epoch_start_name,
+            epoch_end_name=epoch_end_name,
+            process_key=process_key,
         )
-        # analysis_stream.sink(print)
-        analysis_stream = analysis_stream.epoch_window_via_dict()  # .gather()
-        analysis_stream = self.postread_zmq(
-            analysis_stream,
-            view_types=view_types,
-            extra_columns=extra_columns,
-            extra_columns_fn=extra_columns_fn,
-        )
-        analysis_stream = analysis_stream.map(
-            self._analyze_trace,
-            view_types=view_types,
-            logical_view_types=logical_view_types,
-            raw_stats={},
-            metric_boundaries=metric_boundaries,
-        )
-        return analysis_stream
+        output_handler = output_handler or (lambda result: None)
+
+        while True:
+            event = pull_event()
+            if event is None:
+                raise RuntimeError(f"{stream_name} consumer returned no event")
+            if not isinstance(event, dict):
+                raise ValueError(f"Invalid event type from {stream_name}: {type(event)}")
+            logger.debug(f"{stream_name}.raw_event", name=event.get("name"), ph=event.get("ph"))
+
+            # Remove 'epoch' from extra_columns as it is handled by EpochBuffer.
+            normalized_extra_columns = extra_columns.copy() if extra_columns else None
+            if normalized_extra_columns and "epoch" in normalized_extra_columns:
+                normalized_extra_columns.pop("epoch")
+
+            normalized_event = self.normalize_stream_event(
+                event=event,
+                extra_columns=normalized_extra_columns,
+                extra_columns_fn=extra_columns_fn,
+            )
+            logger.debug(f"{stream_name}.normalized_event", name=normalized_event.get("name"))
+
+            if normalized_event.get("name") == stop_name:
+                logger.info(f"{stream_name}.stop_event", name=stop_name)
+                break
+
+            epoch_events = buffer.push(normalized_event)
+            if epoch_events:
+                logger.debug(f"{stream_name}.epoch_emitted", count=len(epoch_events))
+            if not epoch_events:
+                continue
+
+            traces = self.handle_stream_events(
+                events=epoch_events,
+                view_types=proc_view_types,
+                extra_columns=extra_columns,
+            )
+            result = self._analyze_trace(
+                traces=traces,
+                proc_view_types=proc_view_types,
+                logical_view_types=logical_view_types,
+                raw_stats={},
+                metric_boundaries=metric_boundaries,
+            )
+            logger.debug(f"{stream_name}.analysis_complete", flat_views=len(result.flat_views))
+            output_handler(result)
 
     def analyze_mofka(
         self,
@@ -271,63 +344,26 @@ class Analyzer(abc.ABC):
     ) -> None:
         from .streaming.mofka_io import open_consumer
 
-        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
-        buffer = EpochBuffer(
-            epoch_start_name=epoch_start_name,
-            epoch_end_name=epoch_end_name,
-            process_key=process_key,
-        )
-        output_handler = output_handler or (lambda result: None)
-
         driver, consumer = open_consumer(group_file, topic_name)
         logger.debug("Mofka consumer started", topic=topic_name)
         try:
-            while True:
-                mofka_event = consumer.pull().wait(timeout_ms=-1)
-                if mofka_event is None:
-                    raise RuntimeError("Mofka consumer returned no event")
-                event = mofka_event.metadata
-                if not isinstance(event, dict):
-                    raise ValueError(f"Invalid event metadata type: {type(event)}")
-                logger.debug("mofka.raw_event", name=event.get("name"), ph=event.get("ph"))
-
-                # Remove 'epoch' from extra_columns as it is handled by EpochBuffer
-                normalized_extra_columns = extra_columns.copy() if extra_columns else None
-                if normalized_extra_columns and "epoch" in normalized_extra_columns:
-                    normalized_extra_columns.pop("epoch")
-
-                normalized_event = self.normalize_stream_event(
-                    event=event,
-                    extra_columns=normalized_extra_columns,
-                    extra_columns_fn=extra_columns_fn,
-                )
-                logger.debug("mofka.normalized_event", name=normalized_event.get("name"))
-
-                if normalized_event.get("name") == stop_name:
-                    logger.info("Mofka stop event received", name=stop_name)
-                    break
-
-                epoch_events = buffer.push(normalized_event)
-                if epoch_events:
-                    logger.debug("mofka.epoch_emitted", count=len(epoch_events))
-                if not epoch_events:
-                    continue
-
-                traces = self.handle_stream_events(
-                    events=epoch_events,
-                    view_types=proc_view_types,
-                    extra_columns=extra_columns,
-                )
-                result = self._analyze_trace(
-                    traces=traces,
-                    proc_view_types=proc_view_types,
-                    logical_view_types=logical_view_types,
-                    raw_stats={},
-                    metric_boundaries=metric_boundaries,
-                )
-                logger.debug("mofka.analysis_complete", flat_views=len(result.flat_views))
-
-                output_handler(result)
+            self._analyze_stream(
+                pull_event=lambda: (
+                    None if (mofka_event := consumer.pull().wait(timeout_ms=-1)) is None else mofka_event.metadata
+                ),
+                view_types=view_types,
+                exclude_characteristics=exclude_characteristics,
+                logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries,
+                epoch_start_name=epoch_start_name,
+                epoch_end_name=epoch_end_name,
+                process_key=process_key,
+                stop_name=stop_name,
+                extra_columns=extra_columns,
+                extra_columns_fn=extra_columns_fn,
+                output_handler=output_handler,
+                stream_name="mofka",
+            )
         finally:
             del consumer
             del driver
@@ -395,29 +431,8 @@ class Analyzer(abc.ABC):
         trace_address: str,
         extra_columns: Optional[Dict[str, str]],
         extra_columns_fn: Optional[Callable[[dict], dict]],
-    ) -> Stream:
-        """Reads I/O trace data from a ZMQ source.
-
-        Connects to the specified ZMQ address and returns a Stream
-        containing the parsed I/O trace data.
-
-        Args:
-            trace_address: The ZMQ address to connect to for reading traces.
-
-        Returns:
-            A Stream containing the parsed I/O trace data.
-
-        Raises:
-            RuntimeError: If streaming is not available.
-        """
-
-        if not is_streaming_available:
-            raise RuntimeError("Streaming is not available. Please install the required dependencies.")
-
-        s = Stream.from_zmq(trace_address, bind=True).map(lambda msg: msg.decode("utf-8"))
-        logger.debug("ZMQ stream created", address=trace_address)
-        # s.sink_to_textfile("incoming_trace.txt", mode="w")
-        return s  # .scatter()
+    ):
+        raise RuntimeError("read_zmq is deprecated. Use analyze_zmq with output_handler.")
 
     def postread_trace(self, traces: dd.DataFrame, view_types: List[ViewType]) -> dd.DataFrame:
         """Performs any post-processing on the raw trace data.
@@ -436,23 +451,11 @@ class Analyzer(abc.ABC):
 
     def postread_zmq(
         self,
-        trace_stream: Stream,
+        trace_stream,
         view_types: List[ViewType],
         extra_columns: Optional[Dict[str, str]],
         extra_columns_fn: Optional[Callable[[dict], dict]],
-    ) -> Stream:
-        """Performs any post-processing on the raw ZMQ trace data.
-
-        This method can be overridden by subclasses to perform additional
-        transformations or filtering on the trace data after it has been read.
-        By default, it returns the traces unmodified.
-
-        Args:
-            trace_stream: A Stream containing the I/O trace data.
-
-        Returns:
-            A Stream with any post-processing applied.
-        """
+    ):
         return trace_stream
 
     def normalize_stream_event(

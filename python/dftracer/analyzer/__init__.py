@@ -70,6 +70,7 @@ class DFAnalyzerInstance:
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
     ):
         """Analyze the ZMQ trace using the configured analyzer."""
         return self.analyzer.analyze_zmq(
@@ -79,6 +80,7 @@ class DFAnalyzerInstance:
             extra_columns_fn=extra_columns_fn,
             logical_view_types=self.hydra_config.logical_view_types,
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
+            output_handler=output_handler,
             view_types=self.hydra_config.view_types if not view_types else view_types,
         )
 

@@ -1,6 +1,5 @@
 import dftracer.analyzer.utils.warning_utils  # noqa: F401
 import hydra
-import signal
 import structlog
 from distributed import Client
 from hydra.core.hydra_config import HydraConfig
@@ -64,24 +63,16 @@ def main(cfg: Config) -> None:
             # Handle result
             output.handle_result(result=result)
     elif isinstance(input, ZMQInput):
-        print(f"Starting stream analysis from: {input.address}")
-        analysis_stream = analyzer.analyze_zmq(
+        if not hasattr(output, "handle_result"):
+            raise ValueError("Output does not support handle_result for ZMQ input")
+        analyzer.analyze_zmq(
             address=input.address,
             exclude_characteristics=cfg.exclude_characteristics,
             logical_view_types=cfg.logical_view_types,
             metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
             view_types=cfg.view_types,
+            output_handler=output.handle_result,
         )
-        analysis_stream = analysis_stream.map(lambda result: result.flat_views[("epoch",)].to_json(orient="index"))
-        analysis_stream.sink(print)
-        analysis_stream.to_zmq(output.address)
-        analysis_stream.visualize("analysis")
-        analysis_stream.start()
-        print("Streaming analysis started. Press Ctrl+C to exit.")
-        try:
-            signal.pause()
-        except KeyboardInterrupt:
-            print("\nShutting down streaming analysis...")
     elif isinstance(input, MofkaInput):
         if not hasattr(output, "handle_result"):
             raise ValueError("Output does not support handle_result for Mofka input")

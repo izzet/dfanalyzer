@@ -1,99 +1,65 @@
+import json
+import multiprocessing
 import pathlib
 import pytest
-import threading
 import time
-from dftracer.analyzer import init_with_hydra
-from dftracer.analyzer.utils.streaming import is_streaming_available
-from typing import List
 
-# Ensure this module runs in both smoke and full CI modes
+from dftracer.analyzer import init_with_hydra
+from dftracer.analyzer.streaming.zmq_io import open_producer
+
+
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
-@pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
-def test_analyzer_dftracer_read_zmq(
+def test_analyzer_dftracer_analyze_zmq_stops_on_end(
     tmp_path: pathlib.Path,
-    dftracer_ai_logging_posix_events: List[List[str]],
 ) -> None:
-    """Test DFTracerAnalyzer.read_zmq by publishing toy JSON lines over ZMQ.
-
-    This verifies the stream parses incoming JSON lines into dictionaries
-    using the analyzer's JSON loader.
-    """
-    import zmq
+    pytest.importorskip("zmq")
 
     zmq_port = 5570
+    bind_address = f"tcp://*:{zmq_port}"
+    connect_address = f"tcp://127.0.0.1:{zmq_port}"
 
     dfa = init_with_hydra(
         hydra_overrides=[
             "analyzer=dftracer",
-            "analyzer/preset=dlio-ailogging",
-            f"analyzer.checkpoint={False}",
+            "analyzer/preset=dlio",
+            "analyzer.checkpoint=False",
             f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
-            f"cluster.processes={False}",
+            "cluster.processes=False",
             f"hydra.run.dir={tmp_path}",
             f"hydra.runtime.output_dir={tmp_path}",
             "input=zmq",
-            f"input.address=tcp://*:{zmq_port}",
+            f"input.address={bind_address}",
             "view_types=[epoch]",
         ]
     )
 
-    # use realistic epoch lines extracted from the test data
-    events = dftracer_ai_logging_posix_events[0]
+    end_event = json.loads(
+        '{"id":478,"name":"end","cat":"dftracer","pid":4103080,"tid":4103080,"ts":1753300246416070,"dur":0,"ph":"X","args":{"hhash":"03089b0f8c47cc3d","p_idx":476,"num_events":477,"level":6}}'
+    )
 
-    def publisher():
-        ctx = zmq.Context()
-        sock = ctx.socket(zmq.PUSH)
-        sock.connect(f"tcp://localhost:{zmq_port}")
-        time.sleep(0.1)
-        for event in events:
-            sock.send_string(event)
-            time.sleep(0.01)
-        sock.close()
-        ctx.term()
+    def run_producer():
+        context, producer = open_producer(connect_address)
+        time.sleep(0.2)
+        producer.send_json(end_event)
+        producer.close(linger=0)
+        context.term()
 
-    pub_thread = threading.Thread(target=publisher, daemon=True)
+    proc = multiprocessing.Process(target=run_producer, daemon=True)
+    proc.start()
+
+    collected = []
+    dfa.analyzer.analyze_zmq(
+        address=bind_address,
+        view_types=["epoch"],
+        output_handler=collected.append,
+    )
+    assert collected == []
 
     try:
-        collected = []
+        dfa.shutdown()
+    except Exception:
+        pass
 
-        extra_columns = {"epoch": "Int8"}
-
-        def extra_columns_fn(json_dict):
-            return {"epoch": json_dict.get("epoch", None)}
-
-        read_stream = dfa.analyzer.read_zmq(
-            trace_address=f"tcp://*:{zmq_port}",
-            extra_columns=extra_columns,
-            extra_columns_fn=extra_columns_fn,
-        )
-        read_stream.sink(collected.append)
-
-        # start the stream then publisher (give stream time to bind)
-        read_stream.start()
-        time.sleep(0.5)
-        pub_thread.start()
-
-        # wait for data
-        timeout = 10.0
-        start = time.time()
-        while time.time() - start < timeout and len(collected) == 0:
-            time.sleep(0.05)
-
-        # Stop stream
-        try:
-            read_stream.stop()
-        except Exception:
-            pass
-
-        assert len(collected) > 0, "No parsed messages collected from read_zmq"
-        # messages should be dicts with at least 'name' and 'pid' for our toy msgs
-        assert all(isinstance(x, dict) for x in collected), "Parsed items are not dicts"
-        names = [x.get("name") for x in collected]
-        assert "epoch.start" in names or "epoch.block" in names or "read" in names
-    finally:
-        try:
-            dfa.shutdown()
-        except Exception:
-            pass
+    proc.join(timeout=5)

@@ -356,7 +356,7 @@ class SQLiteOutputConfig(OutputConfig):
 
 @dc.dataclass
 class ZMQOutputConfig(OutputConfig):
-    _target_: str = "dfanalyzer.output.ZMQOutput"
+    _target_: str = "dftracer.analyzer.output.ZMQOutput"
     address: str = MISSING
 
 

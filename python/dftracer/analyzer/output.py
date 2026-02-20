@@ -3,6 +3,7 @@ import colorsys
 import dask
 import dataclasses as dc
 import inflect
+import json
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
@@ -15,7 +16,6 @@ from .types import (
     ViewKey,
     humanized_view_name,
 )
-from .utils.streaming import Stream, is_streaming_available
 
 
 @dc.dataclass
@@ -288,17 +288,34 @@ class SQLiteOutput(FileOutput):
 
 class ZMQOutput:
     def __init__(self, address: str, bind: Optional[bool] = False):
-        if not is_streaming_available:
-            raise RuntimeError("Streaming is not available")
+        from .streaming.zmq_io import open_producer
+
         self.address = address
         self.bind = bind
+        self._context, self._producer = open_producer(address=address, bind=bool(bind))
 
-    def handle_stream(self, stream: Stream) -> None:
-        """
-        Consumes an analysis stream and sinks it to the configured ZMQ address.
-        """
-        print(f"Sinking analysis stream to ZMQ address: {self.address}")
-        stream.to_zmq(self.address, bind=self.bind)
+    def handle_result(self, result: AnalyzerResultType):
+        for view_key in result.flat_views:
+            view_type = '_'.join(view_key)
+            flat_view = result.flat_views[view_key]
+            metadata = dict(
+                layers=result.layers,
+                raw_stats=dc.asdict(result.raw_stats),
+                view_len=len(flat_view),
+                view_memory_usage_bytes=int(flat_view.memory_usage(deep=True).sum()),
+                view_type=view_type,
+                view_types=result.view_types,
+            )
+            self._producer.send_multipart(
+                [
+                    json.dumps(metadata).encode("utf-8"),
+                    flat_view.to_parquet(),
+                ]
+            )
+
+    def close(self):
+        self._producer.close(linger=0)
+        self._context.term()
 
 
 class MofkaOutput:

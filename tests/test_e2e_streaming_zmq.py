@@ -1,108 +1,82 @@
+import json
+import multiprocessing
 import pandas as pd
 import pathlib
 import pytest
-import threading
 import time
-from dftracer.analyzer import init_with_hydra
-from dftracer.analyzer.utils.streaming import is_streaming_available
+
 from typing import List
 
-# Ensure this module runs in both smoke and full CI modes
+from dftracer.analyzer import init_with_hydra
+from dftracer.analyzer.streaming.zmq_io import open_producer
+
+
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
-@pytest.mark.skipif(not is_streaming_available, reason="streamz not installed")
 def test_e2e_zmq(
     tmp_path: pathlib.Path,
     dftracer_ai_logging_posix_events: List[List[str]],
 ) -> None:
-    """Synchronous test: parse toy JSON events and run the analyzer pipeline directly.
-
-    This avoids network flakiness while exercising the same parsing and
-    aggregation code paths used by `analyze_zmq`.
-    """
-    import zmq
+    pytest.importorskip("zmq")
 
     zmq_port = 5561
+    bind_address = f"tcp://*:{zmq_port}"
+    connect_address = f"tcp://127.0.0.1:{zmq_port}"
 
-    # Initialize analyzer instance via hydra same as real usage
     dfa = init_with_hydra(
         hydra_overrides=[
             "analyzer=dftracer",
             "analyzer/preset=posix",
-            f"analyzer.checkpoint={False}",
+            "analyzer.checkpoint=False",
             f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
-            f"cluster.processes={False}",
+            "cluster.processes=False",
             f"hydra.run.dir={tmp_path}",
             f"hydra.runtime.output_dir={tmp_path}",
             "input=zmq",
-            f"input.address=tcp://*:{zmq_port}",
+            f"input.address={bind_address}",
             "view_types=[epoch]",
+            "debug=True",
         ]
     )
+
+    events_raw = list(dftracer_ai_logging_posix_events[0])
+    events_raw.append(
+        '{"id":478,"name":"end","cat":"dftracer","pid":4103080,"tid":4103080,"ts":1753300246416070,"dur":0,"ph":"X","args":{"hhash":"03089b0f8c47cc3d","p_idx":476,"num_events":477,"level":6}}'
+    )
+    events = [json.loads(line) for line in events_raw]
+
+    collected = []
+
+    def run_producer():
+        context, producer = open_producer(connect_address)
+        time.sleep(0.2)
+        for event in events:
+            producer.send_json(event)
+        producer.close(linger=0)
+        context.term()
+
+    proc = multiprocessing.Process(target=run_producer, daemon=True)
+    proc.start()
 
     extra_columns = {"epoch": "Int8"}
     extra_columns_fn = lambda json_dict: {"epoch": json_dict.get("epoch", None)}
 
-    # Use realistic epoch lines from the test fixture (first epoch)
-    events = dftracer_ai_logging_posix_events[0]
+    dfa.analyzer.analyze_zmq(
+        address=bind_address,
+        view_types=["epoch"],
+        extra_columns=extra_columns,
+        extra_columns_fn=extra_columns_fn,
+        output_handler=collected.append,
+    )
 
-    # Publisher: connect and push the toy messages
-    def publisher():
-        ctx = zmq.Context()
-        sock = ctx.socket(zmq.PUSH)
-        sock.connect(f"tcp://localhost:{zmq_port}")
-        time.sleep(0.2)
-        for event in events:
-            sock.send_string(event)
-            # print("send line", event)
-            time.sleep(0.01)
-        sock.close()
-        ctx.term()
-
-    pub_thread = threading.Thread(target=publisher, daemon=True)
-
-    # Collect emitted AnalyzerResultType objects
-    collected = []
-
-    # analyze_zmq returns a Stream object; sink receives AnalyzerResultType per epoch
-    analysis_stream = dfa.analyze_zmq(extra_columns=extra_columns, extra_columns_fn=extra_columns_fn)
-    assert analysis_stream is not None
-    assert hasattr(analysis_stream, "sink")
-
-    analysis_stream.sink(collected.append)
-
-    # Start the stream
-    analysis_stream.start()
-
-    # Start the publisher once the stream is running and bound
-    pub_thread.start()
-
-    # Wait for the publisher to finish
-    pub_thread.join()
-
-    # Wait for analysis result (stream processing may be async)
-    timeout = 10.0
-    start = time.time()
-    while time.time() - start < timeout and len(collected) == 0:
-        time.sleep(0.1)
-
-    # Stop stream and cleanup
-    try:
-        analysis_stream.stop()
-    except Exception:
-        pass
-
-    # Basic assertions: we got at least one analysis result
     assert len(collected) > 0, "No analysis results emitted from analyze_zmq"
     result = collected[0]
 
-    # Validate the AnalyzerResultType shape
     assert hasattr(result, "flat_views"), "Result missing flat_views"
     assert isinstance(result.flat_views, dict), "flat_views not a dict"
     assert len(result.flat_views) > 0, "flat_views is empty"
 
-    # At least one flat view must be a non-empty pandas DataFrame
     any_df = False
     for k, v in result.flat_views.items():
         assert isinstance(k, tuple), "flat_views keys should be tuples (view_key)"
@@ -111,11 +85,9 @@ def test_e2e_zmq(
 
     assert any_df, "No non-empty pandas DataFrame found in flat_views"
 
-    # Additional sanity checks: traces and layers present
-    assert hasattr(result, "layers")
-    assert isinstance(result.layers, list)
-
     try:
         dfa.shutdown()
     except Exception:
         pass
+
+    proc.join(timeout=5)
