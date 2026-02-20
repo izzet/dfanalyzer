@@ -3,7 +3,6 @@ import pathlib
 import pytest
 import threading
 import time
-import zmq
 from dftracer.analyzer import init_with_hydra
 from dftracer.analyzer.utils.streaming import is_streaming_available
 from typing import List
@@ -22,6 +21,7 @@ def test_e2e_zmq(
     This avoids network flakiness while exercising the same parsing and
     aggregation code paths used by `analyze_zmq`.
     """
+    import zmq
 
     zmq_port = 5561
 

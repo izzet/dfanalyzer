@@ -2,7 +2,6 @@ import pathlib
 import pytest
 import threading
 import time
-import zmq
 from dftracer.analyzer import init_with_hydra
 from dftracer.analyzer.utils.streaming import is_streaming_available
 from typing import List
@@ -21,6 +20,8 @@ def test_analyzer_dftracer_read_zmq(
     This verifies the stream parses incoming JSON lines into dictionaries
     using the analyzer's JSON loader.
     """
+    import zmq
+
     zmq_port = 5570
 
     dfa = init_with_hydra(
