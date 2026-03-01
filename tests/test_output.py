@@ -8,7 +8,15 @@ import pytest
 from dftracer.analyzer.output import MofkaOutput, ZMQOutput
 from dftracer.analyzer.streaming.mofka_io import open_consumer
 from dftracer.analyzer.streaming.zmq_io import open_consumer as open_zmq_consumer
-from dftracer.analyzer.types import AnalyzerResultType, RawStats
+from dftracer.analyzer.types import (
+    AnalysisFact,
+    AnalyzerResultType,
+    FactProvenance,
+    FactScope,
+    FactSeverity,
+    FactWindow,
+    RawStats,
+)
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -42,6 +50,25 @@ def _sample_result():
         views={},
     )
     return flat_view, result
+
+
+def _sample_fact() -> AnalysisFact:
+    fact = AnalysisFact(
+        fact_type="fetch_interval_pressure",
+        window=FactWindow(run_id="run-1", view_type="time_range", t0_ns=0, t1_ns=10_000_000_000, trigger="rule_eval"),
+        scope=FactScope(entity="0", rank_set="all"),
+        evidence={"metrics": {"fetch_data_time_frac_parent": 0.72}},
+        severity=FactSeverity(score=0.9, label="critical"),
+        confidence=0.8,
+        opportunity_tags=["reader_parallelism"],
+        provenance=FactProvenance(
+            rule_id="rule.fetch.interval",
+            rule_version="1.0.0",
+            view_key=["time_range"],
+        ),
+    )
+    fact.finalize_id()
+    return fact
 
 
 def test_mofka_output_roundtrip(bedrock_mofka):
@@ -113,6 +140,42 @@ def test_zmq_output_roundtrip():
         assert list(restored.columns) == list(flat_view.columns)
         assert list(restored.index) == list(flat_view.index)
         assert restored.index.name == flat_view.index.name
+    finally:
+        output.close()
+        consumer.close(linger=0)
+        context.term()
+
+
+def test_zmq_output_analysis_facts_envelope_only():
+    zmq = pytest.importorskip("zmq")
+    _, result = _sample_result()
+    result.flat_views = {}
+    result.view_types = ["time_range"]
+    result.analysis_facts = {("time_range",): [_sample_fact()]}
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    address = f"tcp://127.0.0.1:{port}"
+    context, consumer = open_zmq_consumer(address, bind=True)
+    consumer.setsockopt(zmq.RCVTIMEO, 5000)
+    output = ZMQOutput(address=address, bind=False)
+    try:
+        output.handle_result(result)
+        parts = consumer.recv_multipart()
+        assert len(parts) == 2
+
+        metadata = json.loads(parts[0].decode("utf-8"))
+        assert metadata.get("artifact_type") == "analysis_facts"
+        assert metadata.get("view_type") == "analysis_facts"
+        assert metadata.get("fact_count") == 1
+
+        payload = json.loads(parts[1].decode("utf-8"))
+        assert payload.get("schema_version") == "analyzer.fact-envelope.v1"
+        assert payload.get("context", {}).get("view_types") == ["time_range"]
+        assert len(payload.get("facts", [])) == 1
+        assert payload.get("fact_count_by_view", {}).get("time_range") == 1
     finally:
         output.close()
         consumer.close(linger=0)

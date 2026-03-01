@@ -1,5 +1,7 @@
 import dask.dataframe as dd
 import dataclasses as dc
+import hashlib
+import json
 import pandas as pd
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union, Tuple
@@ -97,6 +99,92 @@ MetricBoundary = Union[int, float]
 MetricBoundaries = Dict[str, Any]
 ViewMetricBoundaries = Dict[str, MetricBoundaries]
 Views = Dict[ViewKey, View]
+
+
+@dc.dataclass
+class FactWindow:
+    run_id: Optional[str] = None
+    view_type: Optional[str] = None
+    epoch: Optional[int] = None
+    step: Optional[int] = None
+    t0_ns: Optional[int] = None
+    t1_ns: Optional[int] = None
+    trigger: Optional[str] = None
+
+
+@dc.dataclass
+class FactScope:
+    workload: Optional[str] = None
+    layer: Optional[str] = None
+    entity: Optional[str] = None
+    rank_set: Optional[str] = None
+
+
+@dc.dataclass
+class FactSeverity:
+    score: float
+    label: str
+    method: str = "rule_weighted"
+
+
+@dc.dataclass
+class FactProvenance:
+    rule_id: str
+    rule_version: str
+    metric_source: str = "flat_view"
+    view_key: Optional[List[str]] = None
+
+
+@dc.dataclass
+class AnalysisFact:
+    fact_type: str
+    window: FactWindow
+    scope: FactScope
+    evidence: Dict[str, Any]
+    severity: Optional[FactSeverity] = None
+    confidence: Optional[float] = None
+    opportunity_tags: List[str] = dc.field(default_factory=list)
+    provenance: Optional[FactProvenance] = None
+    schema_version: str = "analysisfact.v1"
+    fact_id: Optional[str] = None
+
+    def finalize_id(self):
+        """Set deterministic fact_id when it is not explicitly provided."""
+        if self.fact_id:
+            return self.fact_id
+        scope_key = f"{self.scope.layer}:{self.scope.entity}:{self.scope.rank_set}"
+        window_key = (
+            f"{self.window.run_id}:{self.window.view_type}:{self.window.epoch}:{self.window.step}:"
+            f"{self.window.t0_ns}:{self.window.t1_ns}"
+        )
+        fact_key = f"{self.schema_version}:{self.fact_type}:{window_key}:{scope_key}"
+        self.fact_id = f"af_{hashlib.md5(fact_key.encode('utf-8')).hexdigest()[:12]}"
+        return self.fact_id
+
+
+@dc.dataclass
+class FactEnvelopeContext:
+    run_id: Optional[str] = None
+    layers: List[str] = dc.field(default_factory=list)
+    view_types: List[str] = dc.field(default_factory=list)
+    time_granularity: Optional[float] = None
+    time_resolution: Optional[float] = None
+    total_event_count: Optional[int] = None
+    window_type_counts: Dict[str, int] = dc.field(default_factory=dict)
+
+
+@dc.dataclass
+class FactEnvelope:
+    schema_version: str = "analyzer.fact-envelope.v1"
+    context: FactEnvelopeContext = dc.field(default_factory=FactEnvelopeContext)
+    facts: List[AnalysisFact] = dc.field(default_factory=list)
+    fact_count_by_view: Dict[str, int] = dc.field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dc.asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
 
 
 @dc.dataclass
@@ -201,6 +289,7 @@ class AnalyzerResultType:
     _hlms: Dict[Layer, dd.DataFrame]
     _main_views: Dict[Layer, dd.DataFrame]
     _metric_boundaries: ViewMetricBoundaries
+    analysis_facts: Dict[ViewKey, List[AnalysisFact]] = dc.field(default_factory=dict)
     _traces: Optional[dd.DataFrame] = None
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
@@ -219,6 +308,52 @@ class AnalyzerResultType:
             view_key_type = (view_key_type,)
         return self.views[layer][view_key_type]
 
+    def get_analysis_facts(self, view_key_type: Union[ViewKey, ViewType]) -> List[AnalysisFact]:
+        if not isinstance(view_key_type, tuple):
+            view_key_type = (view_key_type,)
+        return self.analysis_facts.get(view_key_type, [])
+
+    def iter_analysis_facts(self):
+        for view_key, facts in self.analysis_facts.items():
+            for fact in facts:
+                yield view_key, fact
+
+    def to_fact_envelope(self) -> FactEnvelope:
+        raw_stats_dict: Dict[str, Any] = {}
+        if isinstance(self.raw_stats, dict):
+            raw_stats_dict = dict(self.raw_stats)
+        elif dc.is_dataclass(self.raw_stats):
+            raw_stats_dict = dc.asdict(self.raw_stats)
+
+        run_id = raw_stats_dict.get("run_id")
+        fact_count_by_view: Dict[str, int] = {}
+        window_type_counts: Dict[str, int] = {}
+        facts_flat: List[AnalysisFact] = []
+
+        for view_key, fact in self.iter_analysis_facts():
+            view_key_name = "_".join(view_key)
+            fact_count_by_view[view_key_name] = fact_count_by_view.get(view_key_name, 0) + 1
+            if fact.window.view_type:
+                window_type_counts[fact.window.view_type] = window_type_counts.get(fact.window.view_type, 0) + 1
+            if run_id is None and fact.window.run_id:
+                run_id = fact.window.run_id
+            facts_flat.append(fact)
+
+        context = FactEnvelopeContext(
+            run_id=None if run_id is None else str(run_id),
+            layers=[str(layer) for layer in self.layers],
+            view_types=[str(view_type) for view_type in self.view_types],
+            time_granularity=_to_opt_float(raw_stats_dict.get("time_granularity")),
+            time_resolution=_to_opt_float(raw_stats_dict.get("time_resolution")),
+            total_event_count=_to_opt_int(raw_stats_dict.get("total_event_count")),
+            window_type_counts=window_type_counts,
+        )
+        return FactEnvelope(
+            context=context,
+            facts=facts_flat,
+            fact_count_by_view=fact_count_by_view,
+        )
+
 
 def humanized_metric_name(metric: Metric):
     return HUMANIZED_METRICS[metric]
@@ -232,3 +367,39 @@ def humanized_view_name(view_key_type: Union[ViewKey, ViewType], separator='_'):
 
 def view_name(view_key_type: Union[ViewKey, ViewType], separator='_'):
     return separator.join(view_key_type) if isinstance(view_key_type, tuple) else view_key_type
+
+
+def _to_opt_float(value: Any) -> Optional[float]:
+    value = _materialize_scalar(value)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _to_opt_int(value: Any) -> Optional[int]:
+    value = _materialize_scalar(value)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _materialize_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "compute"):
+        try:
+            value = value.compute()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    return value

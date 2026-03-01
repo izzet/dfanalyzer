@@ -329,6 +329,16 @@ class OutputConfig:
 
 
 @dc.dataclass
+class FactsConfig:
+    enabled: bool = False
+    rule_file: str = ""
+    emit_flat_views: bool = True
+    emit_analysis_facts: bool = False
+    strict_time_semantics: bool = True
+    allow_mixed_time_aggregates: bool = False
+
+
+@dc.dataclass
 class FileOutputConfig(OutputConfig):
     compact: Optional[bool] = False
     name: Optional[str] = ""
@@ -420,6 +430,7 @@ class Config:
     cluster: ClusterConfig = MISSING
     debug: Optional[bool] = False
     exclude_characteristics: Optional[List[str]] = dc.field(default_factory=list)
+    facts: FactsConfig = dc.field(default_factory=FactsConfig)
     input: InputConfig = MISSING
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)

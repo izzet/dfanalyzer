@@ -44,6 +44,7 @@ def main(cfg: Config) -> None:
         analyzer: AnalyzerType = instantiate(
             cfg.analyzer,
             debug=cfg.debug,
+            facts_config=cfg.facts,
             verbose=cfg.verbose,
         )
 

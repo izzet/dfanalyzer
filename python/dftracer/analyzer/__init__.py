@@ -150,6 +150,7 @@ def init_with_hydra(hydra_overrides: List[str]):
         analyzer = instantiate(
             hydra_config.analyzer,
             debug=hydra_config.debug,
+            facts_config=hydra_config.facts,
             verbose=hydra_config.verbose,
         )
 

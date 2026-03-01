@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dfanalyzer://schemas/analyzer.fact-envelope.v1",
+  "title": "DFAnalyzer Analyzer Fact Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "context",
+    "facts",
+    "fact_count_by_view"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "analyzer.fact-envelope.v1"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "layers",
+        "view_types",
+        "time_granularity",
+        "time_resolution",
+        "total_event_count",
+        "window_type_counts"
+      ],
+      "properties": {
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "view_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "time_granularity": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "time_resolution": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_event_count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "window_type_counts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "facts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/analysis_fact"
+      }
+    },
+    "fact_count_by_view": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    }
+  },
+  "$defs": {
+    "analysis_fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fact_type",
+        "window",
+        "scope",
+        "evidence",
+        "severity",
+        "confidence",
+        "opportunity_tags",
+        "provenance",
+        "schema_version",
+        "fact_id"
+      ],
+      "properties": {
+        "fact_type": {
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/$defs/fact_window"
+        },
+        "scope": {
+          "$ref": "#/$defs/fact_scope"
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "severity": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fact_severity"
+            }
+          ]
+        },
+        "confidence": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "opportunity_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fact_provenance"
+            }
+          ]
+        },
+        "schema_version": {
+          "type": "string",
+          "const": "analysisfact.v1"
+        },
+        "fact_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "fact_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "view_type",
+        "epoch",
+        "step",
+        "t0_ns",
+        "t1_ns",
+        "trigger"
+      ],
+      "properties": {
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "step": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "t0_ns": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "t1_ns": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "trigger": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "fact_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workload",
+        "layer",
+        "entity",
+        "rank_set"
+      ],
+      "properties": {
+        "workload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank_set": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "fact_severity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "score",
+        "label",
+        "method"
+      ],
+      "properties": {
+        "score": {
+          "type": "number"
+        },
+        "label": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        }
+      }
+    },
+    "fact_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "rule_version",
+        "metric_source",
+        "view_key"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string"
+        },
+        "rule_version": {
+          "type": "string"
+        },
+        "metric_source": {
+          "type": "string"
+        },
+        "view_key": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

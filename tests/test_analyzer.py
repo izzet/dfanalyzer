@@ -4,7 +4,7 @@ import dask.dataframe as dd
 import pytest
 from dask.distributed import Client, LocalCluster
 from dftracer.analyzer.analyzer import Analyzer
-from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX, AnalyzerPresetConfigDLIO
+from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX, AnalyzerPresetConfigDLIO, FactsConfig
 from dftracer.analyzer.constants import VIEW_TYPES
 from dftracer.analyzer.metrics import set_view_metrics
 from typing import List, Optional, Dict
@@ -645,3 +645,50 @@ def test_compute_view_file_dask_quantiles(dummy_analyzer_quantiles: DummyAnalyze
     assert list(out.index.names) == ["file_name"]
     _assert_no_infinities(out)
     _assert_quantile_columns_present(out, "time")
+
+
+class _StubFactEngine:
+    def __init__(self, payload):
+        self.payload = payload
+        self.called = False
+
+    def evaluate(self, flat_views, raw_stats):
+        self.called = True
+        return self.payload
+
+
+def test_evaluate_analysis_facts_respects_emit_toggle(dummy_analyzer: DummyAnalyzer):
+    facts_payload = {("epoch",): ["fact"]}
+    stub = _StubFactEngine(payload=facts_payload)
+    dummy_analyzer.fact_engine = stub
+    dummy_analyzer.facts_config = FactsConfig(enabled=True, emit_analysis_facts=False)
+
+    emitted = dummy_analyzer._evaluate_analysis_facts(flat_views={}, raw_stats={})
+    assert emitted == {}
+    assert stub.called is False
+
+    dummy_analyzer.facts_config = FactsConfig(enabled=True, emit_analysis_facts=True)
+    emitted = dummy_analyzer._evaluate_analysis_facts(flat_views={}, raw_stats={})
+    assert emitted == facts_payload
+    assert stub.called is True
+
+
+def test_materialize_output_artifacts_respects_toggles(dummy_analyzer: DummyAnalyzer):
+    flat_views = {("epoch",): pd.DataFrame({"epoch_time_max": [1.0]})}
+    analysis_facts = {("epoch",): ["fact"]}
+
+    dummy_analyzer.facts_config = FactsConfig(enabled=True, emit_flat_views=False, emit_analysis_facts=True)
+    output_flat_views, output_analysis_facts = dummy_analyzer._materialize_output_artifacts(
+        flat_views=flat_views,
+        analysis_facts=analysis_facts,
+    )
+    assert output_flat_views == {}
+    assert output_analysis_facts == analysis_facts
+
+    dummy_analyzer.facts_config = FactsConfig(enabled=True, emit_flat_views=True, emit_analysis_facts=False)
+    output_flat_views, output_analysis_facts = dummy_analyzer._materialize_output_artifacts(
+        flat_views=flat_views,
+        analysis_facts=analysis_facts,
+    )
+    assert output_flat_views == flat_views
+    assert output_analysis_facts == {}

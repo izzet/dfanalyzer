@@ -1,0 +1,135 @@
+schema_version: analysisfact-rules.v1
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: per_row
+  confidence: "0.80"
+
+rules:
+  - id: dlio.fetch_pressure.v1
+    priority: 100
+    source_view: epoch
+    fact_type: fetch_pressure
+    required_metrics:
+      - fetch_data_time_frac_parent
+      - compute_time_frac_parent
+    when: "fetch_data_time_frac_parent >= 0.20"
+    severity_score: "clip01((fetch_data_time_frac_parent - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_frac_parent - 0.20))"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
+  - id: dlio.compute_dominance.v1
+    priority: 90
+    source_view: epoch
+    fact_type: compute_dominance
+    required_metrics:
+      - compute_time_frac_parent
+      - fetch_data_time_frac_parent
+    when: "compute_time_frac_parent >= 0.90 and fetch_data_time_frac_parent <= 0.10"
+    severity_score: "clip01((compute_time_frac_parent - 0.85) / 0.20)"
+    confidence: "clip01(0.70 + 0.25 * compute_time_frac_parent)"
+    opportunity_tags:
+      - none
+
+  - id: dlio.epoch_straggler.v1
+    priority: 110
+    source_view: proc_name
+    emit_mode: window
+    fact_type: epoch_straggler
+    required_metrics:
+      - epoch_time_max
+    derived_metrics:
+      epoch_straggler_ratio: "max(epoch_time_max) / max(min(epoch_time_max), 1e-9)"
+    when: "epoch_straggler_ratio > 1.05"
+    severity_score: "clip01((epoch_straggler_ratio - 1.0) / 0.20)"
+    confidence: "clip01(0.75 + 0.25 * (epoch_straggler_ratio - 1.0))"
+    opportunity_tags:
+      - rank_balance
+      - pipeline_sync
+
+  - id: dlio.fetch_rank_imbalance.v1
+    priority: 120
+    source_view: proc_name
+    emit_mode: window
+    fact_type: fetch_rank_imbalance
+    required_metrics:
+      - fetch_data_time_max
+      - fetch_data_time_frac_parent
+    derived_metrics:
+      fetch_rank_ratio: "max(fetch_data_time_max) / max(min(fetch_data_time_max), 1e-9)"
+      fetch_share_max: "max(fetch_data_time_frac_parent)"
+    when: "fetch_rank_ratio >= 1.5"
+    severity_score: "clip01((fetch_rank_ratio - 1.0) / 2.5)"
+    confidence: "clip01(0.70 + 0.20 * fetch_share_max + 0.10 * (fetch_rank_ratio - 1.0))"
+    opportunity_tags:
+      - rank_balance
+      - shard_repartition
+
+  - id: dlio.checkpoint_tail_skew.v1
+    priority: 130
+    source_view: proc_name
+    emit_mode: window
+    fact_type: checkpoint_tail_skew
+    required_metrics:
+      - checkpoint_time_max
+      - checkpoint_time_frac_parent
+    derived_metrics:
+      checkpoint_rank_ratio: "max(checkpoint_time_max) / max(min(checkpoint_time_max), 1e-9)"
+      checkpoint_share_max: "max(checkpoint_time_frac_parent)"
+    when: "checkpoint_rank_ratio >= 10 and checkpoint_share_max >= 0.001"
+    severity_score: "clip01(0.5 * ((checkpoint_rank_ratio - 1.0) / 20.0) + 0.5 * (checkpoint_share_max / 0.02))"
+    confidence: "clip01(0.75 + 0.10 * checkpoint_share_max + 0.10 * (checkpoint_rank_ratio - 1.0) / 20.0)"
+    opportunity_tags:
+      - checkpoint_aggregation
+      - io_batching
+
+  - id: dlio.time_range.fetch_interval_pressure.v1
+    priority: 95
+    source_view: time_range
+    fact_type: fetch_interval_pressure
+    required_metrics:
+      - fetch_data_time_frac_parent
+      - compute_time_frac_parent
+      - epoch_time_max
+    derived_metrics:
+      fetch_minus_compute: "fetch_data_time_frac_parent - compute_time_frac_parent"
+    when: "fetch_data_time_frac_parent >= 0.60 and epoch_time_max >= 1.0"
+    severity_score: "clip01((fetch_data_time_frac_parent - 0.40) / 0.40)"
+    confidence: "clip01(0.70 + 0.20 * abs(fetch_minus_compute))"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
+  - id: dlio.time_range.compute_interval_dominance.v1
+    priority: 94
+    source_view: time_range
+    fact_type: compute_interval_dominance
+    required_metrics:
+      - compute_time_frac_parent
+      - fetch_data_time_frac_parent
+      - epoch_time_max
+    when: "compute_time_frac_parent >= 0.45 and fetch_data_time_frac_parent <= 0.50 and epoch_time_max >= 1.0"
+    severity_score: "clip01((compute_time_frac_parent - 0.35) / 0.40)"
+    confidence: "clip01(0.70 + 0.20 * compute_time_frac_parent)"
+    opportunity_tags:
+      - kernel_overlap
+      - pipeline_tuning
+
+  - id: dlio.time_range.checkpoint_interval_burst.v1
+    priority: 96
+    source_view: time_range
+    fact_type: checkpoint_interval_burst
+    required_metrics:
+      - checkpoint_time_max
+      - checkpoint_time_frac_parent
+      - fetch_data_time_max
+    derived_metrics:
+      checkpoint_to_fetch_ratio: "checkpoint_time_max / (fetch_data_time_max + 1e-9)"
+    when: "checkpoint_time_max >= 0.02 and checkpoint_to_fetch_ratio >= 0.10"
+    severity_score: "clip01(0.5 * (checkpoint_to_fetch_ratio / 0.30) + 0.5 * (checkpoint_time_max / 0.20))"
+    confidence: "clip01(0.70 + 0.20 * checkpoint_time_frac_parent + 0.10 * checkpoint_to_fetch_ratio)"
+    opportunity_tags:
+      - checkpoint_aggregation
+      - io_batching

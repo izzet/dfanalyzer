@@ -11,7 +11,7 @@ import structlog
 from betterset import BetterSet as S
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .analysis_utils import (
     fix_dtypes,
@@ -23,7 +23,7 @@ from .analysis_utils import (
     set_unique_counts,
     split_duration_records_vectorized,
 )
-from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig
+from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
 from .constants import (
     COL_FILE_NAME,
     COL_HOST_NAME,
@@ -41,6 +41,7 @@ from .metrics import (
     set_quantile_metrics,
     set_view_metrics,
 )
+from .fact_engine import FactEngine
 from .types import (
     AnalyzerResultType,
     RawStats,
@@ -85,6 +86,7 @@ class Analyzer(abc.ABC):
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
+        facts_config: Optional[Union[FactsConfig, Dict[str, Any]]] = None,
         quantile_stats: bool = False,
         time_approximate: bool = True,
         time_granularity: float = 1,
@@ -115,6 +117,14 @@ class Analyzer(abc.ABC):
         self.debug = debug
         self.quantile_stats = quantile_stats
         self.layers = list(preset.layer_defs.keys())
+        self.facts_config = self._build_facts_config(facts_config)
+        self.fact_engine = None
+        if self.facts_config.enabled:
+            self.fact_engine = FactEngine.from_rule_file(
+                self.facts_config.rule_file,
+                strict_time_semantics=self.facts_config.strict_time_semantics,
+                allow_mixed_time_aggregates=self.facts_config.allow_mixed_time_aggregates,
+            )
         if preset.logical_views is None:
             self.logical_views = {}
         elif isinstance(preset.logical_views, dict):
@@ -128,6 +138,42 @@ class Analyzer(abc.ABC):
         self.time_sliced = time_sliced
         self.verbose = verbose
         ensure_dir(self.checkpoint_dir)
+
+    @staticmethod
+    def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
+        if facts_config is None:
+            return FactsConfig()
+        if isinstance(facts_config, FactsConfig):
+            return facts_config
+        if isinstance(facts_config, dict):
+            return FactsConfig(**facts_config)
+        if OmegaConf.is_config(facts_config):
+            return FactsConfig(**OmegaConf.to_object(facts_config))
+        raise TypeError(f"Unsupported facts_config type: {type(facts_config)}")
+
+    def _evaluate_analysis_facts(
+        self,
+        flat_views: Dict[ViewKey, pd.DataFrame],
+        raw_stats: Any,
+    ) -> Dict[ViewKey, List[Any]]:
+        if self.fact_engine is None:
+            return {}
+        if not self.facts_config.emit_analysis_facts:
+            logger.debug("facts.emit_analysis_facts.disabled")
+            return {}
+        return self.fact_engine.evaluate(
+            flat_views=flat_views,
+            raw_stats=raw_stats,
+        )
+
+    def _materialize_output_artifacts(
+        self,
+        flat_views: Dict[ViewKey, pd.DataFrame],
+        analysis_facts: Dict[ViewKey, List[Any]],
+    ) -> Tuple[Dict[ViewKey, pd.DataFrame], Dict[ViewKey, List[Any]]]:
+        output_flat_views = flat_views if self.facts_config.emit_flat_views else {}
+        output_analysis_facts = analysis_facts if self.facts_config.emit_analysis_facts else {}
+        return output_flat_views, output_analysis_facts
 
     def analyze_file(
         self,
@@ -1132,13 +1178,14 @@ class Analyzer(abc.ABC):
             # Compute time boundaries for flat views
             with log_block("compute_time_boundaries"):
                 metric_boundaries.update(self.compute_time_boundaries(flat_views))
-                with open("metric_boundaries.json", "w") as f:
-                    json.dump(
-                        metric_boundaries,
-                        f,
-                        cls=NpEncoder,
-                        indent=4,
-                    )
+                if self.debug:
+                    with open("metric_boundaries.json", "w") as f:
+                        json.dump(
+                            metric_boundaries,
+                            f,
+                            cls=NpEncoder,
+                            indent=4,
+                        )
 
             # Process flat views
             with log_block("process_flat_views"):
@@ -1149,7 +1196,8 @@ class Analyzer(abc.ABC):
                         view_key=view_key,
                         metric_boundaries=metric_boundaries,
                     )
-                    flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
+                    if self.debug:
+                        flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
 
         # Checkpoint flat views if enabled
         if self.checkpoint:
@@ -1161,12 +1209,24 @@ class Analyzer(abc.ABC):
             with log_block("wait_for_checkpoints"):
                 wait(self.checkpoint_tasks)
 
+        with log_block("evaluate_fact_rules"):
+            analysis_facts = self._evaluate_analysis_facts(
+                flat_views=flat_views,
+                raw_stats=raw_stats,
+            )
+
+        output_flat_views, output_analysis_facts = self._materialize_output_artifacts(
+            flat_views=flat_views,
+            analysis_facts=analysis_facts,
+        )
+
         return AnalyzerResultType(
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
+            analysis_facts=output_analysis_facts,
             checkpoint_dir=self.checkpoint_dir,
-            flat_views=flat_views,
+            flat_views=output_flat_views,
             layers=self.layers,
             raw_stats=raw_stats,
             view_types=proc_view_types,

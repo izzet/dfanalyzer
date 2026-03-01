@@ -12,10 +12,19 @@ from typing import Dict, List, Optional
 from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, Layer, MiB
 from .types import (
     AnalyzerResultType,
+    FactEnvelope,
     RawStats,
     ViewKey,
     humanized_view_name,
 )
+
+
+def _raw_stats_to_dict(raw_stats) -> Dict:
+    if dc.is_dataclass(raw_stats):
+        return dc.asdict(raw_stats)
+    if isinstance(raw_stats, dict):
+        return dict(raw_stats)
+    return {}
 
 
 @dc.dataclass
@@ -295,12 +304,15 @@ class ZMQOutput:
         self._context, self._producer = open_producer(address=address, bind=bool(bind))
 
     def handle_result(self, result: AnalyzerResultType):
+        if result.analysis_facts:
+            self._send_fact_envelope(result=result)
         for view_key in result.flat_views:
             view_type = '_'.join(view_key)
             flat_view = result.flat_views[view_key]
             metadata = dict(
+                artifact_type="flat_view",
                 layers=result.layers,
-                raw_stats=dc.asdict(result.raw_stats),
+                raw_stats=_raw_stats_to_dict(result.raw_stats),
                 view_len=len(flat_view),
                 view_memory_usage_bytes=int(flat_view.memory_usage(deep=True).sum()),
                 view_type=view_type,
@@ -317,6 +329,22 @@ class ZMQOutput:
         self._producer.close(linger=0)
         self._context.term()
 
+    def _send_fact_envelope(self, result: AnalyzerResultType):
+        envelope: FactEnvelope = result.to_fact_envelope()
+        metadata = dict(
+            artifact_type="analysis_facts",
+            schema_version=envelope.schema_version,
+            fact_count=len(envelope.facts),
+            view_type="analysis_facts",
+            view_types=result.view_types,
+        )
+        self._producer.send_multipart(
+            [
+                json.dumps(metadata).encode("utf-8"),
+                envelope.to_json().encode("utf-8"),
+            ]
+        )
+
 
 class MofkaOutput:
     def __init__(self, group_file: str, topic_name: str):
@@ -328,12 +356,15 @@ class MofkaOutput:
         self._driver, self._producer = open_producer(group_file, topic_name)
 
     def handle_result(self, result: AnalyzerResultType):
+        if result.analysis_facts:
+            self._send_fact_envelope(result=result)
         for view_key in result.flat_views:
             view_type = '_'.join(view_key)
             flat_view = result.flat_views[view_key]
             metadata = dict(
+                artifact_type="flat_view",
                 layers=result.layers,
-                raw_stats=dc.asdict(result.raw_stats),
+                raw_stats=_raw_stats_to_dict(result.raw_stats),
                 view_len=len(flat_view),
                 view_memory_usage_bytes=int(flat_view.memory_usage(deep=True).sum()),
                 view_type=view_type,
@@ -344,3 +375,17 @@ class MofkaOutput:
                 data=flat_view.to_parquet(),
             )
         self._producer.flush()
+
+    def _send_fact_envelope(self, result: AnalyzerResultType):
+        envelope: FactEnvelope = result.to_fact_envelope()
+        metadata = dict(
+            artifact_type="analysis_facts",
+            schema_version=envelope.schema_version,
+            fact_count=len(envelope.facts),
+            view_type="analysis_facts",
+            view_types=result.view_types,
+        )
+        self._producer.push(
+            metadata=metadata,
+            data=envelope.to_json().encode("utf-8"),
+        )
