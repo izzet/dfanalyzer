@@ -67,11 +67,16 @@ class Output(abc.ABC):
     def handle_result(self, result: AnalyzerResultType):
         raise NotImplementedError
 
-    def _create_summary(self, result: AnalyzerResultType, view_key: ViewKey) -> OutputSummary:
-        flat_view = result.flat_views[view_key]
+    def _compute_raw_stats(self, result: AnalyzerResultType) -> RawStats:
         raw_stats = dask.compute(result.raw_stats)[0]
         if isinstance(raw_stats, dict):
             raw_stats = RawStats(**raw_stats)
+        return raw_stats
+
+    def _create_summary(self, result: AnalyzerResultType, view_key: ViewKey, raw_stats: Optional[RawStats] = None) -> OutputSummary:
+        flat_view = result.flat_views[view_key]
+        if raw_stats is None:
+            raw_stats = self._compute_raw_stats(result)
         summary = OutputSummary(
             job_time=float(raw_stats.job_time),
             layer_metrics={},
@@ -165,11 +170,12 @@ class ConsoleOutput(Output):
         self.show_header = show_header
 
     def handle_result(self, result: AnalyzerResultType):
+        raw_stats = self._compute_raw_stats(result)
         print_objects = []
         for view_key in result.flat_views:
             if view_key[-1] not in result.view_types:
                 continue
-            summary = self._create_summary(result=result, view_key=view_key)
+            summary = self._create_summary(result=result, view_key=view_key, raw_stats=raw_stats)
             summary_table = self._create_summary_table(summary=summary, view_key=view_key)
             layer_breakdown_table = self._create_layer_breakdown_table(summary=summary, view_key=view_key)
             print_objects.append(summary_table)
@@ -341,15 +347,16 @@ class JSONOutput(Output):
         self.file_path = file_path
 
     def handle_result(self, result: AnalyzerResultType):
+        raw_stats = self._compute_raw_stats(result)
         output = {
             "schema_version": "1",
-            "raw_stats": self._create_raw_stats(result=result),
+            "raw_stats": self._create_raw_stats(raw_stats=raw_stats),
             "views": {},
         }
         for view_key in result.flat_views:
             if view_key[-1] not in result.view_types:
                 continue
-            summary = self._create_summary(result=result, view_key=view_key)
+            summary = self._create_summary(result=result, view_key=view_key, raw_stats=raw_stats)
             output["views"][view_name(view_key, separator="/")] = {
                 "summary": self._create_summary_payload(summary=summary),
                 "additional_metrics": self._create_additional_metrics_payload(result=result, view_key=view_key),
@@ -382,10 +389,7 @@ class JSONOutput(Output):
             return None
         return float(value)
 
-    def _create_raw_stats(self, result: AnalyzerResultType):
-        raw_stats = dask.compute(result.raw_stats)[0]
-        if isinstance(raw_stats, dict):
-            raw_stats = RawStats(**raw_stats)
+    def _create_raw_stats(self, raw_stats: RawStats):
         return {
             "job_time_s": self._to_float_or_none(raw_stats.job_time),
             "time_granularity_s": self._to_float_or_none(raw_stats.time_granularity),
