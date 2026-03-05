@@ -31,7 +31,7 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 
 @dc.dataclass
 class AnalyzerPresetConfig:
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
+    additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     layer_defs: Dict[str, Optional[str]] = MISSING

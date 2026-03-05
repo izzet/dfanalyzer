@@ -953,6 +953,10 @@ class Analyzer(abc.ABC):
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
+            additional_metrics={
+                view_type: list(metrics.keys())
+                for view_type, metrics in (self.preset.additional_metrics or {}).items()
+            },  # type: ignore
             checkpoint_dir=self.checkpoint_dir,
             flat_views=flat_views,
             layers=self.layers,
@@ -1114,16 +1118,22 @@ class Analyzer(abc.ABC):
                 time_boundary_layer=self.get_time_boundary_layer(),
             )
         with log_block("set_additional_metrics", view_key=view_key):
-            flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
+            flat_view = self._set_additional_metrics(
+                flat_view,
+                view_key=view_key,
+            )
         return flat_view.sort_index(axis=1)
 
     @staticmethod
     def _save_flat_view(view: pd.DataFrame, view_path: str):
         view.to_parquet(f"{view_path}.parquet")
 
-    def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
+    def _set_additional_metrics(self, view: pd.DataFrame, view_key: ViewKey, epsilon=1e-9) -> pd.DataFrame:
+        view_type = view_key[-1]
+        is_view_process_based = self.is_view_process_based(view_key)
         time_metric = "time_sum" if is_view_process_based else "time_max"
-        for metric, eval_condition in self.preset.additional_metrics.items():
+        view_additional_metrics = (self.preset.additional_metrics or {}).get(view_type, {})
+        for metric, eval_condition in view_additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
                 time_interval=self.time_granularity,
