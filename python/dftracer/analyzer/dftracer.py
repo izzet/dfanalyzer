@@ -166,13 +166,13 @@ def io_function(json_dict: dict):
                 image_id = int(json_dict["args"]["image_idx"])
                 if image_id > 0:
                     d["image_id"] = image_id
-            # if "image_size" in json_object["args"]:
-            #     name = json_object["name"].lower()
-            #     # e.g. NPZReader.open image_size is not correct
-            #     if 'reader.open' not in name:
-            #         size = int(json_object["args"]["image_size"])
-            #         if size > 0:
-            #             d["size"] = size
+            if "image_size" in json_dict["args"]:
+                name = json_dict["name"].lower()
+                # e.g. NPZReader.open image_size is not correct
+                if "open" not in name:
+                    size = int(json_dict["args"]["image_size"])
+                    if size > 0:
+                        d["size"] = size
     return d
 
 

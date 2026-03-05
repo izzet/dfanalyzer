@@ -25,6 +25,7 @@ DERIVED_POSIX_METRICS = {
     'other': 'io_cat == 6',
     'sync': 'io_cat == 7',
 }
+DERIVED_POSIX_SIZE_METRICS = ('data', 'read', 'write')
 HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", False)
 
 
@@ -37,6 +38,8 @@ class AnalyzerPresetConfig:
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=dict)
+    size_layers: Optional[List[str]] = dc.field(default_factory=list)
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
@@ -66,6 +69,12 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=lambda: {
+            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+        }
+    )
+    size_layers: Optional[List[str]] = dc.field(default_factory=lambda: ['posix'])
 
 
 @dc.dataclass
@@ -174,6 +183,20 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
         }
     )
     name: str = "dlio"
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=lambda: {
+            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+            'reader_posix': list(DERIVED_POSIX_SIZE_METRICS),
+            'checkpoint_posix': list(DERIVED_POSIX_SIZE_METRICS),
+        }
+    )
+    size_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: [
+            'posix',
+            'reader_posix',
+            'checkpoint_posix',
+        ]
+    )
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 

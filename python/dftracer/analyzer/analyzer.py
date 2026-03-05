@@ -691,19 +691,24 @@ class Analyzer(abc.ABC):
             return fallback()
 
     @staticmethod
-    def set_layer_metrics(hlm: pd.DataFrame, derived_metrics: Dict[str, str]) -> pd.DataFrame:
+    def set_layer_metrics(
+        hlm: pd.DataFrame,
+        derived_metrics: Dict[str, str],
+        size_derived_metrics: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
         # Create an explicit copy to avoid SettingWithCopyWarning
         hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
+        size_derived_metric_set = set(size_derived_metrics or [])
         for metric, condition in derived_metrics.items():
-            is_data_metric = metric in ["data", "read", "write"]
+            is_size_metric = metric in size_derived_metric_set
             for col in hlm_columns:
-                is_data_col = col == "size" or "size_bin" in col
-                if not is_data_metric and is_data_col:
+                is_size_col = col == "size" or "size_bin" in col
+                if not is_size_metric and is_size_col:
                     continue
                 metric_col = f"{metric}_{col}"
                 hlm[metric_col] = pd.NA
-                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_data_col:
+                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_size_col:
                     hlm[metric_col] = hlm[metric_col].map(lambda x: S())
                 hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
                 if not pd.api.types.is_string_dtype(hlm.dtypes[col]):
@@ -988,12 +993,18 @@ class Analyzer(abc.ABC):
         partition_size: str,
     ) -> dd.DataFrame:
         with log_block("drop_and_set_metrics", layer=layer):
-            if "posix" not in layer.lower():
+            size_layers = {configured_layer.lower() for configured_layer in (self.preset.size_layers or [])}
+            keep_size_for_layer = layer.lower() in size_layers
+            if not keep_size_for_layer:
                 size_cols = [col for col in hlm.columns if col.startswith("size")]
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            hlm = hlm.map_partitions(self.set_layer_metrics, derived_metrics=self.preset.derived_metrics[layer])
+            hlm = hlm.map_partitions(
+                self.set_layer_metrics,
+                derived_metrics=self.preset.derived_metrics[layer],
+                size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
+            )
         with log_block("build_agg_dict", layer=layer):
             view_types_diff = set(VIEW_TYPES).difference(view_types)
             main_view_agg = {}
