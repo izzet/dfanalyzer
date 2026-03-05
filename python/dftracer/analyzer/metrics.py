@@ -90,40 +90,50 @@ def set_view_metrics(
     time_metric = 'time_sum' if is_view_process_based else 'time_max'
 
     view_metrics = list(set(df.columns.tolist()))
-    new_metrics: List[str] = []
+    new_metrics: Dict[str, pd.Series] = {}
 
     for metric in view_metrics:
         if metric.endswith(count_metric):
             count_col = metric
             count_frac_total_col = metric.replace(count_metric, 'count_frac_total')
             count_sum = df[count_col].sum()
-            df[count_frac_total_col] = df[count_col] / count_sum if count_sum > 0 else pd.NA
-            new_metrics.append(count_frac_total_col)
+            if count_sum > 0:
+                new_metrics[count_frac_total_col] = df[count_col] / count_sum
+            else:
+                new_metrics[count_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
         elif metric.endswith(size_metric):
             size_col = metric
             size_frac_total_col = metric.replace(size_metric, 'size_frac_total')
             size_sum = df[size_col].sum()
-            df[size_frac_total_col] = df[size_col] / size_sum if size_sum > 0 else pd.NA
-            new_metrics.append(size_frac_total_col)
+            if size_sum > 0:
+                new_metrics[size_frac_total_col] = df[size_col] / size_sum
+            else:
+                new_metrics[size_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
         elif metric.endswith(time_metric):
             time_col = metric
             time_frac_total_col = metric.replace(time_metric, 'time_frac_total')
             time_sum = df[time_col].sum()
-            df[time_frac_total_col] = df[time_col] / time_sum if time_sum > 0 else pd.NA
-            new_metrics.append(time_frac_total_col)
+            if time_sum > 0:
+                new_metrics[time_frac_total_col] = df[time_col] / time_sum
+            else:
+                new_metrics[time_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
 
-    count_time_frac_metric_pairs = _find_metric_pairs(new_metrics, 'count_frac_total', 'time_frac_total')
+    count_time_frac_metric_pairs = _find_metric_pairs(list(new_metrics.keys()), 'count_frac_total', 'time_frac_total')
     for count_frac_total_col, time_frac_total_col in count_time_frac_metric_pairs:
         ops_percentile_col = count_frac_total_col.replace('count_frac_total', 'ops_percentile')
         ops_slope_col = count_frac_total_col.replace('count_frac_total', 'ops_slope')
-        ops_slope = df[time_frac_total_col] / df[count_frac_total_col]
+        ops_slope = new_metrics[time_frac_total_col] / new_metrics[count_frac_total_col]
         ops_slope = ops_slope.replace([np.inf, -np.inf], pd.NA)
-        df[ops_percentile_col] = ops_slope.rank(pct=True)
-        df[ops_slope_col] = ops_slope
-        new_metrics.append(ops_percentile_col)
-        new_metrics.append(ops_slope_col)
+        new_metrics[ops_percentile_col] = ops_slope.rank(pct=True)
+        new_metrics[ops_slope_col] = ops_slope
 
-    df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
+    if new_metrics:
+        new_metrics_df = pd.DataFrame(new_metrics, index=df.index)
+        new_metrics_df = new_metrics_df.replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        overlapping_cols = [col for col in new_metrics_df.columns if col in df.columns]
+        if overlapping_cols:
+            df = df.drop(columns=overlapping_cols)
+        df = pd.concat([df, new_metrics_df], axis=1)
 
     return df.sort_index(axis=1)
 
@@ -232,10 +242,12 @@ def set_cross_layer_metrics(
                 x_layer_metrics[u_time_frac_parent_col] = u_time_series / df[f"{parent_layer}_{time_metric}"]
 
     if x_layer_metrics:
-        df = df.copy()
-        df = df.assign(**x_layer_metrics)
-        x_layer_cols = list(x_layer_metrics.keys())
-        df[x_layer_cols] = df[x_layer_cols].replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        x_layer_metrics_df = pd.DataFrame(x_layer_metrics, index=df.index)
+        x_layer_metrics_df = x_layer_metrics_df.replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        overlapping_cols = [col for col in x_layer_metrics_df.columns if col in df.columns]
+        if overlapping_cols:
+            df = df.drop(columns=overlapping_cols)
+        df = pd.concat([df.copy(), x_layer_metrics_df], axis=1)
 
     return df.sort_index(axis=1)
 
