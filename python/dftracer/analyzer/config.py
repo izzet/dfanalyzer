@@ -25,7 +25,7 @@ DERIVED_POSIX_METRICS = {
     'other': 'io_cat == 6',
     'sync': 'io_cat == 7',
 }
-DERIVED_POSIX_SIZE_METRICS = ['data', 'read', 'write']
+DERIVED_POSIX_SIZE_METRICS = ('data', 'read', 'write')
 HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", False)
 
 
