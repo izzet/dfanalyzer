@@ -63,6 +63,7 @@ def test_e2e_smoke(
 
 @pytest.mark.smoke
 def test_json_output_file(tmp_path: pathlib.Path, dask_cluster: LocalCluster) -> None:
+    """Verify JSON output file is created with the expected schema and views."""
     checkpoint_dir = f"{tmp_path}/checkpoints"
     scheduler_address = dask_cluster.scheduler_address
     output_path = tmp_path / "analysis.json"
