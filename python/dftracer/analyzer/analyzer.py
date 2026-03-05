@@ -729,20 +729,18 @@ class Analyzer(abc.ABC):
             return json.dump(data[0], f, cls=NpEncoder)
 
     def store_flat_views(self, flat_views: Dict[ViewKey, pd.DataFrame]):
-        store_flat_view_tasks = []
         for view_key in flat_views:
             flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
             flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
             if self.has_checkpoint(name=flat_view_checkpoint_name):
                 continue
-            store_flat_view_tasks.append(
-                self.dask_client.submit(
-                    self._save_flat_view,
-                    view=flat_views[view_key],
-                    view_path=flat_view_checkpoint_path,
-                )
+            # Save local pandas flat views directly to avoid shipping large payloads
+            # through Dask task graphs.
+            self._save_flat_view(
+                view=flat_views[view_key],
+                view_path=flat_view_checkpoint_path,
             )
-        return store_flat_view_tasks
+        return []
 
     def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
         """Stores a Dask DataFrame view to a Parquet checkpoint.
