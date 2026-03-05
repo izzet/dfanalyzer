@@ -165,7 +165,10 @@ def set_size_bins(df: pd.DataFrame):
 
 
 def set_unique_counts(df: pd.DataFrame, layer: str):
+    # Defragment once before deriving many unique-count columns.
+    df = df.copy()
     unique_cols = [col for col in df.columns if col.endswith('_unique')]
+    nunique_cols = {}
     for unique_col in unique_cols:
         if COL_FILE_NAME in unique_col and 'posix' not in layer:
             continue
@@ -177,10 +180,17 @@ def set_unique_counts(df: pd.DataFrame, layer: str):
                     unique_col,
                     df[unique_col].dtype,
                 )
-            df[nunique_col] = 0
+            nunique_cols[nunique_col] = pd.Series(0, index=df.index, dtype='Int32')
         else:
-            df[nunique_col] = df[unique_col].map(len)
-        df[nunique_col] = df[nunique_col].astype('Int32')
+            nunique_cols[nunique_col] = df[unique_col].map(len).astype('Int32')
+
+    if nunique_cols:
+        nunique_df = pd.DataFrame(nunique_cols, index=df.index).astype('Int32')
+        overlapping_cols = [col for col in nunique_df.columns if col in df.columns]
+        if overlapping_cols:
+            df = df.drop(columns=overlapping_cols)
+        df = pd.concat([df, nunique_df], axis=1)
+
     return df.drop(columns=unique_cols)
 
 
