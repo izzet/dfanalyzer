@@ -1003,7 +1003,7 @@ class Analyzer(abc.ABC):
             hlm = hlm.map_partitions(
                 self.set_layer_metrics,
                 derived_metrics=self.preset.derived_metrics[layer],
-                size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer, []),
+                size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
             )
         with log_block("build_agg_dict", layer=layer):
             view_types_diff = set(VIEW_TYPES).difference(view_types)
