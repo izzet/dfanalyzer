@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import pytest
@@ -58,6 +59,48 @@ def test_e2e_smoke(
 ) -> None:
     """Smoke test with minimal parameter combinations for quick validation."""
     _test_e2e(analyzer, preset, trace_path, checkpoint, tmp_path, dask_cluster)
+
+
+@pytest.mark.smoke
+def test_json_output_file(tmp_path: pathlib.Path, dask_cluster: LocalCluster) -> None:
+    checkpoint_dir = f"{tmp_path}/checkpoints"
+    scheduler_address = dask_cluster.scheduler_address
+    output_path = tmp_path / "analysis.json"
+    hydra_overrides = [
+        "analyzer=dftracer",
+        "analyzer/preset=posix",
+        "analyzer.checkpoint=False",
+        f"analyzer.checkpoint_dir={checkpoint_dir}",
+        "cluster=external",
+        "cluster.restart_on_connect=True",
+        f"cluster.scheduler_address={scheduler_address}",
+        "output=json",
+        f"output.file_path={output_path}",
+        f"hydra.run.dir={tmp_path}",
+        f"hydra.runtime.output_dir={tmp_path}",
+        "trace_path=tests/data/extracted/dftracer-posix",
+        "view_types=[time_range,proc_name]",
+    ]
+
+    dfa = init_with_hydra(hydra_overrides=hydra_overrides)
+    result = dfa.analyze_trace()
+    dfa.output.handle_result(result)
+
+    assert output_path.exists(), f"Expected JSON output at {output_path}"
+    with output_path.open() as f:
+        payload = json.load(f)
+
+    assert payload["schema_version"] == "1"
+    assert "raw_stats" in payload
+    assert "views" in payload
+    assert "time_range" in payload["views"]
+    assert "proc_name" in payload["views"]
+    assert "summary" in payload["views"]["time_range"]
+    assert "additional_metrics" in payload["views"]["time_range"]
+    assert "flat_views" not in payload
+
+    dfa.shutdown()
+    assert dfa.client.status == "closed", "Dask client should be closed after shutdown"
 
 
 def _test_e2e(
