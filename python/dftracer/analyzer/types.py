@@ -192,6 +192,7 @@ class OutputType:
 
 @dc.dataclass
 class AnalyzerResultType:
+    additional_metrics: Dict[ViewType, List[str]]
     checkpoint_dir: str
     flat_views: Dict[ViewKey, pd.DataFrame]
     layers: List[Layer]

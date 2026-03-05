@@ -3,12 +3,13 @@ import colorsys
 import dask
 import dataclasses as dc
 import inflect
+import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from typing import Dict, List, Optional
 
-from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, Layer, MiB
+from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, GiB, Layer, MiB
 from .types import (
     AnalyzerResultType,
     RawStats,
@@ -155,6 +156,9 @@ class ConsoleOutput(Output):
             summary_table = self._create_summary_table(summary=summary, view_key=view_key)
             layer_breakdown_table = self._create_layer_breakdown_table(summary=summary, view_key=view_key)
             print_objects.append(summary_table)
+            additional_metrics_table = self._create_additional_metrics_table(result=result, view_key=view_key)
+            if additional_metrics_table is not None:
+                print_objects.append(additional_metrics_table)
             print_objects.append(layer_breakdown_table)
         console = Console(record=True)
         console.print(*print_objects)
@@ -231,6 +235,63 @@ class ConsoleOutput(Output):
                 summary_table.add_row(f"{layer_name} Avg Transfer Size", 'MB', f"{avg_xfer_size / MiB:.3f}")
 
         return summary_table
+
+    def _create_additional_metrics_table(self, result: AnalyzerResultType, view_key: ViewKey) -> Optional[Table]:
+        if not result.additional_metrics:
+            return None
+
+        flat_view = result.flat_views[view_key]
+        view_type = view_key[-1]
+        view_additional_metrics = result.additional_metrics.get(view_type, [])
+        if not view_additional_metrics:
+            return None
+        view_name = humanized_view_name(view_key, ' ')
+        additional_table = Table(title=f"{view_name} Additional Metrics", title_style='bold magenta', expand=True)
+        additional_table.add_column(header='Metric', style='bold')
+        additional_table.add_column(header='Unit', style='italic')
+        additional_table.add_column(header='Non-null', justify='right')
+        additional_table.add_column(header='Min', justify='right')
+        additional_table.add_column(header='Mean', justify='right')
+        additional_table.add_column(header='Max', justify='right')
+
+        found_metric = False
+        for metric in view_additional_metrics:
+            if metric not in flat_view.columns:
+                continue
+            metric_series = pd.to_numeric(flat_view[metric], errors='coerce').replace([np.inf, -np.inf], pd.NA)
+            scale, unit = self._additional_metric_scale_and_unit(metric)
+            metric_series = metric_series / scale
+            non_null = int(metric_series.notna().sum())
+            if non_null == 0:
+                additional_table.add_row(metric, unit, "0", "-", "-", "-")
+                found_metric = True
+                continue
+            additional_table.add_row(
+                metric,
+                unit,
+                f"{non_null:,}",
+                f"{float(metric_series.min()):.3f}",
+                f"{float(metric_series.mean()):.3f}",
+                f"{float(metric_series.max()):.3f}",
+            )
+            found_metric = True
+
+        if not found_metric:
+            return None
+        return additional_table
+
+    @staticmethod
+    def _additional_metric_scale_and_unit(metric: str):
+        metric_lower = metric.lower()
+        if metric_lower.endswith('_gbps'):
+            return GiB, 'GB/s'
+        if metric_lower.endswith('_mbps'):
+            return MiB, 'MB/s'
+        if metric_lower.endswith('_gb'):
+            return GiB, 'GB'
+        if metric_lower.endswith('_mb'):
+            return MiB, 'MB'
+        return 1.0, '-'
 
     def _format_val(self, value: float, fmt_int=False) -> str:
         if value is None or value == 0:
