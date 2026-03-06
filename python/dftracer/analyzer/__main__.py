@@ -80,6 +80,7 @@ def main(cfg: Config) -> None:
         analyzer.analyze_mofka(
             group_file=input.group_file,
             topic_name=input.topic_name,
+            control_topic_name=input.control_topic_name,
             exclude_characteristics=cfg.exclude_characteristics,
             logical_view_types=cfg.logical_view_types,
             metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),

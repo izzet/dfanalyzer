@@ -45,7 +45,7 @@ def open_consumer(
     group_file: str,
     topic_name: str,
     consumer_name: Optional[str] = None,
-    use_progress_thread: bool = True,
+    use_progress_thread: bool = False,
 ):
     mofka = _load_mofka()
     driver = _get_driver(group_file, use_progress_thread)
@@ -55,7 +55,6 @@ def open_consumer(
     logger.info("mofka.consumer.open", topic=topic_name, name=consumer_name or "dftracer-analyzer")
     consumer = topic.consumer(
         name=consumer_name or "dftracer-analyzer",
-        thread_pool=driver.default_thread_pool,
         batch_size=mofka.AdaptiveBatchSize,
         data_allocator=mofka.ByteArrayAllocator,
         data_selector=mofka.FullDataSelector,

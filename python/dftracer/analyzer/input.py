@@ -1,4 +1,5 @@
 import dataclasses as dc
+from typing import Optional
 
 
 @dc.dataclass
@@ -15,3 +16,4 @@ class ZMQInput:
 class MofkaInput:
     group_file: str
     topic_name: str
+    control_topic_name: Optional[str] = None

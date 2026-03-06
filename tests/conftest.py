@@ -10,6 +10,31 @@ import uuid
 
 
 @pytest.fixture(scope="session", autouse=True)
+def dftracer_streaming_env_defaults():
+    keys = [
+        "DFTRACER_MOFKA_PRODUCER_ORDERING",
+        "DFTRACER_MOFKA_PRODUCER_BATCH_SIZE",
+        "DFTRACER_MOFKA_PRODUCER_MAX_NUM_BATCHES",
+        "DFTRACER_MOFKA_CONTROL_EVENT_NAMES",
+        "DFTRACER_MOFKA_PRODUCER_FLUSH_EVERY_N_WRITES",
+    ]
+    old_values = {key: os.environ.get(key) for key in keys}
+
+    os.environ["DFTRACER_MOFKA_PRODUCER_ORDERING"] = "loose"
+    os.environ["DFTRACER_MOFKA_PRODUCER_BATCH_SIZE"] = "20000"
+    os.environ["DFTRACER_MOFKA_PRODUCER_MAX_NUM_BATCHES"] = "8"
+    os.environ["DFTRACER_MOFKA_CONTROL_EVENT_NAMES"] = "epoch.start,epoch.block"
+    os.environ.pop("DFTRACER_MOFKA_PRODUCER_FLUSH_EVERY_N_WRITES", None)
+    yield
+
+    for key, old_value in old_values.items():
+        if old_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old_value
+
+
+@pytest.fixture(scope="session", autouse=True)
 def extract_test_data():
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     _ensure_extracted_data(data_dir)
@@ -137,6 +162,37 @@ def _mofka_available():
     return True
 
 
+def _create_mofka_topic(group_file: str, topic_name: str) -> None:
+    subprocess.check_call(
+        [
+            "python",
+            "-m",
+            "mochi.mofka.mofkactl",
+            "topic",
+            "create",
+            topic_name,
+            "--groupfile",
+            group_file,
+        ]
+    )
+    subprocess.check_call(
+        [
+            "python",
+            "-m",
+            "mochi.mofka.mofkactl",
+            "partition",
+            "add",
+            topic_name,
+            "--type",
+            "memory",
+            "--rank",
+            "0",
+            "--groupfile",
+            group_file,
+        ]
+    )
+
+
 @pytest.fixture(scope="module")
 def bedrock_mofka():
     if not _mofka_available():
@@ -174,34 +230,7 @@ def bedrock_mofka():
         pytest.fail("mofka.group.json was not created")
 
     topic_name = f"dfanalyzer_test_{uuid.uuid4().hex}"
-    subprocess.check_call(
-        [
-            "python",
-            "-m",
-            "mochi.mofka.mofkactl",
-            "topic",
-            "create",
-            topic_name,
-            "--groupfile",
-            group_file,
-        ]
-    )
-    subprocess.check_call(
-        [
-            "python",
-            "-m",
-            "mochi.mofka.mofkactl",
-            "partition",
-            "add",
-            topic_name,
-            "--type",
-            "memory",
-            "--rank",
-            "0",
-            "--groupfile",
-            group_file,
-        ]
-    )
+    _create_mofka_topic(group_file=group_file, topic_name=topic_name)
 
     yield group_file, topic_name
 
@@ -212,3 +241,11 @@ def bedrock_mofka():
         proc.kill()
     if os.path.exists(group_file):
         os.remove(group_file)
+
+
+@pytest.fixture(scope="module")
+def bedrock_mofka_with_control_topic(bedrock_mofka):
+    group_file, trace_topic_name = bedrock_mofka
+    control_topic_name = f"dfanalyzer_control_{uuid.uuid4().hex}"
+    _create_mofka_topic(group_file=group_file, topic_name=control_topic_name)
+    return group_file, trace_topic_name, control_topic_name

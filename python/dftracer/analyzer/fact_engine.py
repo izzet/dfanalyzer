@@ -99,12 +99,53 @@ def _clip01(value: Any) -> Any:
         return value
 
 
+def _to_float_series(x):
+    """Convert to float64 Series/array, replacing pd.NA with np.nan."""
+    if isinstance(x, pd.Series):
+        return x.astype("Float64").to_numpy(dtype="float64", na_value=float("nan"))
+    return x
+
+
+def _na_safe_max(*args):
+    """NA-safe max that works on pandas Series with nullable dtypes."""
+    import numpy as np
+
+    result = args[0]
+    for arg in args[1:]:
+        if isinstance(result, pd.Series) or isinstance(arg, pd.Series):
+            idx = result.index if isinstance(result, pd.Series) else arg.index
+            result = pd.Series(
+                np.fmax(_to_float_series(result), _to_float_series(arg)),
+                index=idx,
+            )
+        else:
+            result = max(result, arg)
+    return result
+
+
+def _na_safe_min(*args):
+    """NA-safe min that works on pandas Series with nullable dtypes."""
+    import numpy as np
+
+    result = args[0]
+    for arg in args[1:]:
+        if isinstance(result, pd.Series) or isinstance(arg, pd.Series):
+            idx = result.index if isinstance(result, pd.Series) else arg.index
+            result = pd.Series(
+                np.fmin(_to_float_series(result), _to_float_series(arg)),
+                index=idx,
+            )
+        else:
+            result = min(result, arg)
+    return result
+
+
 def _eval_python_expr(df: pd.DataFrame, expression: str) -> pd.Series:
     local_env: Dict[str, Any] = {column: df[column] for column in df.columns}
     local_env.update(
         {
-            "max": max,
-            "min": min,
+            "max": _na_safe_max,
+            "min": _na_safe_min,
             "abs": abs,
             "clip01": _clip01,
             "math": math,
@@ -218,6 +259,12 @@ class FactEngine:
             )
             if facts:
                 all_facts[view_key] = facts
+        if all_facts:
+            logger.info(
+                "facts.evaluate.done",
+                total_facts=sum(len(v) for v in all_facts.values()),
+                view_keys=list(all_facts.keys()),
+            )
         return all_facts
 
     def _evaluate_view_rules(
@@ -242,8 +289,12 @@ class FactEngine:
 
             working_df = rule_df.loc[:, projected_columns].copy()
 
-            for metric_name, expression in rule.derived_metrics.items():
-                working_df[metric_name] = _eval_expr(working_df, expression)
+            try:
+                for metric_name, expression in rule.derived_metrics.items():
+                    working_df[metric_name] = _eval_expr(working_df, expression)
+            except Exception:
+                logger.warning("facts.rule.derived_metric_error", rule_id=rule.id, exc_info=True)
+                continue
 
             unresolved_identifiers = [
                 name
@@ -261,6 +312,12 @@ class FactEngine:
             condition_series = _eval_expr(working_df, rule.when)
             condition_mask = condition_series.fillna(False).astype(bool)
             if not condition_mask.any():
+                logger.debug(
+                    "facts.rule.condition_not_met",
+                    rule_id=rule.id,
+                    when=rule.when,
+                    rows=len(working_df),
+                )
                 continue
 
             severity_series = _eval_expr(working_df, rule.severity_score).clip(lower=0.0, upper=1.0)

@@ -1,4 +1,6 @@
 import abc
+import dataclasses as dc
+from collections import defaultdict
 import dask
 import dask.dataframe as dd
 import hashlib
@@ -7,11 +9,25 @@ import json
 import math
 import os
 import pandas as pd
+import signal
 import structlog
 from betterset import BetterSet as S
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# Module-level shutdown flag set by SIGTERM handler.
+_shutdown_requested = False
+
+
+def _sigterm_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+def install_shutdown_handler():
+    """Install SIGTERM handler so the analyzer exits gracefully."""
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
 from .analysis_utils import (
     fix_dtypes,
@@ -148,7 +164,14 @@ class Analyzer(abc.ABC):
         if isinstance(facts_config, dict):
             return FactsConfig(**facts_config)
         if OmegaConf.is_config(facts_config):
-            return FactsConfig(**OmegaConf.to_object(facts_config))
+            config_obj = OmegaConf.to_object(facts_config)
+            if isinstance(config_obj, FactsConfig):
+                return config_obj
+            if isinstance(config_obj, dict):
+                return FactsConfig(**config_obj)
+            if dc.is_dataclass(config_obj):
+                return FactsConfig(**dc.asdict(config_obj))
+            raise TypeError(f"Unsupported OmegaConf facts object type: {type(config_obj)}")
         raise TypeError(f"Unsupported facts_config type: {type(facts_config)}")
 
     def _evaluate_analysis_facts(
@@ -274,7 +297,6 @@ class Analyzer(abc.ABC):
         epoch_start_name: str = "epoch.start",
         epoch_end_name: str = "epoch.block",
         process_key: str = "pid",
-        stop_name: str = "end",
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
@@ -293,7 +315,6 @@ class Analyzer(abc.ABC):
                 epoch_start_name=epoch_start_name,
                 epoch_end_name=epoch_end_name,
                 process_key=process_key,
-                stop_name=stop_name,
                 extra_columns=extra_columns,
                 extra_columns_fn=extra_columns_fn,
                 output_handler=output_handler,
@@ -313,12 +334,12 @@ class Analyzer(abc.ABC):
         epoch_start_name: str = "epoch.start",
         epoch_end_name: str = "epoch.block",
         process_key: str = "pid",
-        stop_name: str = "end",
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
         stream_name: str = "stream",
     ) -> None:
+        install_shutdown_handler()
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         buffer = EpochBuffer(
             epoch_start_name=epoch_start_name,
@@ -327,9 +348,11 @@ class Analyzer(abc.ABC):
         )
         output_handler = output_handler or (lambda result: None)
 
-        while True:
+        while not _shutdown_requested:
             event = pull_event()
             if event is None:
+                if _shutdown_requested:
+                    break
                 raise RuntimeError(f"{stream_name} consumer returned no event")
             if not isinstance(event, dict):
                 raise ValueError(f"Invalid event type from {stream_name}: {type(event)}")
@@ -346,10 +369,6 @@ class Analyzer(abc.ABC):
                 extra_columns_fn=extra_columns_fn,
             )
             logger.debug(f"{stream_name}.normalized_event", name=normalized_event.get("name"))
-
-            if normalized_event.get("name") == stop_name:
-                logger.info(f"{stream_name}.stop_event", name=stop_name)
-                break
 
             epoch_events = buffer.push(normalized_event)
             if epoch_events:
@@ -372,6 +391,236 @@ class Analyzer(abc.ABC):
             logger.debug(f"{stream_name}.analysis_complete", flat_views=len(result.flat_views))
             output_handler(result)
 
+    def _analyze_mofka_with_control(
+        self,
+        group_file: str,
+        topic_name: str,
+        control_topic_name: str,
+        view_types: List[ViewType],
+        exclude_characteristics: List[str] = [],
+        logical_view_types: bool = False,
+        metric_boundaries: ViewMetricBoundaries = {},
+        epoch_start_name: str = "epoch.start",
+        epoch_end_name: str = "epoch.block",
+        process_key: str = "pid",
+        trace_consumer_name: Optional[str] = None,
+        control_consumer_name: Optional[str] = None,
+        extra_columns: Optional[Dict[str, str]] = None,
+        extra_columns_fn: Optional[Callable[[dict], dict]] = None,
+        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        num_ranks: int = 1,
+    ) -> None:
+        from .streaming.mofka_io import open_consumer
+
+        trace_driver, trace_consumer = open_consumer(
+            group_file,
+            topic_name,
+            consumer_name=trace_consumer_name or "dftracer-analyzer",
+            use_progress_thread=False,
+        )
+        control_driver, control_consumer = open_consumer(
+            group_file,
+            control_topic_name,
+            consumer_name=control_consumer_name or "dftracer-analyzer-control",
+            use_progress_thread=False,
+        )
+        logger.debug(
+            "Mofka consumers started",
+            trace_topic=topic_name,
+            control_topic=control_topic_name,
+        )
+
+        install_shutdown_handler()
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+        output_handler = output_handler or (lambda result: None)
+
+        normalized_extra_columns = extra_columns.copy() if extra_columns else None
+        if normalized_extra_columns and "epoch" in normalized_extra_columns:
+            normalized_extra_columns.pop("epoch")
+
+        epoch_by_pid = defaultdict(int)
+
+        control_wait_timeout_ms = 1000
+        trace_drain_timeout_ms = 100
+
+        def _consume_trace_event(mofka_event, sink_events):
+            """Consume a trace event and return its timestamp (us) or None."""
+            trace_event = mofka_event.metadata
+            event_ts = None
+            if isinstance(trace_event, dict):
+                normalized_event = self.normalize_stream_event(
+                    event=trace_event,
+                    extra_columns=normalized_extra_columns,
+                    extra_columns_fn=extra_columns_fn,
+                )
+                event_pid = normalized_event.get(process_key)
+                if event_pid is None:
+                    logger.warning("mofka.trace_event.missing_pid", name=normalized_event.get("name"))
+                else:
+                    event_pid = int(event_pid)
+                    if epoch_by_pid[event_pid] <= 0:
+                        epoch_by_pid[event_pid] = 1
+                    event_with_epoch = dict(normalized_event)
+                    event_with_epoch["epoch"] = epoch_by_pid[event_pid]
+                    sink_events.append(event_with_epoch)
+                try:
+                    event_ts = int(trace_event.get("ts", 0))
+                except (TypeError, ValueError):
+                    pass
+
+            if hasattr(mofka_event, "acknowledge"):
+                mofka_event.acknowledge()
+            return event_ts
+
+        try:
+            control_future = control_consumer.pull()
+            trace_future = trace_consumer.pull()
+            while not _shutdown_requested:
+                # Block on control topic and only drain trace topic once a control
+                # boundary arrives; this keeps consumer-side epoch buffering disabled.
+                control_mofka_event = control_future.wait(timeout_ms=control_wait_timeout_ms)
+                if control_mofka_event is None:
+                    continue
+
+                control_future = control_consumer.pull()
+                control_event = control_mofka_event.metadata
+                if not isinstance(control_event, dict) or control_event.get("type") != "boundary_event":
+                    if hasattr(control_mofka_event, "acknowledge"):
+                        control_mofka_event.acknowledge()
+                    continue
+
+                try:
+                    pid = int(control_event["pid"])
+                    events_written = int(control_event["events_written"])
+                    trigger_name = str(control_event.get("trigger_event_name", ""))
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("mofka.control_boundary.invalid", metadata=control_event)
+                    if hasattr(control_mofka_event, "acknowledge"):
+                        control_mofka_event.acknowledge()
+                    continue
+
+                if hasattr(control_mofka_event, "acknowledge"):
+                    control_mofka_event.acknowledge()
+
+                if trigger_name == epoch_start_name:
+                    # epoch.start may arrive as metadata events that don't
+                    # produce control boundaries.  Log if we do see one, but
+                    # don't rely on it for epoch numbering.
+                    epoch_by_pid[pid] += 1
+                    logger.info(
+                        "mofka.epoch.start",
+                        pid=pid,
+                        epoch=epoch_by_pid[pid],
+                        boundary_seq=events_written,
+                    )
+                    continue
+                elif trigger_name == epoch_end_name:
+                    # Advance epoch on epoch.block — this is the reliable
+                    # control event because epoch.start is often a metadata
+                    # event that doesn't trigger a control boundary.
+                    epoch_by_pid[pid] += 1
+                    epoch_number = epoch_by_pid[pid]
+                else:
+                    logger.debug(
+                        "mofka.control_boundary.ignored",
+                        pid=pid,
+                        trigger=trigger_name,
+                        events_written=events_written,
+                    )
+                    continue
+
+                # Collect epoch.block from all ranks before analyzing.
+                # We expect exactly num_ranks epoch.block events per epoch.
+                epoch_boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
+                epoch_blocks_received = 1
+
+                while epoch_blocks_received < num_ranks and not _shutdown_requested:
+                    next_control = control_future.wait(timeout_ms=control_wait_timeout_ms)
+                    if next_control is None:
+                        continue
+                    control_future = control_consumer.pull()
+                    next_evt = next_control.metadata
+                    if hasattr(next_control, "acknowledge"):
+                        next_control.acknowledge()
+                    if not isinstance(next_evt, dict) or next_evt.get("type") != "boundary_event":
+                        continue
+                    next_trigger = str(next_evt.get("trigger_event_name", ""))
+                    next_pid = int(next_evt.get("pid", 0))
+                    if next_trigger == epoch_start_name:
+                        epoch_by_pid[next_pid] += 1
+                        continue
+                    if next_trigger != epoch_end_name:
+                        continue
+                    epoch_by_pid[next_pid] += 1
+                    next_ts = int(next_evt.get("ts_unix_ns", 0))
+                    if next_ts > epoch_boundary_ts_ns:
+                        epoch_boundary_ts_ns = next_ts
+                    epoch_blocks_received += 1
+
+                logger.info(
+                    "mofka.epoch.block",
+                    epoch=epoch_number,
+                    ranks_received=epoch_blocks_received,
+                    num_ranks=num_ranks,
+                    boundary_ts_ns=epoch_boundary_ts_ns,
+                )
+
+                # Drain trace events up to this epoch boundary's timestamp.
+                boundary_ts_us = epoch_boundary_ts_ns // 1000 if epoch_boundary_ts_ns else 0
+                pulled_events = []
+
+                while True:
+                    trace_mofka_event = trace_future.wait(timeout_ms=trace_drain_timeout_ms)
+                    if trace_mofka_event is None:
+                        break
+                    event_ts = _consume_trace_event(trace_mofka_event, pulled_events)
+                    trace_future = trace_consumer.pull()
+                    # Stop draining once we've passed the epoch boundary.
+                    if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                        break
+
+                if pulled_events:
+                    # Log event category breakdown for debugging
+                    from collections import Counter
+                    cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
+                    name_sample = Counter(e.get("name", "?") for e in pulled_events)
+                    logger.info(
+                        "mofka.epoch.drain_summary",
+                        epoch=epoch_number,
+                        event_count=len(pulled_events),
+                        cat_counts=dict(cat_counts),
+                        top_names=dict(name_sample.most_common(10)),
+                    )
+
+                    traces = self.handle_stream_events(
+                        events=pulled_events,
+                        view_types=proc_view_types,
+                        extra_columns=extra_columns,
+                    )
+                    result = self._analyze_trace(
+                        traces=traces,
+                        proc_view_types=proc_view_types,
+                        logical_view_types=logical_view_types,
+                        raw_stats={},
+                        metric_boundaries=metric_boundaries,
+                    )
+                    logger.info(
+                        "mofka.epoch.analysis_complete",
+                        epoch=epoch_number,
+                        event_count=len(pulled_events),
+                        num_ranks=num_ranks,
+                        flat_views=len(result.flat_views),
+                        analysis_facts=len(result.analysis_facts),
+                    )
+                    output_handler(result)
+
+        finally:
+            logger.info("mofka.control_stream.stop", reason="sigterm")
+            del control_consumer
+            del control_driver
+            del trace_consumer
+            del trace_driver
+
     def analyze_mofka(
         self,
         group_file: str,
@@ -383,36 +632,47 @@ class Analyzer(abc.ABC):
         epoch_start_name: str = "epoch.start",
         epoch_end_name: str = "epoch.block",
         process_key: str = "pid",
-        stop_name: str = "end",
+        control_topic_name: Optional[str] = None,
+        trace_consumer_name: Optional[str] = None,
+        control_consumer_name: Optional[str] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        num_ranks: int = 1,
     ) -> None:
-        from .streaming.mofka_io import open_consumer
+        resolved_control_topic = (
+            control_topic_name
+            if control_topic_name is not None
+            else os.getenv("DFTRACER_MOFKA_CONTROL_TOPIC_NAME", "")
+        )
+        if not resolved_control_topic:
+            # Keep analyzer aligned with dftracer writer defaults when env is unset.
+            resolved_control_topic = "control_events"
 
-        driver, consumer = open_consumer(group_file, topic_name)
-        logger.debug("Mofka consumer started", topic=topic_name)
-        try:
-            self._analyze_stream(
-                pull_event=lambda: (
-                    None if (mofka_event := consumer.pull().wait(timeout_ms=-1)) is None else mofka_event.metadata
-                ),
-                view_types=view_types,
-                exclude_characteristics=exclude_characteristics,
-                logical_view_types=logical_view_types,
-                metric_boundaries=metric_boundaries,
-                epoch_start_name=epoch_start_name,
-                epoch_end_name=epoch_end_name,
-                process_key=process_key,
-                stop_name=stop_name,
-                extra_columns=extra_columns,
-                extra_columns_fn=extra_columns_fn,
-                output_handler=output_handler,
-                stream_name="mofka",
-            )
-        finally:
-            del consumer
-            del driver
+        logger.debug(
+            "Mofka analyzer control mode",
+            trace_topic=topic_name,
+            control_topic=resolved_control_topic,
+            num_ranks=num_ranks,
+        )
+        self._analyze_mofka_with_control(
+            group_file=group_file,
+            topic_name=topic_name,
+            control_topic_name=resolved_control_topic,
+            view_types=view_types,
+            exclude_characteristics=exclude_characteristics,
+            logical_view_types=logical_view_types,
+            metric_boundaries=metric_boundaries,
+            epoch_start_name=epoch_start_name,
+            epoch_end_name=epoch_end_name,
+            process_key=process_key,
+            trace_consumer_name=trace_consumer_name,
+            control_consumer_name=control_consumer_name,
+            extra_columns=extra_columns,
+            extra_columns_fn=extra_columns_fn,
+            output_handler=output_handler,
+            num_ranks=num_ranks,
+        )
 
     def read_stats(self, traces: dd.DataFrame) -> RawStats:
         """Computes and restores raw statistics from the trace data.

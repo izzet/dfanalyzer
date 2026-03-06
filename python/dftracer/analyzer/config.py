@@ -321,6 +321,7 @@ class MofkaInputConfig(InputConfig):
     _target_: str = "dftracer.analyzer.input.MofkaInput"
     group_file: str = MISSING
     topic_name: str = MISSING
+    control_topic_name: Optional[str] = None
 
 
 @dc.dataclass

@@ -87,9 +87,11 @@ class DFAnalyzerInstance:
     def analyze_mofka(
         self,
         view_types: Optional[List[ViewType]] = None,
+        control_topic_name: Optional[str] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        num_ranks: int = 1,
     ):
         """Analyze the Mofka trace using the configured analyzer."""
         if not isinstance(self.input, MofkaInput):
@@ -103,7 +105,13 @@ class DFAnalyzerInstance:
             metric_boundaries=OmegaConf.to_object(self.hydra_config.metric_boundaries),
             output_handler=output_handler,
             topic_name=self.input.topic_name,
+            control_topic_name=(
+                control_topic_name
+                if control_topic_name is not None
+                else getattr(self.input, "control_topic_name", None)
+            ),
             view_types=self.hydra_config.view_types if not view_types else view_types,
+            num_ranks=num_ranks,
         )
 
     def shutdown(self):
