@@ -1,6 +1,9 @@
 import pandas as pd
+import pytest
 
 from dftracer.analyzer.utils.pandas_utils import to_nullable_numeric
+
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 def test_to_nullable_numeric_preserves_integer_nullability() -> None:

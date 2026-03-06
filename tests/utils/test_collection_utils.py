@@ -1,7 +1,10 @@
 import pandas as pd
+import pytest
 from betterset import BetterSet as S
 
 from dftracer.analyzer.utils.collection_utils import is_set_like_series
+
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 def test_is_set_like_series_detects_betterset_values() -> None:

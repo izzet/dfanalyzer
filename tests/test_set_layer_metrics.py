@@ -1,9 +1,12 @@
 import numpy as np
 import pandas as pd
+import pytest
 from betterset import BetterSet as S
 
 from dftracer.analyzer.analyzer import Analyzer
 from dftracer.analyzer.utils.dask_agg import unique_set_flatten
+
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 DERIVED_METRICS = {
