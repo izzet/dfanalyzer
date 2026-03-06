@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
+from betterset import BetterSet as S
 
 from dftracer.analyzer.analyzer import Analyzer
+from dftracer.analyzer.utils.dask_agg import unique_set_flatten
 
 
 DERIVED_METRICS = {
@@ -51,6 +53,7 @@ def test_set_layer_metrics_correctness() -> None:
         equal_nan=True,
     )
     assert out.loc[~read_mask, "read_count"].isna().all()
+    assert str(out["read_count"].dtype) == "Int64"
 
     assert np.allclose(
         out.loc[write_mask, "write_time"].astype(float),
@@ -58,12 +61,43 @@ def test_set_layer_metrics_correctness() -> None:
         equal_nan=True,
     )
     assert out.loc[~write_mask, "write_time"].isna().all()
+    assert str(out["write_time"].dtype) == "Float64"
 
     # String-derived columns carry original values for matching rows and missing values otherwise.
     # Downstream unique_set_flatten skips missing values.
     assert (out.loc[read_mask, "read_func_name"] == hlm.loc[read_mask, "func_name"]).all()
     assert out.loc[~read_mask, "read_func_name"].isna().all()
     assert (out.loc[metadata_mask, "metadata_func_name"] == hlm.loc[metadata_mask, "func_name"]).all()
+
+
+def test_set_layer_metrics_preserves_betterset_columns() -> None:
+    hlm = pd.DataFrame(
+        {
+            "group": ["g0", "g0", "g1", "g1"],
+            "io_cat": pd.Series([1, 2, 1, 3], dtype="Int64"),
+            "count": pd.Series([1, 2, 3, 4], dtype="Int64"),
+            "file_name": pd.Series(
+                [S(["a"]), S(["b"]), S(["c"]), S(["d"])],
+                dtype="object",
+            ),
+        }
+    )
+    out = Analyzer.set_layer_metrics(
+        hlm=hlm,
+        derived_metrics=DERIVED_METRICS,
+        size_derived_metrics=SIZE_DERIVED_METRICS,
+    )
+
+    read_mask = hlm["io_cat"] == 1
+    for idx in hlm.index[read_mask]:
+        assert out.at[idx, "read_file_name"] == hlm.at[idx, "file_name"]
+    assert out.loc[~read_mask, "read_file_name"].isna().all()
+
+    flatten_agg = unique_set_flatten()
+    chunked = flatten_agg.chunk(out.groupby("group")["read_file_name"])
+    aggregated = flatten_agg.agg(chunked.groupby(level=0))
+    assert set(aggregated.loc["g0"]) == {"a"}
+    assert set(aggregated.loc["g1"]) == {"c"}
 
 
 def test_set_layer_metrics_perf_smoke() -> None:
