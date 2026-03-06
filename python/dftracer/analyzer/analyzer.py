@@ -700,19 +700,33 @@ class Analyzer(abc.ABC):
         hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
         size_derived_metric_set = set(size_derived_metrics or [])
+        is_size_col = {col: (col == "size" or "size_bin" in col) for col in hlm_columns}
+        is_string_col = {col: pd.api.types.is_string_dtype(hlm.dtypes[col]) for col in hlm_columns}
+
+        # Precompute numeric representations once per source column.
+        numeric_cols = {
+            col: pd.to_numeric(hlm[col], errors="coerce")
+            for col in hlm_columns
+            if is_size_col[col] or not is_string_col[col]
+        }
+
+        # Build derived columns in-memory and append once to avoid repeated fragmentation.
+        derived_cols: Dict[str, pd.Series] = {}
         for metric, condition in derived_metrics.items():
+            metric_mask = hlm.eval(condition)
             is_size_metric = metric in size_derived_metric_set
             for col in hlm_columns:
-                is_size_col = col == "size" or "size_bin" in col
-                if not is_size_metric and is_size_col:
+                if not is_size_metric and is_size_col[col]:
                     continue
                 metric_col = f"{metric}_{col}"
-                hlm[metric_col] = pd.NA
-                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_size_col:
-                    hlm[metric_col] = hlm[metric_col].map(lambda x: S())
-                hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
-                if not pd.api.types.is_string_dtype(hlm.dtypes[col]):
-                    hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
+                if is_string_col[col] and not is_size_col[col]:
+                    # Use None for non-matching rows; unique_set_flatten skips None downstream.
+                    derived_cols[metric_col] = hlm[col].where(metric_mask, None)
+                else:
+                    derived_cols[metric_col] = numeric_cols[col].mask(~metric_mask, pd.NA)
+
+        if derived_cols:
+            hlm = pd.concat([hlm, pd.DataFrame(derived_cols, index=hlm.index)], axis=1)
         return hlm
 
     @staticmethod
