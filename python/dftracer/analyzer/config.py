@@ -13,6 +13,7 @@ from .utils.env_utils import get_bool_env_var, get_int_env_var
 
 CHECKPOINT_VIEWS = get_bool_env_var("DFANALYZER_CHECKPOINT_VIEWS", False)
 CLUSTER_RESTART_TIMEOUT_SECONDS = get_int_env_var("DFANALYZER_CLUSTER_RESTART_TIMEOUT_SECONDS", 120)
+DEFAULT_HLM_FIELDS = ["cat", "io_cat", "acc_pat", "func_name"]
 DERIVED_POSIX_METRICS = {
     'data': 'io_cat == 1 or io_cat == 2',
     'read': 'io_cat == 1',
@@ -30,16 +31,33 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 
 
 @dc.dataclass
+class AdditionalFieldConfig:
+    source: str = MISSING
+    dtype: str = MISSING
+    agg: str = "sum"
+
+
+@dc.dataclass
+class TimeCorrelationConfig:
+    enabled: bool = False
+    field: str = ""
+    layer: Optional[str] = None
+
+
+@dc.dataclass
 class AnalyzerPresetConfig:
+    additional_fields: Optional[Dict[str, AdditionalFieldConfig]] = dc.field(default_factory=dict)
     additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
+    hlm_fields: List[str] = dc.field(default_factory=lambda: list(DEFAULT_HLM_FIELDS))
     layer_defs: Dict[str, Optional[str]] = MISSING
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=dict)
     size_layers: Optional[List[str]] = dc.field(default_factory=list)
+    time_correlation: Optional[TimeCorrelationConfig] = dc.field(default_factory=TimeCorrelationConfig)
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
 
@@ -228,7 +246,145 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
 
 
 @dc.dataclass
+class AnalyzerPresetConfigAgentic(AnalyzerPresetConfig):
+    additional_fields: Optional[Dict[str, AdditionalFieldConfig]] = dc.field(
+        default_factory=lambda: {
+            'agent_id': AdditionalFieldConfig(source='args.agent_id', dtype='string', agg='unique_set'),
+            'completion_tokens': AdditionalFieldConfig(source='args.completion_tokens', dtype='Int64', agg='sum'),
+            'format': AdditionalFieldConfig(source='args.format', dtype='string', agg='unique_set'),
+            'llm_call_id': AdditionalFieldConfig(source='args.llm_call_id', dtype='string', agg='unique_set'),
+            'operation_kind': AdditionalFieldConfig(source='args.operation_kind', dtype='string', agg='unique_set'),
+            'prompt_tokens': AdditionalFieldConfig(source='args.prompt_tokens', dtype='Int64', agg='sum'),
+            'step': AdditionalFieldConfig(source='args.step', dtype='Int64', agg='unique_set'),
+            'tool_call_id': AdditionalFieldConfig(source='args.tool_call_id', dtype='string', agg='unique_set'),
+            'tool_name': AdditionalFieldConfig(source='args.tool_name', dtype='string', agg='unique_set'),
+            'total_tokens': AdditionalFieldConfig(source='args.total_tokens', dtype='Int64', agg='sum'),
+            'workflow_id': AdditionalFieldConfig(source='args.workflow_id', dtype='string', agg='unique_set'),
+        }
+    )
+    hlm_fields: List[str] = dc.field(default_factory=lambda: ["cat", "io_cat", "acc_pat", "func_name", "step"])
+    additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {
+            'proc_name': {
+                # Token-normalized I/O
+                'bytes_read_per_output_token': 'posix_read_size_sum / (llm_completion_tokens_sum + {epsilon})',
+                'bytes_written_per_output_token': 'posix_write_size_sum / (llm_completion_tokens_sum + {epsilon})',
+                'metadata_ops_per_output_token': 'posix_metadata_count_sum / (llm_completion_tokens_sum + {epsilon})',
+                'io_ops_per_output_token': 'posix_count_sum / (llm_completion_tokens_sum + {epsilon})',
+                'io_time_per_output_token': 'posix_{time_metric} / (llm_completion_tokens_sum + {epsilon})',
+                # I/O pattern metrics
+                'bytes_per_io_op': 'posix_data_size_sum / (posix_data_count_sum + {epsilon})',
+                'metadata_op_frac': 'posix_metadata_count_sum / (posix_count_sum + {epsilon})',
+                'read_write_ratio': 'posix_read_size_sum / (posix_write_size_sum + {epsilon})',
+            },
+            'time_range': {
+                # Token-normalized I/O
+                'bytes_read_per_output_token': 'posix_read_size_sum / (llm_completion_tokens_sum + {epsilon})',
+                'bytes_written_per_output_token': 'posix_write_size_sum / (llm_completion_tokens_sum + {epsilon})',
+                'metadata_ops_per_output_token': 'posix_metadata_count_sum / (llm_completion_tokens_sum + {epsilon})',
+                'io_ops_per_output_token': 'posix_count_sum / (llm_completion_tokens_sum + {epsilon})',
+                'io_time_per_output_token': 'posix_{time_metric} / (llm_completion_tokens_sum + {epsilon})',
+                # I/O pattern metrics
+                'bytes_per_io_op': 'posix_data_size_sum / (posix_data_count_sum + {epsilon})',
+                'metadata_op_frac': 'posix_metadata_count_sum / (posix_count_sum + {epsilon})',
+                'read_write_ratio': 'posix_read_size_sum / (posix_write_size_sum + {epsilon})',
+            },
+        }
+    )
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {
+            'workflow': {
+                'run': 'func_name == "run"',
+                'resume': 'func_name == "resume"',
+            },
+            'step': {
+                'plan': 'func_name == "plan"',
+                'act': 'func_name == "act"',
+                'observe': 'func_name == "observe"',
+                'reflect': 'func_name == "reflect"',
+            },
+            'llm': {
+                'call': 'func_name == "call"',
+                'stream': 'func_name == "stream"',
+                'parse': 'func_name == "parse"',
+            },
+            'tool': {
+                'call': 'func_name == "call"',
+                'result': 'func_name == "result"',
+            },
+            'data': {
+                'load': 'func_name == "load"',
+                'save': 'func_name == "save"',
+            },
+            'message': {
+                'send': 'func_name == "send"',
+                'receive': 'func_name == "receive"',
+                'stream': 'func_name == "stream"',
+            },
+            'judge': {
+                'evaluate': 'func_name == "evaluate"',
+                'retry': 'func_name == "retry"',
+            },
+            'posix': DERIVED_POSIX_METRICS,
+        }
+    )
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'workflow': 'cat == "workflow"',
+            'step': 'cat == "step"',
+            'llm': 'cat == "llm"',
+            'tool': 'cat == "tool"',
+            'data': 'cat == "data"',
+            'message': 'cat == "message"',
+            'judge': 'cat == "judge"',
+            'posix': 'cat.str.contains("posix|stdio")',
+        }
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'workflow': None,
+            'step': 'workflow',
+            'llm': 'step',
+            'tool': 'step',
+            'data': 'tool',
+            'message': 'step',
+            'judge': 'step',
+            'posix': None,
+        }
+    )
+    logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
+        default_factory=lambda: {
+            'file_name': {
+                'file_dir': None,
+                'file_pattern': None,
+            },
+            'proc_name': {
+                'host_name': 'proc_name.str.split("#").str[1]',
+                'proc_id': 'proc_name.str.split("#").str[2]',
+                'thread_id': 'proc_name.str.split("#").str[3]',
+            },
+        }
+    )
+    name: str = "agentic"
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=lambda: {
+            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+        }
+    )
+    size_layers: Optional[List[str]] = dc.field(default_factory=lambda: ['posix'])
+    time_correlation: Optional[TimeCorrelationConfig] = dc.field(
+        default_factory=lambda: TimeCorrelationConfig(
+            enabled=True,
+            field="step",
+            layer="step",
+        )
+    )
+    unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
+
+
+@dc.dataclass
 class AnalyzerConfig:
+    additional_fields: Optional[Dict[str, AdditionalFieldConfig]] = dc.field(default_factory=dict)
     checkpoint: Optional[bool] = True
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
     preset: Optional[AnalyzerPresetConfig] = MISSING
@@ -417,6 +573,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
+    cs.store(group="analyzer/preset", name="agentic", node=AnalyzerPresetConfigAgentic)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
