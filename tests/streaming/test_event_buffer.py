@@ -1,12 +1,12 @@
 import pytest
 
-from dftracer.analyzer.streaming.epoch_buffer import EpochBuffer
+from dftracer.analyzer.streaming.window_buffer import WindowBoundaryTracker, WindowBuffer
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
-def _push_all(buffer: EpochBuffer, events):
+def _push_all(buffer: WindowBuffer, events):
     emitted = []
     for event in events:
         out = buffer.push(event)
@@ -16,7 +16,7 @@ def _push_all(buffer: EpochBuffer, events):
 
 
 def test_epoch_buffer_buffers_until_epoch_block():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     emitted = _push_all(
         buffer,
         [
@@ -35,7 +35,7 @@ def test_epoch_buffer_buffers_until_epoch_block():
 
 
 def test_epoch_buffer_multiple_epochs():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     emitted = _push_all(
         buffer,
         [
@@ -55,7 +55,7 @@ def test_epoch_buffer_multiple_epochs():
 
 
 def test_epoch_buffer_pid_waits_for_all_pids():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
 
     assert buffer.push({"name": "epoch.start", "pid": 10}) is None
     assert buffer.push({"name": "epoch.start", "pid": 20}) is None
@@ -69,7 +69,7 @@ def test_epoch_buffer_pid_waits_for_all_pids():
 
 
 def test_epoch_buffer_missing_pid_raises():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     buffer.push({"name": "epoch.start", "pid": 1})
     buffer.push({"name": "data", "value": 1, "pid": 1})
 
@@ -77,19 +77,19 @@ def test_epoch_buffer_missing_pid_raises():
         buffer.push({"name": "epoch.block"})
 
 def test_pid_end_without_prior_seen_raises():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     with pytest.raises(ValueError):
         buffer.push({"name": "epoch.block", "pid": 99})
 
 
 def test_data_without_pid_raises():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     with pytest.raises(ValueError):
         buffer.push({"name": "data", "value": 123})
 
 
 def test_overlapping_epochs_fast_process_starts_next_before_slow_finishes():
-    buffer = EpochBuffer()
+    buffer = WindowBuffer()
     emitted = _push_all(
         buffer,
         [
@@ -111,7 +111,7 @@ def test_overlapping_epochs_fast_process_starts_next_before_slow_finishes():
 
 
 def test_epoch_buffer_custom_names():
-    buffer = EpochBuffer(epoch_start_name="start", epoch_end_name="done", process_key="rank")
+    buffer = WindowBuffer(epoch_start_name="start", epoch_end_name="done", process_key="rank")
     emitted = _push_all(
         buffer,
         [
@@ -122,3 +122,52 @@ def test_epoch_buffer_custom_names():
     )
     assert len(emitted) == 1
     assert all(item.get("epoch") == 1 for item in emitted[0])
+    assert all(item.get("window") == 1 for item in emitted[0])
+
+
+def test_window_boundary_tracker_queues_future_boundaries_from_fast_rank():
+    tracker = WindowBoundaryTracker(num_ranks=2)
+
+    assert tracker.observe_start_boundary(pid=1) == 1
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=100) == []
+    assert tracker.observe_start_boundary(pid=1) == 2
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=200) == []
+
+    assert tracker.observe_start_boundary(pid=2) == 1
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=150)
+    assert len(completed) == 1
+    assert completed[0].window_index == 1
+    assert completed[0].ranks_received == 2
+    assert completed[0].boundary_ts_ns == 150
+
+    assert tracker.observe_start_boundary(pid=2) == 2
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=250)
+    assert len(completed) == 1
+    assert completed[0].window_index == 2
+    assert completed[0].ranks_received == 2
+    assert completed[0].boundary_ts_ns == 250
+
+
+def test_window_boundary_tracker_exposes_current_and_next_window_labels():
+    tracker = WindowBoundaryTracker(num_ranks=2)
+
+    assert tracker.current_window(7) == 1
+    assert tracker.next_window(7) == 1
+
+    assert tracker.observe_start_boundary(pid=7) == 1
+    assert tracker.observe_end_boundary(pid=7, boundary_ts_ns=10) == []
+    assert tracker.current_window(7) == 1
+    assert tracker.next_window(7) == 2
+
+
+def test_window_boundary_tracker_uses_start_markers_for_active_window_assignment():
+    tracker = WindowBoundaryTracker(num_ranks=1)
+
+    assert tracker.current_window(3) == 1
+    assert tracker.observe_start_boundary(pid=3) == 1
+    assert tracker.current_window(3) == 1
+    assert tracker.observe_end_boundary(pid=3, boundary_ts_ns=10)[0].window_index == 1
+
+    assert tracker.observe_start_boundary(pid=3) == 2
+    assert tracker.current_window(3) == 2
+    assert tracker.observe_end_boundary(pid=3, boundary_ts_ns=20)[0].window_index == 2

@@ -18,6 +18,7 @@ class FactRule:
     priority: int
     source_view: str
     fact_type: str
+    scope_layer: Optional[str]
     required_metrics: List[str]
     derived_metrics: Dict[str, str]
     when: str
@@ -64,6 +65,7 @@ def build_fact_rule(
 
     rule_id = raw_rule["id"]
     source_view = raw_rule.get("source_view", defaults.get("source_view", "epoch"))
+    scope_layer = raw_rule.get("scope_layer")
     required_metrics = list(raw_rule.get("required_metrics", []))
     derived_metrics = dict(raw_rule.get("derived_metrics", {}))
     when = raw_rule.get("when", "False")
@@ -99,6 +101,7 @@ def build_fact_rule(
         priority=int(raw_rule.get("priority", 0)),
         source_view=str(source_view),
         fact_type=str(raw_rule["fact_type"]),
+        scope_layer=str(scope_layer) if scope_layer is not None else None,
         required_metrics=required_metrics,
         derived_metrics=derived_metrics,
         when=str(when),

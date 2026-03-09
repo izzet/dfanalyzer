@@ -172,3 +172,47 @@ def test_fact_engine_sets_time_range_and_step_window_metadata():
     assert step_fact.window.step == 4
     assert step_fact.window.t0_ns is None
     assert step_fact.window.t1_ns is None
+
+
+def test_fact_engine_emits_layer_scoped_facts_with_fillna0_support():
+    rule = build_fact_rule(
+        raw_rule={
+            "id": "rule.reader.operation.imbalance",
+            "priority": 10,
+            "source_view": "epoch",
+            "fact_type": "operation_imbalance",
+            "scope_layer": "reader_posix",
+            "required_metrics": [
+                "reader_posix_read_count_sum",
+                "reader_posix_write_count_sum",
+            ],
+            "derived_metrics": {
+                "reader_posix_operation_imbalance_ratio": (
+                    "abs(fillna0(reader_posix_read_count_sum) - fillna0(reader_posix_write_count_sum)) "
+                    "/ max(min(fillna0(reader_posix_read_count_sum), fillna0(reader_posix_write_count_sum)), 1e-9)"
+                ),
+            },
+            "when": "reader_posix_operation_imbalance_ratio > 0.10",
+            "severity_score": "clip01((reader_posix_operation_imbalance_ratio - 0.10) / 0.90)",
+            "confidence": "0.8",
+            "opportunity_tags": ["read_write_rebalancing"],
+        }
+    )
+    engine = FactEngine([rule])
+    flat_views = {
+        ("epoch",): pd.DataFrame(
+            {
+                "reader_posix_read_count_sum": pd.array([10.0], dtype="Float64"),
+                "reader_posix_write_count_sum": pd.array([pd.NA], dtype="Float64"),
+            },
+            index=[3],
+        )
+    }
+
+    facts = engine.evaluate(flat_views=flat_views, raw_stats={"run_id": "run-123"})
+
+    epoch_facts = facts[("epoch",)]
+    assert len(epoch_facts) == 1
+    assert epoch_facts[0].scope.layer == "reader_posix"
+    assert epoch_facts[0].window.epoch == 3
+    assert epoch_facts[0].evidence["metrics"]["reader_posix_operation_imbalance_ratio"] > 1e6

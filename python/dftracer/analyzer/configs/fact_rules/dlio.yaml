@@ -33,6 +33,166 @@ rules:
     opportunity_tags:
       - none
 
+  - id: dlio.reader_posix.small_read_dominance.v1
+    priority: 89
+    source_view: epoch
+    fact_type: small_read_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_time_frac_parent
+      - reader_posix_read_size_mean
+    when: "reader_posix_read_time_frac_parent > 0.50 and reader_posix_read_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_read_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.reader_posix.small_write_dominance.v1
+    priority: 88
+    source_view: epoch
+    fact_type: small_write_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_write_time_frac_parent
+      - reader_posix_write_size_mean
+    when: "reader_posix_write_time_frac_parent > 0.50 and reader_posix_write_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_write_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_write_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_write_time_frac_parent + 0.10 * ((1048576 - reader_posix_write_size_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.reader_posix.excessive_metadata_access.v1
+    priority: 87
+    source_view: epoch
+    fact_type: excessive_metadata_access
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_frac_parent
+      - reader_posix_open_time_frac_parent
+      - reader_posix_close_time_frac_parent
+      - reader_posix_seek_time_frac_parent
+      - reader_posix_stat_time_frac_parent
+    when: "reader_posix_metadata_time_frac_parent > 0.50"
+    severity_score: "clip01((reader_posix_metadata_time_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  - id: dlio.reader_posix.operation_imbalance.v1
+    priority: 86
+    source_view: epoch
+    fact_type: operation_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_count_sum
+      - reader_posix_write_count_sum
+    derived_metrics:
+      reader_posix_total_count_sum: "fillna0(reader_posix_read_count_sum) + fillna0(reader_posix_write_count_sum)"
+      reader_posix_operation_imbalance_ratio: "abs(fillna0(reader_posix_read_count_sum) - fillna0(reader_posix_write_count_sum)) / max(min(fillna0(reader_posix_read_count_sum), fillna0(reader_posix_write_count_sum)), 1e-9)"
+    when: "reader_posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: dlio.reader_posix.size_imbalance.v1
+    priority: 85
+    source_view: epoch
+    fact_type: size_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_size_sum
+      - reader_posix_write_size_sum
+    derived_metrics:
+      reader_posix_total_size_sum: "fillna0(reader_posix_read_size_sum) + fillna0(reader_posix_write_size_sum)"
+      reader_posix_size_imbalance_ratio: "abs(fillna0(reader_posix_read_size_sum) - fillna0(reader_posix_write_size_sum)) / max(min(fillna0(reader_posix_read_size_sum), fillna0(reader_posix_write_size_sum)), 1e-9)"
+    when: "reader_posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: dlio.checkpoint_posix.small_read_dominance.v1
+    priority: 84
+    source_view: epoch
+    fact_type: small_read_dominance
+    scope_layer: checkpoint_posix
+    required_metrics:
+      - checkpoint_posix_read_time_frac_parent
+      - checkpoint_posix_read_size_mean
+    when: "checkpoint_posix_read_time_frac_parent > 0.50 and checkpoint_posix_read_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((checkpoint_posix_read_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_read_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_read_time_frac_parent + 0.10 * ((1048576 - checkpoint_posix_read_size_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.checkpoint_posix.small_write_dominance.v1
+    priority: 83
+    source_view: epoch
+    fact_type: small_write_dominance
+    scope_layer: checkpoint_posix
+    required_metrics:
+      - checkpoint_posix_write_time_frac_parent
+      - checkpoint_posix_write_size_mean
+    when: "checkpoint_posix_write_time_frac_parent > 0.50 and checkpoint_posix_write_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((checkpoint_posix_write_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_write_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_write_time_frac_parent + 0.10 * ((1048576 - checkpoint_posix_write_size_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.checkpoint_posix.excessive_metadata_access.v1
+    priority: 82
+    source_view: epoch
+    fact_type: excessive_metadata_access
+    scope_layer: checkpoint_posix
+    required_metrics:
+      - checkpoint_posix_metadata_time_frac_parent
+      - checkpoint_posix_open_time_frac_parent
+      - checkpoint_posix_close_time_frac_parent
+      - checkpoint_posix_seek_time_frac_parent
+      - checkpoint_posix_stat_time_frac_parent
+    when: "checkpoint_posix_metadata_time_frac_parent > 0.50"
+    severity_score: "clip01((checkpoint_posix_metadata_time_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * checkpoint_posix_metadata_time_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  - id: dlio.checkpoint_posix.operation_imbalance.v1
+    priority: 81
+    source_view: epoch
+    fact_type: operation_imbalance
+    scope_layer: checkpoint_posix
+    required_metrics:
+      - checkpoint_posix_read_count_sum
+      - checkpoint_posix_write_count_sum
+    derived_metrics:
+      checkpoint_posix_total_count_sum: "fillna0(checkpoint_posix_read_count_sum) + fillna0(checkpoint_posix_write_count_sum)"
+      checkpoint_posix_operation_imbalance_ratio: "abs(fillna0(checkpoint_posix_read_count_sum) - fillna0(checkpoint_posix_write_count_sum)) / max(min(fillna0(checkpoint_posix_read_count_sum), fillna0(checkpoint_posix_write_count_sum)), 1e-9)"
+      checkpoint_posix_mixed_count_activity: "min(fillna0(checkpoint_posix_read_count_sum), fillna0(checkpoint_posix_write_count_sum))"
+    when: "checkpoint_posix_mixed_count_activity > 0 and checkpoint_posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((checkpoint_posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * checkpoint_posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: dlio.checkpoint_posix.size_imbalance.v1
+    priority: 80
+    source_view: epoch
+    fact_type: size_imbalance
+    scope_layer: checkpoint_posix
+    required_metrics:
+      - checkpoint_posix_read_size_sum
+      - checkpoint_posix_write_size_sum
+    derived_metrics:
+      checkpoint_posix_total_size_sum: "fillna0(checkpoint_posix_read_size_sum) + fillna0(checkpoint_posix_write_size_sum)"
+      checkpoint_posix_size_imbalance_ratio: "abs(fillna0(checkpoint_posix_read_size_sum) - fillna0(checkpoint_posix_write_size_sum)) / max(min(fillna0(checkpoint_posix_read_size_sum), fillna0(checkpoint_posix_write_size_sum)), 1e-9)"
+      checkpoint_posix_mixed_size_activity: "min(fillna0(checkpoint_posix_read_size_sum), fillna0(checkpoint_posix_write_size_sum))"
+    when: "checkpoint_posix_mixed_size_activity > 0 and checkpoint_posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((checkpoint_posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * checkpoint_posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
   - id: dlio.epoch_straggler.v1
     priority: 110
     source_view: proc_name

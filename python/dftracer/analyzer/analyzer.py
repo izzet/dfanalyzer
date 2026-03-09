@@ -73,7 +73,7 @@ from .utils.json_encoders import NpEncoder
 from .utils.log_utils import console_block, log_block
 from .utils.pandas_agg import unique_set_flatten_pd, unique_set_pd
 from .utils.pandas_utils import flatten_column_names
-from .streaming.epoch_buffer import EpochBuffer
+from .streaming.window_buffer import WindowBoundaryTracker, WindowBuffer
 
 
 CHECKPOINT_FLAT_VIEW = "_flat_view"
@@ -341,9 +341,11 @@ class Analyzer(abc.ABC):
     ) -> None:
         install_shutdown_handler()
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
-        buffer = EpochBuffer(
-            epoch_start_name=epoch_start_name,
-            epoch_end_name=epoch_end_name,
+        window_start_name = epoch_start_name
+        window_end_name = epoch_end_name
+        buffer = WindowBuffer(
+            window_start_name=window_start_name,
+            window_end_name=window_end_name,
             process_key=process_key,
         )
         output_handler = output_handler or (lambda result: None)
@@ -358,10 +360,12 @@ class Analyzer(abc.ABC):
                 raise ValueError(f"Invalid event type from {stream_name}: {type(event)}")
             logger.debug(f"{stream_name}.raw_event", name=event.get("name"), ph=event.get("ph"))
 
-            # Remove 'epoch' from extra_columns as it is handled by EpochBuffer.
+            # Remove internal window labels from extra_columns as they are handled
+            # by the WindowBuffer.
             normalized_extra_columns = extra_columns.copy() if extra_columns else None
-            if normalized_extra_columns and "epoch" in normalized_extra_columns:
-                normalized_extra_columns.pop("epoch")
+            if normalized_extra_columns:
+                normalized_extra_columns.pop("epoch", None)
+                normalized_extra_columns.pop("window", None)
 
             normalized_event = self.normalize_stream_event(
                 event=event,
@@ -370,14 +374,14 @@ class Analyzer(abc.ABC):
             )
             logger.debug(f"{stream_name}.normalized_event", name=normalized_event.get("name"))
 
-            epoch_events = buffer.push(normalized_event)
-            if epoch_events:
-                logger.debug(f"{stream_name}.epoch_emitted", count=len(epoch_events))
-            if not epoch_events:
+            window_events = buffer.push(normalized_event)
+            if window_events:
+                logger.debug(f"{stream_name}.window_emitted", count=len(window_events))
+            if not window_events:
                 continue
 
             traces = self.handle_stream_events(
-                events=epoch_events,
+                events=window_events,
                 view_types=proc_view_types,
                 extra_columns=extra_columns,
             )
@@ -435,34 +439,29 @@ class Analyzer(abc.ABC):
         output_handler = output_handler or (lambda result: None)
 
         normalized_extra_columns = extra_columns.copy() if extra_columns else None
-        if normalized_extra_columns and "epoch" in normalized_extra_columns:
-            normalized_extra_columns.pop("epoch")
+        if normalized_extra_columns:
+            normalized_extra_columns.pop("epoch", None)
+            normalized_extra_columns.pop("window", None)
 
-        epoch_by_pid = defaultdict(int)
+        window_tracker = WindowBoundaryTracker(num_ranks=num_ranks)
+        window_start_name = epoch_start_name
+        window_end_name = epoch_end_name
 
         control_wait_timeout_ms = 1000
         trace_drain_timeout_ms = 100
+        pending_trace_event: Optional[Tuple[dict, Optional[int]]] = None
 
-        def _consume_trace_event(mofka_event, sink_events):
-            """Consume a trace event and return its timestamp (us) or None."""
+        def _normalize_trace_event(mofka_event) -> Tuple[Optional[dict], Optional[int]]:
+            """Normalize a trace event and return it with its timestamp (us)."""
             trace_event = mofka_event.metadata
             event_ts = None
+            normalized_event = None
             if isinstance(trace_event, dict):
                 normalized_event = self.normalize_stream_event(
                     event=trace_event,
                     extra_columns=normalized_extra_columns,
                     extra_columns_fn=extra_columns_fn,
                 )
-                event_pid = normalized_event.get(process_key)
-                if event_pid is None:
-                    logger.warning("mofka.trace_event.missing_pid", name=normalized_event.get("name"))
-                else:
-                    event_pid = int(event_pid)
-                    if epoch_by_pid[event_pid] <= 0:
-                        epoch_by_pid[event_pid] = 1
-                    event_with_epoch = dict(normalized_event)
-                    event_with_epoch["epoch"] = epoch_by_pid[event_pid]
-                    sink_events.append(event_with_epoch)
                 try:
                     event_ts = int(trace_event.get("ts", 0))
                 except (TypeError, ValueError):
@@ -470,14 +469,30 @@ class Analyzer(abc.ABC):
 
             if hasattr(mofka_event, "acknowledge"):
                 mofka_event.acknowledge()
-            return event_ts
+            return normalized_event, event_ts
+
+        def _append_trace_event_to_window(normalized_event: Optional[dict], sink_events: List[dict]) -> None:
+            if not isinstance(normalized_event, dict):
+                return
+            event_pid = normalized_event.get(process_key)
+            if event_pid is None:
+                logger.warning("mofka.trace_event.missing_pid", name=normalized_event.get("name"))
+                return
+
+            event_pid = int(event_pid)
+            event_with_window = dict(normalized_event)
+            current_window = window_tracker.current_window(event_pid)
+            event_with_window["window"] = current_window
+            # Keep the historical epoch field for downstream schema compatibility.
+            event_with_window["epoch"] = current_window
+            sink_events.append(event_with_window)
 
         try:
             control_future = control_consumer.pull()
             trace_future = trace_consumer.pull()
             while not _shutdown_requested:
                 # Block on control topic and only drain trace topic once a control
-                # boundary arrives; this keeps consumer-side epoch buffering disabled.
+                # boundary arrives; this keeps consumer-side window buffering disabled.
                 control_mofka_event = control_future.wait(timeout_ms=control_wait_timeout_ms)
                 if control_mofka_event is None:
                     continue
@@ -502,25 +517,16 @@ class Analyzer(abc.ABC):
                 if hasattr(control_mofka_event, "acknowledge"):
                     control_mofka_event.acknowledge()
 
-                if trigger_name == epoch_start_name:
-                    # epoch.start may arrive as metadata events that don't
-                    # produce control boundaries.  Log if we do see one, but
-                    # don't rely on it for epoch numbering.
-                    epoch_by_pid[pid] += 1
+                if trigger_name == window_start_name:
+                    started_window = window_tracker.observe_start_boundary(pid)
                     logger.info(
-                        "mofka.epoch.start",
+                        "mofka.window.start",
                         pid=pid,
-                        epoch=epoch_by_pid[pid],
+                        window=started_window,
                         boundary_seq=events_written,
                     )
                     continue
-                elif trigger_name == epoch_end_name:
-                    # Advance epoch on epoch.block — this is the reliable
-                    # control event because epoch.start is often a metadata
-                    # event that doesn't trigger a control boundary.
-                    epoch_by_pid[pid] += 1
-                    epoch_number = epoch_by_pid[pid]
-                else:
+                if trigger_name != window_end_name:
                     logger.debug(
                         "mofka.control_boundary.ignored",
                         pid=pid,
@@ -529,64 +535,62 @@ class Analyzer(abc.ABC):
                     )
                     continue
 
-                # Collect epoch.block from all ranks before analyzing.
-                # We expect exactly num_ranks epoch.block events per epoch.
-                epoch_boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
-                epoch_blocks_received = 1
-
-                while epoch_blocks_received < num_ranks and not _shutdown_requested:
-                    next_control = control_future.wait(timeout_ms=control_wait_timeout_ms)
-                    if next_control is None:
-                        continue
-                    control_future = control_consumer.pull()
-                    next_evt = next_control.metadata
-                    if hasattr(next_control, "acknowledge"):
-                        next_control.acknowledge()
-                    if not isinstance(next_evt, dict) or next_evt.get("type") != "boundary_event":
-                        continue
-                    next_trigger = str(next_evt.get("trigger_event_name", ""))
-                    next_pid = int(next_evt.get("pid", 0))
-                    if next_trigger == epoch_start_name:
-                        epoch_by_pid[next_pid] += 1
-                        continue
-                    if next_trigger != epoch_end_name:
-                        continue
-                    epoch_by_pid[next_pid] += 1
-                    next_ts = int(next_evt.get("ts_unix_ns", 0))
-                    if next_ts > epoch_boundary_ts_ns:
-                        epoch_boundary_ts_ns = next_ts
-                    epoch_blocks_received += 1
-
-                logger.info(
-                    "mofka.epoch.block",
-                    epoch=epoch_number,
-                    ranks_received=epoch_blocks_received,
-                    num_ranks=num_ranks,
-                    boundary_ts_ns=epoch_boundary_ts_ns,
+                boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
+                completed_windows = window_tracker.observe_end_boundary(
+                    pid=pid,
+                    boundary_ts_ns=boundary_ts_ns,
                 )
 
-                # Drain trace events up to this epoch boundary's timestamp.
-                boundary_ts_us = epoch_boundary_ts_ns // 1000 if epoch_boundary_ts_ns else 0
-                pulled_events = []
+                for completed_window in completed_windows:
+                    logger.info(
+                        "mofka.window.block",
+                        window=completed_window.window_index,
+                        ranks_received=completed_window.ranks_received,
+                        num_ranks=num_ranks,
+                        boundary_ts_ns=completed_window.boundary_ts_ns,
+                    )
 
-                while True:
-                    trace_mofka_event = trace_future.wait(timeout_ms=trace_drain_timeout_ms)
-                    if trace_mofka_event is None:
-                        break
-                    event_ts = _consume_trace_event(trace_mofka_event, pulled_events)
-                    trace_future = trace_consumer.pull()
-                    # Stop draining once we've passed the epoch boundary.
-                    if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
-                        break
+                    # Drain trace events up to this window boundary's timestamp.
+                    boundary_ts_us = (
+                        completed_window.boundary_ts_ns // 1000
+                        if completed_window.boundary_ts_ns
+                        else 0
+                    )
+                    pulled_events = []
+                    can_drain_trace_stream = True
 
-                if pulled_events:
+                    if pending_trace_event is not None:
+                        normalized_event, event_ts = pending_trace_event
+                        if not boundary_ts_us or not event_ts or event_ts <= boundary_ts_us:
+                            _append_trace_event_to_window(normalized_event, pulled_events)
+                            pending_trace_event = None
+                        else:
+                            can_drain_trace_stream = False
+
+                    if can_drain_trace_stream:
+                        while True:
+                            trace_mofka_event = trace_future.wait(timeout_ms=trace_drain_timeout_ms)
+                            if trace_mofka_event is None:
+                                break
+                            normalized_event, event_ts = _normalize_trace_event(trace_mofka_event)
+                            trace_future = trace_consumer.pull()
+                            # Stop draining once we've passed the window boundary.
+                            if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                pending_trace_event = (normalized_event, event_ts)
+                                break
+                            _append_trace_event_to_window(normalized_event, pulled_events)
+
+                    if not pulled_events:
+                        continue
+
                     # Log event category breakdown for debugging
                     from collections import Counter
+
                     cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
                     name_sample = Counter(e.get("name", "?") for e in pulled_events)
                     logger.info(
-                        "mofka.epoch.drain_summary",
-                        epoch=epoch_number,
+                        "mofka.window.drain_summary",
+                        window=completed_window.window_index,
                         event_count=len(pulled_events),
                         cat_counts=dict(cat_counts),
                         top_names=dict(name_sample.most_common(10)),
@@ -605,8 +609,8 @@ class Analyzer(abc.ABC):
                         metric_boundaries=metric_boundaries,
                     )
                     logger.info(
-                        "mofka.epoch.analysis_complete",
-                        epoch=epoch_number,
+                        "mofka.window.analysis_complete",
+                        window=completed_window.window_index,
                         event_count=len(pulled_events),
                         num_ranks=num_ranks,
                         flat_views=len(result.flat_views),

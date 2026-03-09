@@ -26,6 +26,7 @@ RESERVED_IDENTIFIERS = {
     "min",
     "abs",
     "clip01",
+    "fillna0",
     "math",
 }
 
@@ -99,6 +100,17 @@ def _clip01(value: Any) -> Any:
         return value
 
 
+def _fillna0(value: Any) -> Any:
+    if isinstance(value, pd.Series):
+        return value.fillna(0.0)
+    if value is None:
+        return 0.0
+    try:
+        return 0.0 if pd.isna(value) else value
+    except Exception:
+        return value
+
+
 def _to_float_series(x):
     """Convert to float64 Series/array, replacing pd.NA with np.nan."""
     if isinstance(x, pd.Series):
@@ -148,6 +160,7 @@ def _eval_python_expr(df: pd.DataFrame, expression: str) -> pd.Series:
             "min": _na_safe_min,
             "abs": abs,
             "clip01": _clip01,
+            "fillna0": _fillna0,
             "math": math,
         }
     )
@@ -380,7 +393,11 @@ class FactEngine:
                         t1_ns=t1_ns,
                         trigger="rule_eval",
                     ),
-                    scope=FactScope(entity="window" if rule.emit_mode == "window" else str(row_index), rank_set="all"),
+                    scope=FactScope(
+                        layer=rule.scope_layer,
+                        entity="window" if rule.emit_mode == "window" else str(row_index),
+                        rank_set="all",
+                    ),
                     evidence={"metrics": evidence_metrics},
                     severity=FactSeverity(score=severity_score, label=_severity_label(severity_score)),
                     confidence=confidence,

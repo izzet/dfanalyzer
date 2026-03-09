@@ -54,3 +54,18 @@ def test_build_fact_rule_rejects_invalid_emit_mode():
 
     with pytest.raises(FactRuleValidationError, match="invalid emit_mode"):
         build_fact_rule(raw_rule=raw_rule)
+
+
+def test_build_fact_rule_preserves_scope_layer():
+    raw_rule = {
+        "id": "layer.scoped.rule",
+        "fact_type": "layer_scoped_fact",
+        "scope_layer": "reader_posix",
+        "required_metrics": ["reader_posix_read_time_frac_parent"],
+        "when": "reader_posix_read_time_frac_parent > 0.5",
+        "severity_score": "0.7",
+    }
+
+    rule = build_fact_rule(raw_rule=raw_rule)
+
+    assert rule.scope_layer == "reader_posix"
