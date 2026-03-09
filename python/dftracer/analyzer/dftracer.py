@@ -261,10 +261,9 @@ def load_objects_dict(
                         )
                 final_dict.update(io_function(json_dict))
                 final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-            # check if all extra columns are present
-            if extra_columns and not all(col in final_dict for col in extra_columns):
-                missing_cols = [col for col in extra_columns if col not in final_dict]
-                raise ValueError(f"Missing extra columns: {missing_cols}")
+            if extra_columns:
+                for col in extra_columns:
+                    final_dict.setdefault(col, None)
             logger.debug("Built a dictionary for dict", final_dict=final_dict)
             yield final_dict
         except ValueError as error:
@@ -419,33 +418,6 @@ class DFTracerAnalyzer(Analyzer):
         with log_block("set_basic_columns"):
             traces[COL_ACC_PAT] = 0
             traces[COL_COUNT] = 1
-
-        # drop columns that are not needed
-        # if COL_FILE_NAME not in view_types:
-        #     traces = traces.drop(columns=[COL_FILE_NAME], errors='ignore')
-        # if COL_HOST_NAME not in view_types:
-        #     traces = traces.drop(columns=[COL_HOST_NAME], errors='ignore')
-
-        # Set batches
-        # traces['batch'] = traces.groupby(['func_name', 'step']).cumcount() + 1
-        # batch_counts = traces['batch'].value_counts()
-        # last_valid_batch = batch_counts[batch_counts > 1].index.max()
-        # traces['batch'] = traces['batch'].mask(
-        #     traces['batch'] > last_valid_batch, pd.NA
-        # )
-
-        # pytorch reads images instead of batches
-        # e.g. 4 workers = 0..4 images = who starts/finishes first
-
-        # epoch and step make sense in dlio layer
-
-        # to put step back, target variable = previous compute + my io
-
-        # Set steps depending on time ranges
-        # step_time_ranges = traces.groupby(['pid', 'epoch', 'step']).agg({'ts': min, 'te': max})
-        # traces = traces.map_partitions(
-        #     self._set_steps, step_time_ranges=step_time_ranges.reset_index()
-        # )
 
         return (
             traces.map_partitions(self._set_proc_names)
