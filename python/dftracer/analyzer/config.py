@@ -335,6 +335,12 @@ class ConsoleOutputConfig(OutputConfig):
 
 
 @dc.dataclass
+class JSONOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.JSONOutput"
+    file_path: Optional[str] = ""
+
+
+@dc.dataclass
 class CSVOutputConfig(OutputConfig):
     _target_: str = "dftracer.analyzer.output.CSVOutput"
 
@@ -423,6 +429,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="cluster", name="pbs", node=PBSClusterConfig)
     cs.store(group="cluster", name="slurm", node=SLURMClusterConfig)
     cs.store(group="output", name="console", node=ConsoleOutputConfig)
+    cs.store(group="output", name="json", node=JSONOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
     return cs

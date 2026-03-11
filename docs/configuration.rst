@@ -223,6 +223,25 @@ Console Output (``output=console``)
 
 Prints the analysis summary directly to the console. This is the **default** output.
 
+JSON Output (``output=json``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Saves a JSON summary report to disk. This output includes raw stats, per-view
+summary metrics, per-layer metrics, and additional metrics statistics.
+
+.. list-table::
+   :widths: 25 15 30 30
+   :header-rows: 1
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``output.file_path``
+     - string
+     - ""
+     - JSON output file path. If empty, writes to ``<hydra.runtime.output_dir>/dfanalyzer_output.json``.
+
 CSV Output (``output=csv``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
