@@ -250,15 +250,19 @@ class AnalyzerPresetConfigAgentic(AnalyzerPresetConfig):
     additional_fields: Optional[Dict[str, AdditionalFieldConfig]] = dc.field(
         default_factory=lambda: {
             'agent_id': AdditionalFieldConfig(source='args.agent_id', dtype='string', agg='unique_set'),
-            'completion_tokens': AdditionalFieldConfig(source='args.completion_tokens', dtype='Int64', agg='sum'),
+            # Sparse agentic numeric fields are absent on most POSIX events.
+            # Using pandas nullable Int64 here makes Dask ingest pathologically slow;
+            # float64 preserves missing values efficiently and downstream metrics
+            # already materialize these aggregates as numeric scalars.
+            'completion_tokens': AdditionalFieldConfig(source='args.completion_tokens', dtype='float64', agg='sum'),
             'format': AdditionalFieldConfig(source='args.format', dtype='string', agg='unique_set'),
             'llm_call_id': AdditionalFieldConfig(source='args.llm_call_id', dtype='string', agg='unique_set'),
             'operation_kind': AdditionalFieldConfig(source='args.operation_kind', dtype='string', agg='unique_set'),
-            'prompt_tokens': AdditionalFieldConfig(source='args.prompt_tokens', dtype='Int64', agg='sum'),
-            'step': AdditionalFieldConfig(source='args.step', dtype='Int64', agg='unique_set'),
+            'prompt_tokens': AdditionalFieldConfig(source='args.prompt_tokens', dtype='float64', agg='sum'),
+            'step': AdditionalFieldConfig(source='args.step', dtype='float64', agg='unique_set'),
             'tool_call_id': AdditionalFieldConfig(source='args.tool_call_id', dtype='string', agg='unique_set'),
             'tool_name': AdditionalFieldConfig(source='args.tool_name', dtype='string', agg='unique_set'),
-            'total_tokens': AdditionalFieldConfig(source='args.total_tokens', dtype='Int64', agg='sum'),
+            'total_tokens': AdditionalFieldConfig(source='args.total_tokens', dtype='float64', agg='sum'),
             'workflow_id': AdditionalFieldConfig(source='args.workflow_id', dtype='string', agg='unique_set'),
         }
     )
