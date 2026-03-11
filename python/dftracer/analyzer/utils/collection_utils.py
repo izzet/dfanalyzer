@@ -1,5 +1,6 @@
 import pandas as pd
 from typing import Iterable, List
+from betterset import BetterSet as S
 
 
 def deepflatten(collection, ignore_types=(bytes, str)):
@@ -42,3 +43,10 @@ def join_with_and(values: List[str]):
         return ' and '.join(values)
     else:
         return ', '.join(values[:-1]) + ', and ' + values[-1]
+
+
+def is_set_like_series(series: pd.Series) -> bool:
+    for value in series.array:
+        if value is not None and value is not pd.NA:
+            return isinstance(value, S)
+    return False

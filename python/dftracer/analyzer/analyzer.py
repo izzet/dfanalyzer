@@ -7,7 +7,6 @@ import math
 import os
 import pandas as pd
 import structlog
-from betterset import BetterSet as S
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
@@ -45,12 +44,14 @@ from .types import (
     ViewType,
     Views,
 )
+from .utils.collection_utils import is_set_like_series
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 from .utils.dask_utils import flatten_column_names
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
 from .utils.log_utils import console_block, log_block
+from .utils.pandas_utils import to_nullable_numeric
 
 
 CHECKPOINT_FLAT_VIEW = "_flat_view"
@@ -700,19 +701,42 @@ class Analyzer(abc.ABC):
         hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
         size_derived_metric_set = set(size_derived_metrics or [])
+        is_size_col = {col: (col == "size" or "size_bin" in col) for col in hlm_columns}
+        col_kinds = {}
+        numeric_cols = {}
+
+        for col in hlm_columns:
+            series = hlm[col]
+            if is_size_col[col] or pd.api.types.is_numeric_dtype(series.dtype):
+                col_kinds[col] = "numeric"
+                numeric_cols[col] = to_nullable_numeric(series)
+            elif pd.api.types.is_string_dtype(series.dtype):
+                col_kinds[col] = "string"
+            elif is_set_like_series(series):
+                col_kinds[col] = "set_like"
+            else:
+                raise TypeError(
+                    f"Unsupported data type '{series.dtype}' for column '{col}'. "
+                    "Developer must add explicit handling for this data type in set_layer_metrics."
+                )
+
+        # Build derived columns in-memory and append once to avoid repeated fragmentation.
+        derived_cols: Dict[str, pd.Series] = {}
         for metric, condition in derived_metrics.items():
+            metric_mask = hlm.eval(condition)
             is_size_metric = metric in size_derived_metric_set
             for col in hlm_columns:
-                is_size_col = col == "size" or "size_bin" in col
-                if not is_size_metric and is_size_col:
+                if not is_size_metric and is_size_col[col]:
                     continue
                 metric_col = f"{metric}_{col}"
-                hlm[metric_col] = pd.NA
-                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_size_col:
-                    hlm[metric_col] = hlm[metric_col].map(lambda x: S())
-                hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
-                if not pd.api.types.is_string_dtype(hlm.dtypes[col]):
-                    hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
+                if col_kinds[col] in {"string", "set_like"}:
+                    # unique_set_flatten skips None for set-like columns downstream.
+                    derived_cols[metric_col] = hlm[col].where(metric_mask, None)
+                else:
+                    derived_cols[metric_col] = numeric_cols[col].where(metric_mask)
+
+        if derived_cols:
+            hlm = pd.concat([hlm, pd.DataFrame(derived_cols, index=hlm.index)], axis=1)
         return hlm
 
     @staticmethod
