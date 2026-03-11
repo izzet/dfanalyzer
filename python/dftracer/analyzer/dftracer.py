@@ -11,7 +11,7 @@ import portion as I
 import structlog
 from dftracer.utils import Indexer, Reader
 from dask.distributed import wait
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer
 from .constants import (
@@ -30,7 +30,7 @@ from .constants import (
     POSIX_METADATA_FUNCTIONS,
     IOCategory,
 )
-from .types import ViewType
+from .types import ReadTraceResult, ViewType
 from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
@@ -86,6 +86,38 @@ TRACE_COL_MAPPING = {
     "te": COL_TIME_END,
     "trange": COL_TIME_RANGE,
     "ts": COL_TIME_START,
+}
+TYPE_EVENT = 0
+TYPE_FILE_HASH = 1
+TYPE_HOST_HASH = 2
+TYPE_STRING_HASH = 3
+TYPE_METADATA = 4
+TYPE_PROC_METADATA = 5
+TYPE_PROFILE = 6
+PROFILE_COLUMN_MAPPING = {
+    "count": "Int64",
+    "count_max": "Int64",
+    "count_min": "Int64",
+    "count_sum": "Int64",
+    "dft_cnt": "Int64",
+    "dur": "Int64",
+    "dur_max": "Int64",
+    "dur_min": "Int64",
+    "dur_sum": "Int64",
+    "epoch": "Int64",
+    "flags": "Int64",
+    "offset": "Int64",
+    "ret": "Int64",
+    "offset_max": "Int64",
+    "offset_min": "Int64",
+    "offset_sum": "Int64",
+    "ret_max": "Int64",
+    "ret_min": "Int64",
+    "ret_sum": "Int64",
+    "whence": "Int64",
+    "whence_max": "Int64",
+    "whence_min": "Int64",
+    "whence_sum": "Int64",
 }
 
 
@@ -176,6 +208,22 @@ def io_function(json_dict: dict):
     return d
 
 
+def profile_function(json_dict: dict):
+    args = json_dict.get("args", {})
+    d = {}
+    d[COL_IO_CAT] = IOCategory.OTHER.value
+    if "fhash" in args:
+        d["file_hash"] = str(args["fhash"])
+    if "hhash" in args:
+        d["host_hash"] = str(args["hhash"])
+    if json_dict.get("cat") in [CAT_POSIX, CAT_STDIO]:
+        d[COL_IO_CAT] = get_io_cat(json_dict["name"])
+    for key in PROFILE_COLUMN_MAPPING:
+        if key in args:
+            d[key] = int(args[key])
+    return d
+
+
 def load_indexed_gzip_files(filename, start, end):
     index_file = f"{filename}.idx"
     reader = Reader(filename, index_file)
@@ -194,6 +242,7 @@ def load_objects_dict(
     logger.debug("Loading dict", json_dict=json_dict)
     if json_dict is not None:
         try:
+            ph = json_dict.get("ph")
             if "name" in json_dict:
                 final_dict["name"] = json_dict["name"]
             if "cat" in json_dict:
@@ -205,48 +254,54 @@ def load_objects_dict(
             if "args" in json_dict:
                 if "hhash" in json_dict["args"]:
                     final_dict["host_hash"] = str(json_dict["args"]["hhash"])
-                # if "level" in val["args"]:
-                #     d["level"] = int(val["args"]["level"])
-                # if (
-                #     "epoch" in val["args"]
-                #     and val["args"]["epoch"] != "train"
-                #     and val["args"]["epoch"] != "valid"
-                # ):
-                #     epoch = int(val["args"]["epoch"])
-                #     if epoch > 0:
-                #         d["epoch"] = epoch
+                if (
+                    "epoch" in json_dict["args"]
+                    and json_dict["args"]["epoch"] != "train"
+                    and json_dict["args"]["epoch"] != "valid"
+                ):
+                    epoch = int(json_dict["args"]["epoch"])
+                    if epoch >= 0:
+                        final_dict["epoch"] = epoch
                 if "step" in json_dict["args"]:
                     step = int(json_dict["args"]["step"])
-                    if step > 0:
+                    if step >= 0:
                         final_dict["step"] = step
-            if "M" == json_dict["ph"]:
+            if "M" == ph:
                 if final_dict["name"] == "FH":
-                    final_dict["type"] = 1  # 1-> file hash
+                    final_dict["type"] = TYPE_FILE_HASH
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["hash"] = str(json_dict["args"]["value"])
                 elif final_dict["name"] == "HH":
-                    final_dict["type"] = 2  # 2-> hostname hash
+                    final_dict["type"] = TYPE_HOST_HASH
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["hash"] = str(json_dict["args"]["value"])
                 elif final_dict["name"] == "SH":
-                    final_dict["type"] = 3  # 3-> string hash
+                    final_dict["type"] = TYPE_STRING_HASH
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["hash"] = str(json_dict["args"]["value"])
                 elif final_dict["name"] == "PR":
-                    final_dict["type"] = 5  # 5-> process metadata
+                    final_dict["type"] = TYPE_PROC_METADATA
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["hash"] = str(json_dict["args"]["value"])
                 else:
-                    final_dict["type"] = 4  # 4-> others
+                    final_dict["type"] = TYPE_METADATA
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["value"] = str(json_dict["args"]["value"])
+            elif "C" == ph:
+                final_dict["type"] = TYPE_PROFILE
+                if "ts" in json_dict:
+                    if type(json_dict["ts"]) is not int:
+                        json_dict["ts"] = int(json_dict["ts"])
+                    final_dict["ts"] = json_dict["ts"]
+                final_dict.update(profile_function(json_dict))
+                final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
             else:
-                final_dict["type"] = 0  # 0->regular event
+                final_dict["type"] = TYPE_EVENT
                 if "dur" in json_dict:
                     if type(json_dict["dur"]) is not int:
                         json_dict["dur"] = int(json_dict["dur"])
@@ -373,19 +428,23 @@ class DFTracerAnalyzer(Analyzer):
             with log_block("to_dataframe"):
                 raw_traces = main_bag.to_dataframe(meta=self._columns)
             with log_block("_handle_metadata"):
-                traces = self._handle_metadata(raw_traces)
+                traces, profiles = self._handle_metadata(raw_traces)
             self._npartitions = math.ceil(total_size / (128 * 1024**2))
             logger.debug(f"Number of partitions used are {self._npartitions}")
             with log_block("repartition+persist"):
                 traces = traces.repartition(npartitions=self._npartitions).persist()
+                profiles = profiles.repartition(npartitions=self._npartitions).persist()
             with log_block("_fix_time+persist"):
                 traces = self._fix_time(traces).persist()
             with log_block("wait_all"):
-                wait([traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata])
+                wait([traces, profiles, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata])
         else:
             logger.error("Unable to load traces")
             exit(1)
-        return self._rename_columns(traces)
+        return ReadTraceResult(
+            traces=self._rename_columns(traces),
+            profiles=profiles,
+        )
 
     def postread_trace(
         self,
@@ -573,6 +632,8 @@ class DFTracerAnalyzer(Analyzer):
             "ts": "Int64",
             "te": "Int64",
             "dur": "Int64",
+            "epoch": "Int64",
+            "step": "Int64",
             "tinterval": "Int64" if self.time_approximate else "string",
             "trange": "Int64",
             "level": "Int8",
@@ -583,22 +644,24 @@ class DFTracerAnalyzer(Analyzer):
             "value": "string",
         }
         columns.update(io_columns())
+        columns.update(PROFILE_COLUMN_MAPPING)
         columns.update(metadata_columns)
         columns.update(extra_columns or {})
         logger.debug("get_columns", columns=columns)
         return columns
 
-    def _handle_metadata(self, raw_traces: dd.DataFrame) -> dd.DataFrame:
+    def _handle_metadata(self, raw_traces: dd.DataFrame) -> Tuple[dd.DataFrame, dd.DataFrame]:
         # print('=' * 33)
         # print('Handling metadata:\n')
         # print('>Raw traces:\n')
         # print(raw_traces)
         is_dask = isinstance(raw_traces, dd.DataFrame)
-        traces = raw_traces.query("type == 0")
-        file_hashes = raw_traces.query("type == 1")[["name", "hash"]].groupby("hash").first()
-        host_hashes = raw_traces.query("type == 2")[["name", "hash"]].groupby("hash").first()
-        string_hashes = raw_traces.query("type == 3")[["name", "hash"]].groupby("hash").first()
-        metadata = raw_traces.query("type == 4")[["name", "value"]]
+        traces = raw_traces.query(f"type == {TYPE_EVENT}")
+        profiles = raw_traces.query(f"type == {TYPE_PROFILE}")
+        file_hashes = raw_traces.query(f"type == {TYPE_FILE_HASH}")[["name", "hash"]].groupby("hash").first()
+        host_hashes = raw_traces.query(f"type == {TYPE_HOST_HASH}")[["name", "hash"]].groupby("hash").first()
+        string_hashes = raw_traces.query(f"type == {TYPE_STRING_HASH}")[["name", "hash"]].groupby("hash").first()
+        metadata = raw_traces.query(f"type == {TYPE_METADATA}")[["name", "value"]]
         file_hashes.index = file_hashes.index.astype(str)
         host_hashes.index = host_hashes.index.astype(str)
         string_hashes.index = string_hashes.index.astype(str)
@@ -611,18 +674,8 @@ class DFTracerAnalyzer(Analyzer):
         # print('host_hash dtype', traces["host_hash"].dtype)
         # print('file_hash index dtype', file_hashes.index.dtype)
         # print('host_hash index dtype', host_hashes.index.dtype)
-        traces = traces.merge(
-            file_hashes.rename(columns={"name": COL_FILE_NAME}),
-            how="left",
-            left_on="file_hash",
-            right_index=True,
-        )
-        traces = traces.merge(
-            host_hashes.rename(columns={"name": COL_HOST_NAME}),
-            how="left",
-            left_on="host_hash",
-            right_index=True,
-        )
+        traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
+        profiles = self._attach_metadata(profiles, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes
         self._host_hashes = host_hashes
         self._string_hashes = string_hashes
@@ -630,7 +683,23 @@ class DFTracerAnalyzer(Analyzer):
         # print('>Traces:\n')
         # print(traces)
         # print('=' * 33)
-        return traces
+        return traces, profiles
+
+    @staticmethod
+    def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):
+        records = records.merge(
+            file_hashes.rename(columns={"name": COL_FILE_NAME}),
+            how="left",
+            left_on="file_hash",
+            right_index=True,
+        )
+        records = records.merge(
+            host_hashes.rename(columns={"name": COL_HOST_NAME}),
+            how="left",
+            left_on="host_hash",
+            right_index=True,
+        )
+        return records
 
     @staticmethod
     def _rename_columns(traces: dd.DataFrame) -> dd.DataFrame:

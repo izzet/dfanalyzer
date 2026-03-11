@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, GiB, Layer, MiB
 from .types import (
-    AnalyzerResultType,
+    AnalysisResult,
     RawStats,
     ViewKey,
     humanized_view_name,
@@ -60,10 +60,10 @@ class Output(abc.ABC):
         self.root_only = root_only
         self.view_names = view_names
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError
 
-    def _create_summary(self, result: AnalyzerResultType, view_key: ViewKey) -> OutputSummary:
+    def _create_summary(self, result: AnalysisResult, view_key: ViewKey) -> OutputSummary:
         flat_view = result.flat_views[view_key]
         raw_stats = dask.compute(result.raw_stats)[0]
         if isinstance(raw_stats, dict):
@@ -147,7 +147,7 @@ class ConsoleOutput(Output):
         self.show_debug = show_debug
         self.show_header = show_header
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         print_objects = []
         for view_key in result.flat_views:
             if view_key[-1] not in result.view_types:
@@ -236,7 +236,7 @@ class ConsoleOutput(Output):
 
         return summary_table
 
-    def _create_additional_metrics_table(self, result: AnalyzerResultType, view_key: ViewKey) -> Optional[Table]:
+    def _create_additional_metrics_table(self, result: AnalysisResult, view_key: ViewKey) -> Optional[Table]:
         if not result.additional_metrics:
             return None
 
@@ -325,7 +325,7 @@ class ConsoleOutput(Output):
 
 
 class CSVOutput(Output):
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError("CSVOutput is not implemented yet.")
 
 
@@ -342,5 +342,5 @@ class SQLiteOutput(Output):
         super().__init__(compact, name, root_only, view_names)
         self.run_db_path = run_db_path
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError("SQLiteOutput is not implemented yet.")

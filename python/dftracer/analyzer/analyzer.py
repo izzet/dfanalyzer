@@ -38,7 +38,8 @@ from .metrics import (
     set_view_metrics,
 )
 from .types import (
-    AnalyzerResultType,
+    AnalysisResult,
+    ReadTraceResult,
     RawStats,
     ViewKey,
     ViewMetricBoundaries,
@@ -126,7 +127,7 @@ class Analyzer(abc.ABC):
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
         unoverlapped_posix_only: Optional[bool] = False,
-    ) -> AnalyzerResultType:
+    ) -> AnalysisResult:
         """Analyzes I/O trace data to identify performance bottlenecks.
 
         This method orchestrates the entire analysis process, including reading
@@ -142,22 +143,24 @@ class Analyzer(abc.ABC):
             view_types: A list of view types to compute (e.g., 'file_name', 'proc_name').
 
         Returns:
-            An AnalyzerResultType object containing the analysis results.
+            An AnalysisResult object containing the analysis results.
         """
         # Check if high-level metrics are checkpointed
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
+        read_result = None
         traces = None
         raw_stats = None
         with console_block("Read trace & stats"):
             if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
                 # Read trace & stats
                 with log_block("read_trace"):
-                    traces = self.read_trace(
+                    read_result = self.read_trace(
                         trace_path=trace_path,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
                     )
+                    traces = read_result.traces
                 with log_block("read_stats"):
                     raw_stats = self.read_stats(traces=traces)
                 with log_block("postread_trace"):
@@ -171,6 +174,7 @@ class Analyzer(abc.ABC):
                             time_granularity=self.time_granularity,
                             time_resolution=self.time_resolution,
                         )
+                read_result.traces = traces
             else:
                 # Restore stats
                 with log_block("restore_raw_stats"):
@@ -205,7 +209,7 @@ class Analyzer(abc.ABC):
         )
 
         # Attach correct traces & view types
-        result._traces = traces
+        result._read_result = read_result
         result.view_types = view_types
 
         # Return result
@@ -252,7 +256,7 @@ class Analyzer(abc.ABC):
         trace_path: str,
         extra_columns: Optional[Dict[str, str]],
         extra_columns_fn: Optional[Callable[[dict], dict]],
-    ) -> dd.DataFrame:
+    ) -> ReadTraceResult:
         """Reads I/O trace data from the specified path.
 
         This is an abstract method that must be implemented by subclasses
@@ -262,7 +266,8 @@ class Analyzer(abc.ABC):
             trace_path: Path to the I/O trace file or directory.
 
         Returns:
-            A Dask DataFrame containing the parsed I/O trace data.
+            A ReadTraceResult containing the parsed I/O trace data and any
+            additional native profile streams for the analyzer.
 
         Raises:
             NotImplementedError: If the subclass does not implement this method.
@@ -807,7 +812,7 @@ class Analyzer(abc.ABC):
         raw_stats: RawStats,
         logical_view_types: bool,
         layer_main_views: Optional[Dict[Layer, dd.DataFrame]] = None,
-    ) -> AnalyzerResultType:
+    ) -> AnalysisResult:
         """
         Analyze the high-level metrics (HLM) and compute views for each layer.
 
@@ -827,7 +832,7 @@ class Analyzer(abc.ABC):
                 precomputed main view. If not provided, main views will be computed from `hlm`.
 
         Returns:
-            AnalyzerResultType: The result of the analysis, including computed views and statistics.
+            AnalysisResult: The result of the analysis, including computed views and statistics.
 
         Raises:
             ValueError: If neither `hlm` nor `layer_main_views` is provided for a required layer.
@@ -947,7 +952,7 @@ class Analyzer(abc.ABC):
             with log_block("wait_for_checkpoints"):
                 wait(self.checkpoint_tasks)
 
-        return AnalyzerResultType(
+        return AnalysisResult(
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
