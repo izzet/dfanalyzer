@@ -4,6 +4,7 @@ import hashlib
 import itertools as it
 import json
 import math
+import numpy as np
 import os
 import pandas as pd
 import structlog
@@ -79,6 +80,8 @@ class Analyzer(abc.ABC):
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
+        profile_distribution: str = "uniform",
+        profile_time_granularity: float = 5,
         quantile_stats: bool = False,
         time_approximate: bool = True,
         time_granularity: float = 1,
@@ -93,6 +96,10 @@ class Analyzer(abc.ABC):
             checkpoint: Whether to enable checkpointing of intermediate results.
             checkpoint_dir: Directory to store checkpoint data.
             debug: Whether to enable debug mode.
+            profile_distribution: Strategy for distributing profile measures
+                when expanding buckets ('uniform' or 'weighted').
+            profile_time_granularity: The time granularity of profile buckets
+                emitted by the tracer, in seconds.
             time_approximate: Whether to use approximate time for I/O operations.
             time_granularity: The time granularity for analysis, in seconds.
             time_resolution: The time resolution for analysis, in microseconds.
@@ -101,12 +108,16 @@ class Analyzer(abc.ABC):
         """
         if checkpoint:
             assert checkpoint_dir != "", "Checkpoint directory must be defined"
+        if profile_distribution not in ("uniform", "weighted"):
+            raise ValueError(f"profile_distribution must be 'uniform' or 'weighted', got '{profile_distribution}'")
 
         self.checkpoint = checkpoint
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_tasks = []
         self.dask_client = get_client()
         self.debug = debug
+        self.profile_distribution = profile_distribution
+        self.profile_time_granularity = profile_time_granularity
         self.quantile_stats = quantile_stats
         self.layers = list(preset.layer_defs.keys())
         self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
@@ -160,6 +171,14 @@ class Analyzer(abc.ABC):
                 )
                 traces = read_result.traces
                 profiles = read_result.profiles
+            if profiles is not None:
+                with log_block("validate_and_expand_profiles"):
+                    ptg = read_result.profile_time_granularity or self.profile_time_granularity
+                    profiles = self._validate_and_expand_profiles(
+                        profiles=profiles,
+                        profile_time_granularity=ptg,
+                    )
+                    read_result.profiles = profiles
             with log_block("read_stats"):
                 raw_stats = self.read_stats(traces=traces, profiles=profiles)
             with log_block("postread_trace"):
@@ -1123,6 +1142,117 @@ class Analyzer(abc.ABC):
             traces=profiles,
             view_types=view_types,
         )
+
+    def _validate_and_expand_profiles(
+        self,
+        profiles: dd.DataFrame,
+        profile_time_granularity: float,
+    ) -> dd.DataFrame:
+        profile_ratio = self.time_granularity / profile_time_granularity
+        inverse_ratio = profile_time_granularity / self.time_granularity
+        is_coarser_aligned = math.isclose(profile_ratio, round(profile_ratio), rel_tol=0, abs_tol=1e-9)
+        is_finer_aligned = math.isclose(inverse_ratio, round(inverse_ratio), rel_tol=0, abs_tol=1e-9)
+        if not is_coarser_aligned and not is_finer_aligned:
+            raise ValueError(
+                f"Analysis granularity ({self.time_granularity}s) must evenly divide into "
+                f"or be an integer multiple of the profile bucket width "
+                f"({profile_time_granularity}s)"
+            )
+        if self.time_granularity < profile_time_granularity:
+            expansion_factor = int(round(inverse_ratio))
+            profiles = profiles.map_partitions(
+                self._expand_profile_buckets,
+                expansion_factor=expansion_factor,
+                time_resolution=self.time_resolution,
+                time_granularity=self.time_granularity,
+                distribution=self.profile_distribution,
+                meta=profiles._meta,
+            )
+        return profiles
+
+    @staticmethod
+    def _expand_profile_buckets(
+        df: pd.DataFrame,
+        expansion_factor: int,
+        time_resolution: float,
+        time_granularity: float,
+        distribution: str,
+    ) -> pd.DataFrame:
+        """Expand each profile row into ``expansion_factor`` sub-bucket rows.
+
+        When the analysis granularity is finer than the profile bucket width
+        (e.g. 1s analysis vs 5s profiles, expansion_factor=5), each canonical
+        profile row is replicated into *expansion_factor* rows with adjusted
+        ``time_range``, ``time_start``, and ``time_end``.
+
+        Measures (``count``, ``time``, ``size``) are distributed across
+        sub-buckets using the chosen *distribution* strategy:
+
+        * ``"uniform"`` — divide evenly.
+        * ``"weighted"`` — use ``time_min`` / ``time_max`` to shape the
+          distribution so that sub-buckets with higher estimated per-event
+          duration receive proportionally more of the aggregate ``time``.
+          ``count`` and ``size`` remain uniformly split.
+        """
+        if df.empty:
+            return df
+
+        sub_granularity_us = int(time_granularity * time_resolution)
+        output_columns = list(df.columns)
+
+        # Repeat every row expansion_factor times
+        expanded = df.loc[df.index.repeat(expansion_factor)].copy()
+        sub_idx = np.tile(np.arange(expansion_factor), len(df))
+
+        # Recompute time_start / time_end / time_range for each sub-bucket
+        base_start = np.repeat(df["time_start"].values, expansion_factor)
+        expanded["time_start"] = (base_start + sub_idx * sub_granularity_us).astype("Int64")
+        expanded["time_end"] = (expanded["time_start"] + sub_granularity_us).astype("Int64")
+        expanded["time_range"] = (expanded["time_start"] // sub_granularity_us).astype("Int64")
+
+        # Distribute measures
+        if distribution == "weighted":
+            t_min = np.repeat(df["time_min"].fillna(0).values, expansion_factor)
+            t_max = np.repeat(df["time_max"].fillna(0).values, expansion_factor)
+            if expansion_factor > 1:
+                ramp = t_min + (t_max - t_min) * sub_idx / (expansion_factor - 1)
+            else:
+                ramp = t_min
+            ramp_sums = np.repeat(
+                ramp.reshape(-1, expansion_factor).sum(axis=1),
+                expansion_factor,
+            )
+            weights = np.where(ramp_sums > 0, ramp / ramp_sums, 1.0 / expansion_factor)
+            total_time = np.repeat(df["time"].values, expansion_factor)
+            expanded["time"] = (total_time * weights).astype("float64")
+        else:
+            expanded["time"] = (
+                np.repeat(df["time"].values, expansion_factor) / expansion_factor
+            ).astype("float64")
+
+        # count and size always split uniformly (they are discrete totals)
+        expanded["count"] = (
+            np.repeat(df["count"].fillna(0).values, expansion_factor) / expansion_factor
+        )
+        base_count = expanded["count"].values
+        floor_count = np.floor(base_count).astype(np.int64)
+        remainders = np.repeat(
+            (df["count"].fillna(0).values % expansion_factor).astype(np.int64),
+            expansion_factor,
+        )
+        floor_count = np.where(sub_idx < remainders, floor_count + 1, floor_count)
+        expanded["count"] = pd.array(floor_count, dtype="Int64")
+
+        orig_size = df["size"].values
+        has_size = pd.notna(orig_size)
+        rep_size = np.repeat(orig_size, expansion_factor)
+        rep_has_size = np.repeat(has_size, expansion_factor)
+        size_arr = np.where(rep_has_size, rep_size / expansion_factor, pd.NA)
+        expanded["size"] = pd.array(size_arr, dtype="Int64")
+
+        # stat columns carry through unchanged (they are per-event bounds)
+        expanded.reset_index(drop=True, inplace=True)
+        return expanded[output_columns]
 
     def _compute_hybrid_hlm(
         self,

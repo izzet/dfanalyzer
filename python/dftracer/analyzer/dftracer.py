@@ -95,7 +95,6 @@ TYPE_STRING_HASH = 3
 TYPE_METADATA = 4
 TYPE_PROC_METADATA = 5
 TYPE_PROFILE = 6
-PROFILE_TIME_GRANULARITY = 5
 PROFILE_COLUMN_MAPPING = {
     "count": "Int64",
     "count_max": "Int64",
@@ -138,12 +137,22 @@ PROFILE_OUTPUT_COLUMNS = {
     COL_COUNT: "Int64",
     COL_TIME: "float64",
     COL_SIZE: "Int64",
+    "time_min": "float64",
+    "time_max": "float64",
+    "size_min": "Int64",
+    "size_max": "Int64",
+    "offset_min": "Int64",
+    "offset_max": "Int64",
     COL_TIME_RANGE: "Int64",
     COL_TIME_START: "Int64",
     COL_TIME_END: "Int64",
 }
 PROFILE_MEASURE_COLUMNS = [COL_COUNT, COL_TIME, COL_SIZE]
-PROFILE_IDENTITY_COLUMNS = [col for col in PROFILE_OUTPUT_COLUMNS if col not in PROFILE_MEASURE_COLUMNS]
+PROFILE_STAT_COLUMNS = ["time_min", "time_max", "size_min", "size_max", "offset_min", "offset_max"]
+PROFILE_IDENTITY_COLUMNS = [
+    col for col in PROFILE_OUTPUT_COLUMNS
+    if col not in PROFILE_MEASURE_COLUMNS and col not in PROFILE_STAT_COLUMNS
+]
 
 
 def create_index(filename):
@@ -464,17 +473,8 @@ class DFTracerAnalyzer(Analyzer):
                     # while trace_min is arbitrary. Snap the shared origin down to the
                     # 5s profile grid so a single 5s profile bucket cannot straddle two
                     # analyzer bins and get assigned to only one time_range.
-                    profile_grid_width = int(PROFILE_TIME_GRANULARITY * self.time_resolution)
+                    profile_grid_width = int(self.profile_time_granularity * self.time_resolution)
                     time_origin = (time_origin // profile_grid_width) * profile_grid_width
-                profile_ratio = self.time_granularity / PROFILE_TIME_GRANULARITY
-                is_profile_aligned = math.isclose(profile_ratio, round(profile_ratio), rel_tol=0, abs_tol=1e-9)
-                if has_profiles and (
-                    self.time_granularity < PROFILE_TIME_GRANULARITY or not is_profile_aligned
-                ):
-                    raise NotImplementedError(
-                        "Profile resolution matching is only implemented for analysis granularity "
-                        "equal to or an integer multiple of 5s"
-                    )
             self._npartitions = math.ceil(total_size / (128 * 1024**2))
             logger.debug(f"Number of partitions used are {self._npartitions}")
             with log_block("repartition+persist"):
@@ -498,6 +498,7 @@ class DFTracerAnalyzer(Analyzer):
         return ReadTraceResult(
             traces=self._rename_columns(traces),
             profiles=profiles,
+            profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
         )
 
     def postread_trace(
@@ -681,6 +682,7 @@ class DFTracerAnalyzer(Analyzer):
         profiles = profiles.map_partitions(self._set_proc_names)
         profiles = profiles.map_partitions(
             self._standardize_profile_partition,
+            profile_time_granularity=self.profile_time_granularity,
             time_granularity=self.time_granularity,
             time_origin=time_origin,
             time_resolution=self.time_resolution,
@@ -701,6 +703,12 @@ class DFTracerAnalyzer(Analyzer):
                     COL_COUNT: "sum",
                     COL_TIME: "sum",
                     COL_SIZE: "sum",
+                    "time_min": "min",
+                    "time_max": "max",
+                    "size_min": "min",
+                    "size_max": "max",
+                    "offset_min": "min",
+                    "offset_max": "max",
                 },
                 split_out=split_out,
             )
@@ -714,6 +722,7 @@ class DFTracerAnalyzer(Analyzer):
     @staticmethod
     def _standardize_profile_partition(
         df: pd.DataFrame,
+        profile_time_granularity: float,
         time_origin: int,
         time_granularity: float,
         time_resolution: float,
@@ -744,8 +753,22 @@ class DFTracerAnalyzer(Analyzer):
         profile_df[COL_TIME] = duration.astype("float64") / time_resolution
         profile_df[COL_SIZE] = pd.Series(pd.NA, index=df.index, dtype="Int64")
         profile_df.loc[is_sized_io, COL_SIZE] = size.loc[is_sized_io].astype("Int64")
+        dur_min = df["dur_min"].where(df["dur_min"].notna(), df["dur"])
+        profile_df["time_min"] = dur_min.astype("float64") / time_resolution
+        dur_max = df["dur_max"].where(df["dur_max"].notna(), df["dur"])
+        profile_df["time_max"] = dur_max.astype("float64") / time_resolution
+        profile_df["size_min"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+        profile_df["size_max"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+        profile_df.loc[is_sized_io, "size_min"] = (
+            df["ret_min"].where(df["ret_min"].notna(), df["ret"]).loc[is_sized_io].astype("Int64")
+        )
+        profile_df.loc[is_sized_io, "size_max"] = (
+            df["ret_max"].where(df["ret_max"].notna(), df["ret"]).loc[is_sized_io].astype("Int64")
+        )
+        profile_df["offset_min"] = df["offset_min"].where(df["offset_min"].notna(), df["offset"]).astype("Int64")
+        profile_df["offset_max"] = df["offset_max"].where(df["offset_max"].notna(), df["offset"]).astype("Int64")
         profile_df[COL_TIME_START] = (df["ts"] - time_origin).astype("Int64")
-        profile_df[COL_TIME_END] = profile_df[COL_TIME_START] + int(PROFILE_TIME_GRANULARITY * time_resolution)
+        profile_df[COL_TIME_END] = profile_df[COL_TIME_START] + int(profile_time_granularity * time_resolution)
         profile_df[COL_TIME_RANGE] = (
             profile_df[COL_TIME_START] // int(time_granularity * time_resolution)
         ).astype("Int64")

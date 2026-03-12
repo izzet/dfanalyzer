@@ -55,6 +55,7 @@ class RawStats:
 class ReadTraceResult:
     traces: dd.DataFrame
     profiles: Optional[dd.DataFrame] = None
+    profile_time_granularity: Optional[float] = None
 
 
 @dc.dataclass
