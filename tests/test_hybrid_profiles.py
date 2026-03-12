@@ -60,6 +60,34 @@ TRACE_CONTENT = [
     "]",
 ]
 
+TRACE_NO_HOST_METADATA_CONTENT = [
+    "[",
+    json.dumps(
+        {
+            "id": 1,
+            "name": "FH",
+            "cat": "dftracer",
+            "pid": 1,
+            "tid": 1,
+            "ph": "M",
+            "args": {"hhash": "h1", "name": "/tmp/data/file.bin", "value": "f1"},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 2,
+            "name": "open64",
+            "cat": "POSIX",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 3, "dur_sum": 300},
+        }
+    ),
+    "]",
+]
+
 FULL_TRACE_CONTENT = [
     "[",
     json.dumps(
@@ -228,6 +256,13 @@ def full_hybrid_trace_path(tmp_path):
     return trace_path
 
 
+@pytest.fixture
+def no_host_metadata_trace_path(tmp_path):
+    trace_path = tmp_path / "no-host-hybrid.pfw"
+    trace_path.write_text("\n".join(TRACE_NO_HOST_METADATA_CONTENT) + "\n", encoding="utf-8")
+    return trace_path
+
+
 def make_analyzer(tmp_path, time_granularity, preset=None):
     return DFTracerAnalyzer(
         preset=OmegaConf.structured(preset or AnalyzerPresetConfigPOSIX()),
@@ -280,6 +315,48 @@ def test_read_trace_rejects_non_multiple_profile_granularity(dask_client, hybrid
             extra_columns=None,
             extra_columns_fn=None,
         )
+
+
+def test_read_trace_uses_host_hash_in_proc_name_when_host_name_is_missing(
+    dask_client,
+    no_host_metadata_trace_path,
+    tmp_path,
+):
+    analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
+
+    read_result = analyzer.read_trace(
+        trace_path=str(no_host_metadata_trace_path),
+        extra_columns=None,
+        extra_columns_fn=None,
+    )
+
+    profiles = read_result.profiles.compute()
+
+    assert len(profiles) == 1
+    assert profiles.iloc[0]["host_name"] is None or str(profiles.iloc[0]["host_name"]) == "<NA>"
+    assert profiles.iloc[0]["proc_name"] == "app#h1#1#1"
+
+
+def test_read_trace_coalesces_duplicate_full_profile_rows(dask_client, full_hybrid_trace_path, tmp_path):
+    analyzer = make_analyzer(
+        tmp_path=tmp_path,
+        time_granularity=5,
+        preset=AnalyzerPresetConfigDLIOAILogging(),
+    )
+
+    read_result = analyzer.read_trace(
+        trace_path=str(full_hybrid_trace_path),
+        extra_columns=None,
+        extra_columns_fn=None,
+    )
+
+    profiles = read_result.profiles.compute()
+    item_profiles = profiles[profiles["func_name"] == "item"].reset_index(drop=True)
+
+    assert len(item_profiles) == 1
+    assert int(item_profiles.loc[0, "count"]) == 3
+    assert float(item_profiles.loc[0, "time"]) == pytest.approx(2.5)
+    assert item_profiles.loc[0, "size"] is None or str(item_profiles.loc[0, "size"]) == "<NA>"
 
 
 def test_analyze_trace_reconciles_hybrid_hlm_and_tracks_raw_stats(dask_client, hybrid_trace_path, tmp_path):

@@ -132,3 +132,16 @@ Follow-up design note for `dft-agg-full`:
 - The current global `trace_hlm` + `profile_hlm` reconcile is acceptable for `dft-agg-selective` because the profile side is effectively just POSIX.
 - For `dft-agg-full`, profiles contribute rows to multiple layers (`posix`, `data`, `compute`, `dataloader`, `device`, `comm`), so reconciliation should move into the per-layer `layer_hlm` loop rather than happen once above all layers.
 - Separate concern, explicitly deferred for now: if `file_name` is included in `view_types`, fileless profile rows are lost during HLM grouping before the layer loop runs. This is not unique to hybrid profiles, and for now we accept it as a view-selection limitation rather than widening the current implementation scope.
+
+Validated implementation notes for `dft-agg-full`:
+- Across the first 16 `*-app.pfw.gz` files, standardized full-profile rows were not fully canonical yet: `886 / 150,984` rows duplicated the canonical `(proc_name, time_range, cat, func_name, io_cat, file_name)` profile key, almost entirely `data:item`.
+- Those duplicates are now coalesced inside `dftracer.read_trace()` so `ReadTraceResult.profiles` returns a stable canonical profile table.
+- Host-name metadata is absent in these full app traces, so building `proc_name` as `app#unknown#pid#tid` was unsafe. We now fall back to `host_hash` when `host_name` is missing to preserve cross-host uniqueness.
+- After those two fixes, the same 16-file scan produced `0` duplicate canonical profile rows and `0` `proc_name` values containing `#unknown#`.
+- Remaining semantic gap under the current DLIO layer definitions: `50 / 150,984` standardized profile rows in the first 16 files are still not assigned to any layer. The uncovered function/category pairs are exactly:
+  - `comm:all_reduce`
+  - `compute:backward`
+  - `compute:forward`
+  - `dataloader:fetch.block`
+  - `device:transfer`
+- This remaining gap is a layer-mapping/design choice, not a profile-normalization bug.

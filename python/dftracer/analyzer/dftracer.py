@@ -142,6 +142,8 @@ PROFILE_OUTPUT_COLUMNS = {
     COL_TIME_START: "Int64",
     COL_TIME_END: "Int64",
 }
+PROFILE_MEASURE_COLUMNS = [COL_COUNT, COL_TIME, COL_SIZE]
+PROFILE_IDENTITY_COLUMNS = [col for col in PROFILE_OUTPUT_COLUMNS if col not in PROFILE_MEASURE_COLUMNS]
 
 
 def create_index(filename):
@@ -684,7 +686,30 @@ class DFTracerAnalyzer(Analyzer):
             time_resolution=self.time_resolution,
             meta=PROFILE_OUTPUT_COLUMNS,
         )
-        return profiles.map_partitions(self._fix_file_posix_category).map_partitions(self._sanitize_size_offset)
+        profiles = profiles.map_partitions(self._fix_file_posix_category).map_partitions(self._sanitize_size_offset)
+        return self._coalesce_profiles(profiles)
+
+    def _coalesce_profiles(self, profiles: dd.DataFrame) -> dd.DataFrame:
+        # dft-agg-full can emit multiple counter rows for the same canonical
+        # profile bucket. Collapse them here so `read_trace()` returns a stable
+        # analyzer-native profile table.
+        split_out = max(1, math.ceil(math.sqrt(profiles.npartitions)))
+        coalesced = (
+            profiles.groupby(PROFILE_IDENTITY_COLUMNS, dropna=False)
+            .agg(
+                {
+                    COL_COUNT: "sum",
+                    COL_TIME: "sum",
+                    COL_SIZE: "sum",
+                },
+                split_out=split_out,
+            )
+            .reset_index()
+        )
+        coalesced[COL_COUNT] = coalesced[COL_COUNT].astype("Int64")
+        coalesced[COL_TIME] = coalesced[COL_TIME].astype("float64")
+        coalesced[COL_SIZE] = coalesced[COL_SIZE].replace(0, pd.NA).astype("Int64")
+        return coalesced[list(PROFILE_OUTPUT_COLUMNS)]
 
     @staticmethod
     def _standardize_profile_partition(
@@ -836,9 +861,12 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _set_proc_names(df: pd.DataFrame):
+        host_component = df[COL_HOST_NAME] if COL_HOST_NAME in df.columns else pd.Series(pd.NA, index=df.index)
+        if "host_hash" in df.columns:
+            host_component = host_component.fillna(df["host_hash"])
         df[COL_PROC_NAME] = (
             "app#"
-            + df[COL_HOST_NAME].fillna("unknown").astype(str)
+            + host_component.fillna("unknown").astype(str)
             + "#"
             + df["pid"].astype(str)
             + "#"
