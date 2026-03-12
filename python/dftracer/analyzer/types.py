@@ -43,6 +43,8 @@ class RawStats:
     job_time: "dd.Scalar"
     time_granularity: int
     time_resolution: int
+    trace_event_count: "dd.Scalar"
+    profile_event_count: "dd.Scalar"
     total_event_count: "dd.Scalar"
     unique_file_count: "dd.Scalar"
     unique_host_count: "dd.Scalar"

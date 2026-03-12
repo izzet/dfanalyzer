@@ -22,6 +22,7 @@ from .constants import (
     COL_HOST_NAME,
     COL_IO_CAT,
     COL_PROC_NAME,
+    COL_SIZE,
     COL_TIME,
     COL_TIME_END,
     COL_TIME_RANGE,
@@ -94,6 +95,7 @@ TYPE_STRING_HASH = 3
 TYPE_METADATA = 4
 TYPE_PROC_METADATA = 5
 TYPE_PROFILE = 6
+PROFILE_TIME_GRANULARITY = 5
 PROFILE_COLUMN_MAPPING = {
     "count": "Int64",
     "count_max": "Int64",
@@ -118,6 +120,27 @@ PROFILE_COLUMN_MAPPING = {
     "whence_max": "Int64",
     "whence_min": "Int64",
     "whence_sum": "Int64",
+}
+PROFILE_OUTPUT_COLUMNS = {
+    "cat": "string",
+    COL_FUNC_NAME: "string",
+    "pid": "Int64",
+    "tid": "Int64",
+    "epoch": "Int64",
+    "step": "Int64",
+    "file_hash": "string",
+    "host_hash": "string",
+    COL_FILE_NAME: "string",
+    COL_HOST_NAME: "string",
+    COL_PROC_NAME: "string",
+    COL_IO_CAT: "Int8",
+    COL_ACC_PAT: "Int8",
+    COL_COUNT: "Int64",
+    COL_TIME: "float64",
+    COL_SIZE: "Int64",
+    COL_TIME_RANGE: "Int64",
+    COL_TIME_START: "Int64",
+    COL_TIME_END: "Int64",
 }
 
 
@@ -429,15 +452,44 @@ class DFTracerAnalyzer(Analyzer):
                 raw_traces = main_bag.to_dataframe(meta=self._columns)
             with log_block("_handle_metadata"):
                 traces, profiles = self._handle_metadata(raw_traces)
+            with log_block("compute_time_origin"):
+                trace_min, profile_min = dask.compute(traces["ts"].min(), profiles["ts"].min())
+                time_origin_candidates = [ts for ts in [trace_min, profile_min] if pd.notna(ts)]
+                time_origin = min(time_origin_candidates) if time_origin_candidates else 0
+                has_profiles = pd.notna(profile_min)
+                if has_profiles:
+                    # DFTracer counter buckets are emitted on absolute 5s boundaries,
+                    # while trace_min is arbitrary. Snap the shared origin down to the
+                    # 5s profile grid so a single 5s profile bucket cannot straddle two
+                    # analyzer bins and get assigned to only one time_range.
+                    profile_grid_width = int(PROFILE_TIME_GRANULARITY * self.time_resolution)
+                    time_origin = (time_origin // profile_grid_width) * profile_grid_width
+                profile_ratio = self.time_granularity / PROFILE_TIME_GRANULARITY
+                is_profile_aligned = math.isclose(profile_ratio, round(profile_ratio), rel_tol=0, abs_tol=1e-9)
+                if has_profiles and (
+                    self.time_granularity < PROFILE_TIME_GRANULARITY or not is_profile_aligned
+                ):
+                    raise NotImplementedError(
+                        "Profile resolution matching is only implemented for analysis granularity "
+                        "equal to or an integer multiple of 5s"
+                    )
             self._npartitions = math.ceil(total_size / (128 * 1024**2))
             logger.debug(f"Number of partitions used are {self._npartitions}")
             with log_block("repartition+persist"):
                 traces = traces.repartition(npartitions=self._npartitions).persist()
-                profiles = profiles.repartition(npartitions=self._npartitions).persist()
-            with log_block("_fix_time+persist"):
-                traces = self._fix_time(traces).persist()
+                if has_profiles:
+                    profiles = profiles.repartition(npartitions=self._npartitions).persist()
+                else:
+                    profiles = None
+            with log_block("normalize_records+persist"):
+                traces = self._fix_time(traces, time_origin=time_origin).persist()
+                if profiles is not None:
+                    profiles = self._standardize_profiles(profiles, time_origin=time_origin).persist()
             with log_block("wait_all"):
-                wait([traces, profiles, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata])
+                wait_list = [traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata]
+                if profiles is not None:
+                    wait_list.append(profiles)
+                wait(wait_list)
         else:
             logger.error("Unable to load traces")
             exit(1)
@@ -612,8 +664,9 @@ class DFTracerAnalyzer(Analyzer):
 
         return df
 
-    def _fix_time(self, traces: dd.DataFrame) -> dd.DataFrame:
-        traces["ts"] = traces["ts"] - traces["ts"].min()
+    def _fix_time(self, traces: dd.DataFrame, time_origin: Optional[int] = None) -> dd.DataFrame:
+        time_origin = traces["ts"].min() if time_origin is None else time_origin
+        traces["ts"] = traces["ts"] - time_origin
         traces["te"] = traces["ts"] + traces["dur"]
         traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
         traces["ts"] = traces["ts"].astype("Int64")
@@ -621,6 +674,57 @@ class DFTracerAnalyzer(Analyzer):
         traces["trange"] = traces["trange"].astype("Int16")
         traces["dur"] = traces["dur"] / self.time_resolution
         return traces
+
+    def _standardize_profiles(self, profiles: dd.DataFrame, time_origin: int) -> dd.DataFrame:
+        profiles = profiles.map_partitions(self._set_proc_names)
+        profiles = profiles.map_partitions(
+            self._standardize_profile_partition,
+            time_granularity=self.time_granularity,
+            time_origin=time_origin,
+            time_resolution=self.time_resolution,
+            meta=PROFILE_OUTPUT_COLUMNS,
+        )
+        return profiles.map_partitions(self._fix_file_posix_category).map_partitions(self._sanitize_size_offset)
+
+    @staticmethod
+    def _standardize_profile_partition(
+        df: pd.DataFrame,
+        time_origin: int,
+        time_granularity: float,
+        time_resolution: float,
+    ) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in PROFILE_OUTPUT_COLUMNS.items()})
+
+        df = df.copy()
+        duration = df["dur_sum"].where(df["dur_sum"].notna(), df["dur"]).fillna(0)
+        size = df["ret_sum"].where(df["ret_sum"].notna(), df["ret"])
+        is_sized_io = df[COL_IO_CAT].isin([IOCategory.READ.value, IOCategory.WRITE.value]) & size.notna() & (size > 0)
+
+        profile_df = pd.DataFrame(index=df.index)
+        profile_df["cat"] = df["cat"].astype("string")
+        profile_df[COL_FUNC_NAME] = df["name"].astype("string")
+        profile_df["pid"] = df["pid"].astype("Int64")
+        profile_df["tid"] = df["tid"].astype("Int64")
+        profile_df["epoch"] = df["epoch"].astype("Int64")
+        profile_df["step"] = df["step"].astype("Int64")
+        profile_df["file_hash"] = df["file_hash"].astype("string")
+        profile_df["host_hash"] = df["host_hash"].astype("string")
+        profile_df[COL_FILE_NAME] = df[COL_FILE_NAME].astype("string")
+        profile_df[COL_HOST_NAME] = df[COL_HOST_NAME].astype("string")
+        profile_df[COL_PROC_NAME] = df[COL_PROC_NAME].astype("string")
+        profile_df[COL_IO_CAT] = df[COL_IO_CAT].fillna(IOCategory.OTHER.value).astype("Int8")
+        profile_df[COL_ACC_PAT] = pd.Series(0, index=df.index, dtype="Int8")
+        profile_df[COL_COUNT] = df["dft_cnt"].fillna(0).astype("Int64")
+        profile_df[COL_TIME] = duration.astype("float64") / time_resolution
+        profile_df[COL_SIZE] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+        profile_df.loc[is_sized_io, COL_SIZE] = size.loc[is_sized_io].astype("Int64")
+        profile_df[COL_TIME_START] = (df["ts"] - time_origin).astype("Int64")
+        profile_df[COL_TIME_END] = profile_df[COL_TIME_START] + int(PROFILE_TIME_GRANULARITY * time_resolution)
+        profile_df[COL_TIME_RANGE] = (
+            profile_df[COL_TIME_START] // int(time_granularity * time_resolution)
+        ).astype("Int64")
+        return profile_df[list(PROFILE_OUTPUT_COLUMNS)]
 
     def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
         columns = {
@@ -734,7 +838,7 @@ class DFTracerAnalyzer(Analyzer):
     def _set_proc_names(df: pd.DataFrame):
         df[COL_PROC_NAME] = (
             "app#"
-            + df[COL_HOST_NAME].astype(str).fillna("unknown")
+            + df[COL_HOST_NAME].fillna("unknown").astype(str)
             + "#"
             + df["pid"].astype(str)
             + "#"

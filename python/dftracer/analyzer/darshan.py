@@ -77,6 +77,8 @@ class DarshanAnalyzer(Analyzer):
             job_time=self.job_time,
             time_granularity=self.time_granularity,
             time_resolution=self.time_resolution,
+            trace_event_count=len(file_name_ddf),
+            profile_event_count=0,
             total_event_count=len(file_name_ddf),
             unique_file_count=file_name_ddf['file_name'].nunique(),
             unique_host_count=file_name_ddf['host_name'].nunique(),

@@ -39,6 +39,8 @@ class OutputSummary:
     layers: List[Layer]
     time_granularity: float
     time_resolution: float
+    trace_event_count: int
+    profile_event_count: int
     total_event_count: int
     unique_file_count: int
     unique_host_count: int
@@ -74,6 +76,8 @@ class Output(abc.ABC):
             layers=result.layers,
             time_granularity=float(raw_stats.time_granularity),
             time_resolution=float(raw_stats.time_resolution),
+            trace_event_count=int(raw_stats.trace_event_count),
+            profile_event_count=int(raw_stats.profile_event_count),
             total_event_count=int(raw_stats.total_event_count),
             unique_file_count=int(raw_stats.unique_file_count),
             unique_host_count=int(raw_stats.unique_host_count),
@@ -217,6 +221,8 @@ class ConsoleOutput(Output):
         summary_table.add_column(header='Value', justify='right')
 
         summary_table.add_row('Job Time', 'seconds', f"{summary.job_time:.3f}")
+        summary_table.add_row('Trace Count', 'count', f"{summary.trace_event_count:,}")
+        summary_table.add_row('Profile Count', 'count', f"{summary.profile_event_count:,}")
         summary_table.add_row('Total Count', 'count', f"{summary.total_event_count:,}")
         summary_table.add_row('Total Files', 'count', f"{summary.unique_file_count:,}")
         summary_table.add_row('Total Nodes', 'count', f"{summary.unique_host_count:,}")

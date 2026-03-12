@@ -24,6 +24,7 @@ from .analysis_utils import (
 )
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig
 from .constants import (
+    COL_COUNT,
     COL_FILE_NAME,
     COL_HOST_NAME,
     COL_PROC_NAME,
@@ -149,6 +150,7 @@ class Analyzer(abc.ABC):
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
         read_result = None
+        profiles = None
         traces = None
         raw_stats = None
         with console_block("Read trace & stats"):
@@ -161,8 +163,9 @@ class Analyzer(abc.ABC):
                         extra_columns_fn=extra_columns_fn,
                     )
                     traces = read_result.traces
+                    profiles = read_result.profiles
                 with log_block("read_stats"):
-                    raw_stats = self.read_stats(traces=traces)
+                    raw_stats = self.read_stats(traces=traces, profiles=profiles)
                 with log_block("postread_trace"):
                     traces = self.postread_trace(traces=traces, view_types=proc_view_types)
                 with log_block("set_size_bins"):
@@ -185,12 +188,21 @@ class Analyzer(abc.ABC):
 
         # Compute high-level metrics
         with console_block("Compute high-level metrics"):
-            with log_block("compute_high_level_metrics"):
-                hlm = self.compute_high_level_metrics(
-                    checkpoint_name=hlm_checkpoint_name,
-                    traces=traces,
-                    view_types=proc_view_types,
-                )
+            if profiles is None:
+                with log_block("compute_high_level_metrics"):
+                    hlm = self.compute_high_level_metrics(
+                        checkpoint_name=hlm_checkpoint_name,
+                        traces=traces,
+                        view_types=proc_view_types,
+                    )
+            else:
+                with log_block("compute_hybrid_hlm"):
+                    hlm = self.compute_hybrid_hlm(
+                        checkpoint_name=hlm_checkpoint_name,
+                        traces=traces,
+                        profiles=profiles,
+                        view_types=proc_view_types,
+                    )
             with log_block("persist"):
                 (hlm, raw_stats) = persist(hlm, raw_stats)
             with log_block("wait"):
@@ -215,7 +227,7 @@ class Analyzer(abc.ABC):
         # Return result
         return result
 
-    def read_stats(self, traces: dd.DataFrame) -> RawStats:
+    def read_stats(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
         Calculates job time and total event count from the traces.
@@ -230,24 +242,35 @@ class Analyzer(abc.ABC):
             and 'total_count'.
         """
         job_time = self.get_job_time(traces)
-        total_event_count = self.get_total_event_count(traces)
+        trace_event_count = self.get_total_event_count(traces)
+        profile_event_count = self.get_profile_event_count(profiles)
+        total_event_count = trace_event_count + profile_event_count
         unique_file_count = self.get_unique_file_count(traces)
         unique_host_count = self.get_unique_host_count(traces)
         unique_process_count = self.get_unique_process_count(traces)
-        raw_stats = RawStats(
-            **self.restore_extra_data(
-                name=self.get_stats_checkpoint_name(),
-                fallback=lambda: dict(
-                    job_time=job_time,
-                    time_granularity=self.time_granularity,
-                    time_resolution=self.time_resolution,
-                    total_event_count=total_event_count,
-                    unique_file_count=unique_file_count,
-                    unique_host_count=unique_host_count,
-                    unique_process_count=unique_process_count,
-                ),
-            )
+        raw_stats_data = self.restore_extra_data(
+            name=self.get_stats_checkpoint_name(),
+            fallback=lambda: dict(
+                job_time=job_time,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+                trace_event_count=trace_event_count,
+                profile_event_count=profile_event_count,
+                total_event_count=total_event_count,
+                unique_file_count=unique_file_count,
+                unique_host_count=unique_host_count,
+                unique_process_count=unique_process_count,
+            ),
         )
+        if "trace_event_count" not in raw_stats_data:
+            raw_stats_data["trace_event_count"] = raw_stats_data.get("total_event_count", 0)
+        if "profile_event_count" not in raw_stats_data:
+            raw_stats_data["profile_event_count"] = 0
+        if "total_event_count" not in raw_stats_data:
+            raw_stats_data["total_event_count"] = (
+                raw_stats_data["trace_event_count"] + raw_stats_data["profile_event_count"]
+            )
+        raw_stats = RawStats(**raw_stats_data)
         return raw_stats
 
     @abc.abstractmethod
@@ -317,6 +340,52 @@ class Analyzer(abc.ABC):
                 traces=traces,
                 view_types=view_types,
             ),
+        )
+
+    def compute_profile_hlm(
+        self,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+    ) -> dd.DataFrame:
+        profiles = profiles.map_partitions(set_size_bins)
+        return self._compute_high_level_metrics(
+            partition_size=partition_size,
+            traces=profiles,
+            view_types=view_types,
+        )
+
+    def compute_hybrid_hlm(
+        self,
+        traces: dd.DataFrame,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+        checkpoint_name: Optional[str] = None,
+    ) -> dd.DataFrame:
+        checkpoint_name = checkpoint_name or self.get_hlm_checkpoint_name(view_types)
+        return self.restore_view(
+            name=checkpoint_name,
+            fallback=lambda: self._compute_hybrid_hlm(
+                partition_size=partition_size,
+                profiles=profiles,
+                traces=traces,
+                view_types=view_types,
+            ),
+        )
+
+    def reconcile_hlm(
+        self,
+        trace_hlm: dd.DataFrame,
+        profile_hlm: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+    ) -> dd.DataFrame:
+        return self._reconcile_hlm(
+            partition_size=partition_size,
+            profile_hlm=profile_hlm,
+            trace_hlm=trace_hlm,
+            view_types=view_types,
         )
 
     def compute_main_view(
@@ -553,6 +622,13 @@ class Analyzer(abc.ABC):
             The total count of I/O events as an integer.
         """
         return traces.index.count().persist()
+
+    def get_profile_event_count(self, profiles: Optional[dd.DataFrame]):
+        if profiles is None:
+            return 0
+        if COL_COUNT in profiles.columns:
+            return profiles[COL_COUNT].fillna(0).sum().persist()
+        return profiles.index.count().persist()
 
     def get_unique_host_count(self, traces: dd.DataFrame):
         """Computes the total number of unique hosts accessed in the traces.
@@ -975,7 +1051,7 @@ class Analyzer(abc.ABC):
         partition_size: str,
     ) -> dd.DataFrame:
         # Add layer columns
-        hlm_groupby = list(set(view_types).union(HLM_EXTRA_COLS))
+        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
@@ -990,6 +1066,72 @@ class Analyzer(abc.ABC):
             .replace(0, pd.NA)
         )
         hlm[bin_cols] = hlm[bin_cols].astype("Int32")
+        return hlm.persist()
+
+    def _compute_hybrid_hlm(
+        self,
+        traces: dd.DataFrame,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str,
+    ) -> dd.DataFrame:
+        trace_hlm = self._compute_high_level_metrics(
+            partition_size=partition_size,
+            traces=traces,
+            view_types=view_types,
+        )
+        profile_hlm = self.compute_profile_hlm(
+            partition_size=partition_size,
+            profiles=profiles,
+            view_types=view_types,
+        )
+        return self._reconcile_hlm(
+            partition_size=partition_size,
+            profile_hlm=profile_hlm,
+            trace_hlm=trace_hlm,
+            view_types=view_types,
+        )
+
+    def _reconcile_hlm(
+        self,
+        trace_hlm: dd.DataFrame,
+        profile_hlm: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str,
+    ) -> dd.DataFrame:
+        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
+        trace_hlm = trace_hlm.reset_index()
+        profile_hlm = profile_hlm.reset_index()
+        for col in hlm_groupby:
+            if col in trace_hlm.columns and col in profile_hlm.columns:
+                profile_dtype = profile_hlm._meta[col].dtype
+                if trace_hlm._meta[col].dtype != profile_dtype:
+                    trace_hlm[col] = trace_hlm[col].astype(profile_dtype)
+        trace_keys = trace_hlm[hlm_groupby].drop_duplicates().assign(_trace_present=1)
+        profile_hlm = profile_hlm.merge(trace_keys, how="left", on=hlm_groupby).persist()
+        overlap_count = int(profile_hlm["_trace_present"].fillna(0).sum().compute())
+        if overlap_count > 0:
+            logger.warning("Hybrid reconcile found overlapping HLM keys", overlap_count=overlap_count)
+        else:
+            logger.info("Hybrid reconcile found no overlapping HLM keys", overlap_count=overlap_count)
+        profile_only = profile_hlm[profile_hlm["_trace_present"].isna()].drop(columns=["_trace_present"])
+        combined_hlm = dd.concat([trace_hlm, profile_only], interleave_partitions=True)
+        bin_cols = [col for col in combined_hlm.columns if "_bin_" in col]
+        view_types_diff = list(set(VIEW_TYPES).difference(view_types))
+        hlm_agg = dict(HLM_AGG)
+        hlm_agg.update({col: "sum" for col in bin_cols})
+        for col in view_types_diff:
+            if col in combined_hlm.columns:
+                hlm_agg[col] = unique_set_flatten()
+        hlm = (
+            combined_hlm.groupby(hlm_groupby)
+            .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
+            .persist()
+            .repartition(partition_size=partition_size)
+            .replace(0, pd.NA)
+        )
+        if bin_cols:
+            hlm[bin_cols] = hlm[bin_cols].astype("Int32")
         return hlm.persist()
 
     def _compute_main_view(
