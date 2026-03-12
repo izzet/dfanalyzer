@@ -4,7 +4,7 @@ import pytest
 from dask.distributed import Client, LocalCluster
 from omegaconf import OmegaConf
 
-from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX
+from dftracer.analyzer.config import AnalyzerPresetConfigDLIOAILogging, AnalyzerPresetConfigPOSIX
 from dftracer.analyzer.dftracer import DFTracerAnalyzer
 
 
@@ -60,6 +60,142 @@ TRACE_CONTENT = [
     "]",
 ]
 
+FULL_TRACE_CONTENT = [
+    "[",
+    json.dumps(
+        {
+            "id": 1,
+            "name": "HH",
+            "cat": "dftracer",
+            "pid": 1,
+            "tid": 1,
+            "ph": "M",
+            "args": {"hhash": "h1", "name": "hostA", "value": "h1"},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 2,
+            "name": "FH",
+            "cat": "dftracer",
+            "pid": 1,
+            "tid": 1,
+            "ph": "M",
+            "args": {"hhash": "h1", "name": "/tmp/data/file.bin", "value": "f1"},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 3,
+            "name": "read",
+            "cat": "POSIX",
+            "pid": 1,
+            "tid": 1,
+            "ph": "X",
+            "ts": 6000123,
+            "dur": 200,
+            "args": {"hhash": "h1", "fhash": "f1", "ret": 4096, "offset": 0},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 4,
+            "name": "ai_root",
+            "cat": "ai_root",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 1, "dur_sum": 5000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 5,
+            "name": "train",
+            "cat": "pipeline",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 1, "dur_sum": 5000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 6,
+            "name": "epoch.1",
+            "cat": "pipeline",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 1, "dur_sum": 5000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 7,
+            "name": "compute",
+            "cat": "compute",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 2, "dur_sum": 4000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 8,
+            "name": "fetch.iter",
+            "cat": "pipeline",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 1, "dur_sum": 1000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 9,
+            "name": "item",
+            "cat": "data",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 2, "dur_sum": 2000000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 10,
+            "name": "item",
+            "cat": "data",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "dft_cnt": 1, "dur": 500000},
+        }
+    ),
+    json.dumps(
+        {
+            "id": 11,
+            "name": "open64",
+            "cat": "POSIX",
+            "pid": 1,
+            "tid": 1,
+            "ph": "C",
+            "ts": 10000000,
+            "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 3, "dur_sum": 300},
+        }
+    ),
+    "]",
+]
+
 
 @pytest.fixture
 def dask_client():
@@ -85,9 +221,16 @@ def hybrid_trace_path(tmp_path):
     return trace_path
 
 
-def make_analyzer(tmp_path, time_granularity):
+@pytest.fixture
+def full_hybrid_trace_path(tmp_path):
+    trace_path = tmp_path / "full-hybrid.pfw"
+    trace_path.write_text("\n".join(FULL_TRACE_CONTENT) + "\n", encoding="utf-8")
+    return trace_path
+
+
+def make_analyzer(tmp_path, time_granularity, preset=None):
     return DFTracerAnalyzer(
-        preset=OmegaConf.structured(AnalyzerPresetConfigPOSIX()),
+        preset=OmegaConf.structured(preset or AnalyzerPresetConfigPOSIX()),
         checkpoint=False,
         checkpoint_dir=str(tmp_path / "checkpoints"),
         debug=False,
@@ -158,3 +301,36 @@ def test_analyze_trace_reconciles_hybrid_hlm_and_tracks_raw_stats(dask_client, h
     by_func = posix_hlm.set_index("func_name")
     assert int(by_func.loc["read", "count"]) == 1
     assert int(by_func.loc["open64", "count"]) == 3
+
+
+def test_analyze_trace_reconciles_profiles_per_layer_for_full_hybrid_case(
+    dask_client,
+    full_hybrid_trace_path,
+    tmp_path,
+):
+    analyzer = make_analyzer(
+        tmp_path=tmp_path,
+        time_granularity=5,
+        preset=AnalyzerPresetConfigDLIOAILogging(),
+    )
+
+    result = analyzer.analyze_trace(
+        trace_path=str(full_hybrid_trace_path),
+        view_types=["proc_name", "time_range"],
+    )
+
+    assert result.profiles is not None
+
+    app_hlm = result.get_hlm("app").compute().reset_index()
+    compute_hlm = result.get_hlm("compute").compute().reset_index()
+    data_hlm = result.get_hlm("data_loader").compute().reset_index()
+    posix_hlm = result.get_hlm("posix").compute().reset_index()
+
+    assert set(app_hlm["func_name"]) == {"ai_root"}
+    assert set(compute_hlm["func_name"]) == {"compute"}
+    assert set(data_hlm["func_name"]) == {"item"}
+    assert set(posix_hlm["func_name"]) == {"read", "open64"}
+
+    assert int(compute_hlm.iloc[0]["count"]) == 2
+    assert int(data_hlm.iloc[0]["count"]) == 3
+    assert int(posix_hlm.set_index("func_name").loc["open64", "count"]) == 3

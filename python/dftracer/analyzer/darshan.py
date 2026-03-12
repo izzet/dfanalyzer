@@ -93,8 +93,10 @@ class DarshanAnalyzer(Analyzer):
             layer_main_views={Layer.POSIX: file_name_view},
             logical_view_types=logical_view_types,
             metric_boundaries=metric_boundaries,
+            profile_hlm=None,
             proc_view_types=self.ensure_proc_view_type(view_types=view_types),
             raw_stats=raw_stats,
+            trace_hlm=None,
         )
 
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):

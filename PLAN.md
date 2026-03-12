@@ -127,3 +127,8 @@ Immediate follow-up notes after walking the merge path:
 - Enforce profile-compatible analysis granularity strictly. The current hybrid path is only exact when the analysis granularity is `5s` or an integer multiple of `5s`; non-aligned values such as `6s` or `7s` need real rebucketing/resolution matching and should be rejected for now.
 - Add an explicit HLM overlap diagnostic during reconcile. The current reconcile policy is "trace wins on exact HLM-key collisions", so we should log how many exact overlaps exist whenever hybrid HLM is built.
 - Deferred on purpose: add a profile-side equivalent of `postread_trace()` filtering. Right now traces go through ignored-file / ignored-function filtering, but profiles do not. Park this until after the current granularity and overlap diagnostics are in place.
+
+Follow-up design note for `dft-agg-full`:
+- The current global `trace_hlm` + `profile_hlm` reconcile is acceptable for `dft-agg-selective` because the profile side is effectively just POSIX.
+- For `dft-agg-full`, profiles contribute rows to multiple layers (`posix`, `data`, `compute`, `dataloader`, `device`, `comm`), so reconciliation should move into the per-layer `layer_hlm` loop rather than happen once above all layers.
+- Separate concern, explicitly deferred for now: if `file_name` is included in `view_types`, fileless profile rows are lost during HLM grouping before the layer loop runs. This is not unique to hybrid profiles, and for now we accept it as a view-selection limitation rather than widening the current implementation scope.
