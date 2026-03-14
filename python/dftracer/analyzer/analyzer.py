@@ -1206,9 +1206,17 @@ class Analyzer(abc.ABC):
 
         # Recompute time_start / time_end / time_range for each sub-bucket
         base_start = np.repeat(df["time_start"].values, expansion_factor)
-        expanded["time_start"] = (base_start + sub_idx * sub_granularity_us).astype("Int64")
-        expanded["time_end"] = (expanded["time_start"] + sub_granularity_us).astype("Int64")
-        expanded["time_range"] = (expanded["time_start"] // sub_granularity_us).astype("Int64")
+        expanded["time_start"] = pd.array(
+            (base_start + sub_idx * sub_granularity_us).astype(np.int64), dtype="Int64"
+        )
+        expanded["time_end"] = pd.array(
+            (expanded["time_start"].to_numpy(dtype=np.int64, na_value=0) + sub_granularity_us),
+            dtype="Int64",
+        )
+        expanded["time_range"] = pd.array(
+            expanded["time_start"].to_numpy(dtype=np.int64, na_value=0) // sub_granularity_us,
+            dtype="Int64",
+        )
 
         # Distribute measures
         if distribution == "weighted":
@@ -1245,10 +1253,14 @@ class Analyzer(abc.ABC):
 
         orig_size = df["size"].values
         has_size = pd.notna(orig_size)
-        rep_size = np.repeat(orig_size, expansion_factor)
+        rep_size = np.repeat(
+            np.where(has_size, orig_size.astype(float), 0.0), expansion_factor
+        )
         rep_has_size = np.repeat(has_size, expansion_factor)
-        size_arr = np.where(rep_has_size, rep_size / expansion_factor, pd.NA)
-        expanded["size"] = pd.array(size_arr, dtype="Int64")
+        size_vals = np.where(rep_has_size, (rep_size / expansion_factor).astype(np.int64), 0)
+        size_mask = ~rep_has_size
+        expanded["size"] = pd.array(size_vals, dtype="Int64")
+        expanded.loc[size_mask, "size"] = pd.NA
 
         # stat columns carry through unchanged (they are per-event bounds)
         expanded.reset_index(drop=True, inplace=True)
