@@ -151,17 +151,20 @@ def set_proc_name_parts(df: pd.DataFrame):
 
 
 def set_size_bins(df: pd.DataFrame):
-    df['size_bin_temp'] = pd.cut(
+    size_bins = pd.cut(
         df['size'],
         bins=SIZE_BINS,
         labels=SIZE_BIN_SUFFIXES,
         right=True,
         include_lowest=True,
     )
-    size_bin_dummies = pd.get_dummies(df['size_bin_temp'], prefix='size_bin', dtype=int)
-    df = pd.concat([df, size_bin_dummies], axis=1)
-    df = df.drop('size_bin_temp', axis=1)
-    return df
+    size_bin_dummies = pd.get_dummies(size_bins, prefix='size_bin', dtype=int)
+    # Ensure all expected size_bin columns exist (needed for Dask partition consistency)
+    for suffix in SIZE_BIN_SUFFIXES:
+        col = f"size_bin_{suffix}"
+        if col not in size_bin_dummies.columns:
+            size_bin_dummies[col] = 0
+    return pd.concat([df, size_bin_dummies], axis=1)
 
 
 def set_unique_counts(df: pd.DataFrame, layer: str):
