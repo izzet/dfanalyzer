@@ -578,6 +578,12 @@ class DFTracerAnalyzer(Analyzer):
             host_hashes = host_hashes.persist()
             string_hashes = string_hashes.persist()
             metadata = metadata.persist()
+        # Ensure merge key dtypes match (file_hash/host_hash may be float64
+        # when all values are NaN, e.g. AI-only events with POSIX disabled).
+        if "file_hash" in traces.columns:
+            traces["file_hash"] = traces["file_hash"].astype(str)
+        if "host_hash" in traces.columns:
+            traces["host_hash"] = traces["host_hash"].astype(str)
         traces = traces.merge(
             file_hashes.rename(columns={"name": COL_FILE_NAME}),
             how="left",

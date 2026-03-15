@@ -56,6 +56,7 @@ class WindowBuffer:
         if window_for_pid > 0:
             event["window"] = window_for_pid
             event["epoch"] = window_for_pid
+            event["step"] = window_for_pid
             self.seen_pids_by_window.setdefault(window_for_pid, set()).add(pid)
             self.buffer_by_window.setdefault(window_for_pid, []).append(event)
 
@@ -90,6 +91,8 @@ class CompletedWindowBoundary:
     window_index: int
     boundary_ts_ns: int
     ranks_received: int
+    events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
 
 
 @dc.dataclass
@@ -97,6 +100,8 @@ class _PendingWindowBoundary:
     window_index: int
     boundary_ts_ns: int = 0
     ranks_seen: Set[int] = dc.field(default_factory=set)
+    events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
 
 
 class WindowBoundaryTracker:
@@ -107,17 +112,20 @@ class WindowBoundaryTracker:
     analyzer window as slower ranks still finishing window N.
     """
 
-    def __init__(self, num_ranks: int):
+    def __init__(self, num_ranks: int, require_explicit_start: bool = False):
         self.num_ranks = num_ranks
+        self.require_explicit_start = require_explicit_start
         self.active_window_by_pid: Dict[int, int] = {}
         self.completed_window_by_pid: Dict[int, int] = {}
         self.pending_by_window: Dict[int, _PendingWindowBoundary] = {}
         self.next_window_to_emit = 1
 
-    def current_window(self, pid: int) -> int:
+    def current_window(self, pid: int) -> Optional[int]:
         active_window = self.active_window_by_pid.get(pid)
         if active_window is not None:
             return active_window
+        if self.require_explicit_start:
+            return None
         return self.completed_window_by_pid.get(pid, 0) + 1 or 1
 
     def next_window(self, pid: int) -> int:
@@ -129,7 +137,7 @@ class WindowBoundaryTracker:
             return completed_window + 1
         return active_window
 
-    def observe_start_boundary(self, pid: int) -> int:
+    def observe_start_boundary(self, pid: int, events_written: Optional[int] = None) -> int:
         next_window = self.completed_window_by_pid.get(pid, 0) + 1
         active_window = self.active_window_by_pid.get(pid)
         if active_window is None or active_window < next_window:
@@ -143,11 +151,32 @@ class WindowBoundaryTracker:
             )
         else:
             logger.debug("window.start.duplicate", pid=pid, window=active_window)
-        return self.active_window_by_pid[pid]
+        window_index = self.active_window_by_pid[pid]
+        pending = self.pending_by_window.setdefault(
+            window_index,
+            _PendingWindowBoundary(window_index=window_index),
+        )
+        if events_written is not None and events_written > 0:
+            current_start = pending.start_events_written_by_pid.get(pid)
+            if current_start is None:
+                pending.start_events_written_by_pid[pid] = events_written
+        return window_index
 
-    def observe_end_boundary(self, pid: int, boundary_ts_ns: int) -> List[CompletedWindowBoundary]:
+    def observe_end_boundary(
+        self,
+        pid: int,
+        boundary_ts_ns: int,
+        events_written: Optional[int] = None,
+    ) -> List[CompletedWindowBoundary]:
         window_index = self.active_window_by_pid.get(pid)
         if window_index is None:
+            if self.require_explicit_start:
+                logger.warning(
+                    "window.boundary.without_start",
+                    pid=pid,
+                    boundary_ts_ns=boundary_ts_ns,
+                )
+                return []
             window_index = self.completed_window_by_pid.get(pid, 0) + 1
             self.active_window_by_pid[pid] = window_index
 
@@ -162,6 +191,10 @@ class WindowBoundaryTracker:
             return []
 
         self.completed_window_by_pid[pid] = window_index
+        # An end boundary closes the active window for this pid. Clearing the
+        # active assignment allows end-only control streams to advance to the
+        # next window even when no explicit start boundary is emitted.
+        self.active_window_by_pid.pop(pid, None)
 
         pending = self.pending_by_window.setdefault(
             window_index,
@@ -173,6 +206,8 @@ class WindowBoundaryTracker:
             pending.ranks_seen.add(pid)
         if boundary_ts_ns > pending.boundary_ts_ns:
             pending.boundary_ts_ns = boundary_ts_ns
+        if events_written is not None and events_written > 0:
+            pending.events_written_by_pid[pid] = events_written
 
         completed: List[CompletedWindowBoundary] = []
         while True:
@@ -184,6 +219,8 @@ class WindowBoundaryTracker:
                     window_index=next_pending.window_index,
                     boundary_ts_ns=next_pending.boundary_ts_ns,
                     ranks_received=len(next_pending.ranks_seen),
+                    events_written_by_pid=dict(next_pending.events_written_by_pid),
+                    start_events_written_by_pid=dict(next_pending.start_events_written_by_pid),
                 )
             )
             self.pending_by_window.pop(self.next_window_to_emit, None)

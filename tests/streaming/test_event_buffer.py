@@ -156,7 +156,7 @@ def test_window_boundary_tracker_exposes_current_and_next_window_labels():
 
     assert tracker.observe_start_boundary(pid=7) == 1
     assert tracker.observe_end_boundary(pid=7, boundary_ts_ns=10) == []
-    assert tracker.current_window(7) == 1
+    assert tracker.current_window(7) == 2
     assert tracker.next_window(7) == 2
 
 
@@ -171,3 +171,20 @@ def test_window_boundary_tracker_uses_start_markers_for_active_window_assignment
     assert tracker.observe_start_boundary(pid=3) == 2
     assert tracker.current_window(3) == 2
     assert tracker.observe_end_boundary(pid=3, boundary_ts_ns=20)[0].window_index == 2
+
+
+def test_window_boundary_tracker_advances_with_end_only_boundaries():
+    tracker = WindowBoundaryTracker(num_ranks=2)
+
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=100) == []
+    assert tracker.observe_end_boundary(pid=2, boundary_ts_ns=120)[0].window_index == 1
+
+    assert tracker.current_window(1) == 2
+    assert tracker.current_window(2) == 2
+
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=200) == []
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=220)
+    assert len(completed) == 1
+    assert completed[0].window_index == 2
+    assert completed[0].ranks_received == 2
+    assert completed[0].boundary_ts_ns == 220

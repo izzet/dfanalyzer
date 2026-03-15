@@ -1,6 +1,6 @@
 import abc
 import dataclasses as dc
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 import dask
 import dask.dataframe as dd
 import hashlib
@@ -11,6 +11,7 @@ import os
 import pandas as pd
 import signal
 import structlog
+import time
 from betterset import BetterSet as S
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
@@ -365,6 +366,7 @@ class Analyzer(abc.ABC):
             normalized_extra_columns = extra_columns.copy() if extra_columns else None
             if normalized_extra_columns:
                 normalized_extra_columns.pop("epoch", None)
+                normalized_extra_columns.pop("step", None)
                 normalized_extra_columns.pop("window", None)
 
             normalized_event = self.normalize_stream_event(
@@ -406,6 +408,12 @@ class Analyzer(abc.ABC):
         metric_boundaries: ViewMetricBoundaries = {},
         epoch_start_name: str = "epoch.start",
         epoch_end_name: str = "epoch.block",
+        control_window_start_name: Optional[str] = None,
+        control_window_end_name: Optional[str] = None,
+        step_trigger_name: Optional[str] = None,
+        step_trigger_every: int = 0,
+        step_trigger_warmup: int = 0,
+        trace_drain_grace_ms: int = 5000,
         process_key: str = "pid",
         trace_consumer_name: Optional[str] = None,
         control_consumer_name: Optional[str] = None,
@@ -441,20 +449,86 @@ class Analyzer(abc.ABC):
         normalized_extra_columns = extra_columns.copy() if extra_columns else None
         if normalized_extra_columns:
             normalized_extra_columns.pop("epoch", None)
+            normalized_extra_columns.pop("step", None)
             normalized_extra_columns.pop("window", None)
 
-        window_tracker = WindowBoundaryTracker(num_ranks=num_ranks)
-        window_start_name = epoch_start_name
-        window_end_name = epoch_end_name
+        selected_control_window_start_name = (control_window_start_name or "").strip()
+        selected_control_window_end_name = (control_window_end_name or "").strip()
+        window_tracker = WindowBoundaryTracker(
+            num_ranks=num_ranks,
+            require_explicit_start=bool(selected_control_window_start_name),
+        )
+        window_start_name = selected_control_window_start_name or epoch_start_name
+        window_end_name = selected_control_window_end_name or epoch_end_name
+        selected_step_trigger_name = (step_trigger_name or "").strip()
+        selected_step_trigger_every = max(step_trigger_every, 0)
+        selected_step_trigger_warmup = max(step_trigger_warmup, 0)
+        selected_trace_drain_grace_ms = max(trace_drain_grace_ms, 0)
 
         control_wait_timeout_ms = 1000
         trace_drain_timeout_ms = 100
         pending_trace_event: Optional[Tuple[dict, Optional[int]]] = None
 
-        def _normalize_trace_event(mofka_event) -> Tuple[Optional[dict], Optional[int]]:
-            """Normalize a trace event and return it with its timestamp (us)."""
+        def _parse_control_int(control_event: dict, key: str) -> Optional[int]:
+            value = control_event.get(key)
+            if value is None or value == "":
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _should_close_on_step_trigger(control_event: dict) -> bool:
+            if not selected_step_trigger_name or selected_step_trigger_every <= 0:
+                return False
+            pid = _parse_control_int(control_event, "pid")
+            if pid is None or pid < 0:
+                logger.debug(
+                    "mofka.step_boundary.skipped",
+                    reason="missing_pid",
+                    trigger=control_event.get("trigger_event_name"),
+                    pid=control_event.get("pid"),
+                )
+                return False
+            step = _parse_control_int(control_event, "step")
+            if step is not None and step > 0:
+                boundary_kind = "step"
+                boundary_value = step
+            else:
+                step_trigger_counts_by_pid[pid] += 1
+                boundary_kind = "trigger_count"
+                boundary_value = step_trigger_counts_by_pid[pid]
+            if boundary_value <= selected_step_trigger_warmup:
+                logger.debug(
+                    "mofka.step_boundary.skipped",
+                    reason="warmup",
+                    trigger=control_event.get("trigger_event_name"),
+                    pid=pid,
+                    boundary_kind=boundary_kind,
+                    boundary_value=boundary_value,
+                    warmup=selected_step_trigger_warmup,
+                )
+                return False
+            if boundary_value % selected_step_trigger_every != 0:
+                logger.debug(
+                    "mofka.step_boundary.skipped",
+                    reason="cadence",
+                    trigger=control_event.get("trigger_event_name"),
+                    pid=pid,
+                    boundary_kind=boundary_kind,
+                    boundary_value=boundary_value,
+                    every=selected_step_trigger_every,
+                )
+                return False
+            return True
+
+        def _normalize_trace_event(
+            mofka_event,
+        ) -> Tuple[Optional[dict], Optional[int], Optional[int]]:
+            """Normalize a trace event and return it with timestamp/pid context."""
             trace_event = mofka_event.metadata
             event_ts = None
+            event_pid = None
             normalized_event = None
             if isinstance(trace_event, dict):
                 normalized_event = self.normalize_stream_event(
@@ -466,12 +540,26 @@ class Analyzer(abc.ABC):
                     event_ts = int(trace_event.get("ts", 0))
                 except (TypeError, ValueError):
                     pass
+                raw_pid = trace_event.get(process_key)
+                if raw_pid is None and isinstance(normalized_event, dict):
+                    raw_pid = normalized_event.get(process_key)
+                try:
+                    if raw_pid is not None:
+                        event_pid = int(raw_pid)
+                except (TypeError, ValueError):
+                    event_pid = None
 
             if hasattr(mofka_event, "acknowledge"):
                 mofka_event.acknowledge()
-            return normalized_event, event_ts
+            return normalized_event, event_ts, event_pid
 
-        def _append_trace_event_to_window(normalized_event: Optional[dict], sink_events: List[dict]) -> None:
+        def _append_trace_event_to_window(
+            normalized_event: Optional[dict],
+            sink_events: List[dict],
+            *,
+            window_index: Optional[int] = None,
+            start_counts: Optional[Dict[int, int]] = None,
+        ) -> None:
             if not isinstance(normalized_event, dict):
                 return
             event_pid = normalized_event.get(process_key)
@@ -480,12 +568,70 @@ class Analyzer(abc.ABC):
                 return
 
             event_pid = int(event_pid)
+            if start_counts and event_pid in start_counts:
+                if trace_events_seen_by_pid.get(event_pid, 0) <= start_counts[event_pid]:
+                    return
             event_with_window = dict(normalized_event)
-            current_window = window_tracker.current_window(event_pid)
+            current_window = window_index
+            if current_window is None:
+                current_window = window_tracker.current_window(event_pid)
+            if current_window is None:
+                return
             event_with_window["window"] = current_window
             # Keep the historical epoch field for downstream schema compatibility.
             event_with_window["epoch"] = current_window
+            event_with_window["step"] = current_window
             sink_events.append(event_with_window)
+
+        trace_events_seen_by_pid = defaultdict(int)
+        pending_trace_events = deque()
+        step_trigger_counts_by_pid = defaultdict(int)
+
+        def _targets_satisfied(target_counts: Dict[int, int]) -> bool:
+            if not target_counts:
+                return False
+            return all(trace_events_seen_by_pid.get(pid, 0) >= target for pid, target in target_counts.items())
+
+        def _event_exceeds_target(event_pid: Optional[int], target_counts: Dict[int, int]) -> bool:
+            if event_pid is None:
+                return False
+            if event_pid not in target_counts:
+                return False
+            return trace_events_seen_by_pid.get(event_pid, 0) >= target_counts[event_pid]
+
+        def _record_trace_event(
+            normalized_event: Optional[dict],
+            event_pid: Optional[int],
+            sink_events: List[dict],
+            *,
+            window_index: Optional[int] = None,
+            start_counts: Optional[Dict[int, int]] = None,
+        ) -> None:
+            if event_pid is not None:
+                trace_events_seen_by_pid[event_pid] += 1
+            _append_trace_event_to_window(
+                normalized_event,
+                sink_events,
+                window_index=window_index,
+                start_counts=start_counts,
+            )
+
+        def _pop_pending_event_for_window(target_counts: Dict[int, int]):
+            if not pending_trace_events:
+                return None
+            skipped_events = deque()
+            selected_event = None
+            while pending_trace_events:
+                candidate = pending_trace_events.popleft()
+                _, _, event_pid = candidate
+                if _event_exceeds_target(event_pid, target_counts):
+                    skipped_events.append(candidate)
+                    continue
+                selected_event = candidate
+                break
+            while skipped_events:
+                pending_trace_events.appendleft(skipped_events.pop())
+            return selected_event
 
         try:
             control_future = control_consumer.pull()
@@ -518,7 +664,10 @@ class Analyzer(abc.ABC):
                     control_mofka_event.acknowledge()
 
                 if trigger_name == window_start_name:
-                    started_window = window_tracker.observe_start_boundary(pid)
+                    started_window = window_tracker.observe_start_boundary(
+                        pid,
+                        events_written=events_written,
+                    )
                     logger.info(
                         "mofka.window.start",
                         pid=pid,
@@ -526,7 +675,16 @@ class Analyzer(abc.ABC):
                         boundary_seq=events_written,
                     )
                     continue
-                if trigger_name != window_end_name:
+                close_reason = None
+                if trigger_name == window_end_name:
+                    close_reason = "hard_end"
+                elif (
+                    selected_step_trigger_name
+                    and trigger_name == selected_step_trigger_name
+                    and _should_close_on_step_trigger(control_event)
+                ):
+                    close_reason = "step_trigger"
+                if close_reason is None:
                     logger.debug(
                         "mofka.control_boundary.ignored",
                         pid=pid,
@@ -535,10 +693,15 @@ class Analyzer(abc.ABC):
                     )
                     continue
 
-                boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
+                boundary_ts_us = _parse_control_int(control_event, "trace_ts_us")
+                if boundary_ts_us is not None and boundary_ts_us > 0:
+                    boundary_ts_ns = boundary_ts_us * 1000
+                else:
+                    boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
                 completed_windows = window_tracker.observe_end_boundary(
                     pid=pid,
                     boundary_ts_ns=boundary_ts_ns,
+                    events_written=events_written,
                 )
 
                 for completed_window in completed_windows:
@@ -548,50 +711,141 @@ class Analyzer(abc.ABC):
                         ranks_received=completed_window.ranks_received,
                         num_ranks=num_ranks,
                         boundary_ts_ns=completed_window.boundary_ts_ns,
+                        close_reason=close_reason,
+                        trigger=trigger_name,
+                        step=_parse_control_int(control_event, "step"),
+                        epoch=_parse_control_int(control_event, "epoch"),
                     )
 
                     # Drain trace events up to this window boundary's timestamp.
+                    pulled_events = []
+                    target_counts = {
+                        int(boundary_pid): int(boundary_count)
+                        for boundary_pid, boundary_count in completed_window.events_written_by_pid.items()
+                        if boundary_count is not None and int(boundary_count) > 0
+                    }
                     boundary_ts_us = (
                         completed_window.boundary_ts_ns // 1000
                         if completed_window.boundary_ts_ns
                         else 0
                     )
-                    pulled_events = []
-                    can_drain_trace_stream = True
 
-                    if pending_trace_event is not None:
-                        normalized_event, event_ts = pending_trace_event
-                        if not boundary_ts_us or not event_ts or event_ts <= boundary_ts_us:
-                            _append_trace_event_to_window(normalized_event, pulled_events)
-                            pending_trace_event = None
-                        else:
-                            can_drain_trace_stream = False
+                    if target_counts:
+                        start_counts = {
+                            int(boundary_pid): int(boundary_count)
+                            for boundary_pid, boundary_count in completed_window.start_events_written_by_pid.items()
+                            if boundary_count is not None and int(boundary_count) > 0
+                        }
+                        drain_deadline = (
+                            time.monotonic()
+                            + (selected_trace_drain_grace_ms / 1000.0)
+                        )
+                        while not _targets_satisfied(target_counts):
+                            pending_event = _pop_pending_event_for_window(target_counts)
+                            if pending_event is not None:
+                                normalized_event, event_ts, event_pid = pending_event
+                                _record_trace_event(
+                                    normalized_event,
+                                    event_pid,
+                                    pulled_events,
+                                    window_index=completed_window.window_index,
+                                    start_counts=start_counts,
+                                )
+                                continue
 
-                    if can_drain_trace_stream:
-                        while True:
-                            trace_mofka_event = trace_future.wait(timeout_ms=trace_drain_timeout_ms)
+                            remaining_ms = int(
+                                max(
+                                    0.0,
+                                    min(
+                                        float(trace_drain_timeout_ms),
+                                        (drain_deadline - time.monotonic()) * 1000.0,
+                                    ),
+                                )
+                            )
+                            if remaining_ms <= 0:
+                                break
+                            trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
                             if trace_mofka_event is None:
-                                break
-                            normalized_event, event_ts = _normalize_trace_event(trace_mofka_event)
+                                continue
+                            normalized_event, event_ts, event_pid = _normalize_trace_event(trace_mofka_event)
                             trace_future = trace_consumer.pull()
-                            # Stop draining once we've passed the window boundary.
-                            if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
-                                pending_trace_event = (normalized_event, event_ts)
-                                break
-                            _append_trace_event_to_window(normalized_event, pulled_events)
+                            if _event_exceeds_target(event_pid, target_counts):
+                                pending_trace_events.append((normalized_event, event_ts, event_pid))
+                                continue
+                            _record_trace_event(
+                                normalized_event,
+                                event_pid,
+                                pulled_events,
+                                window_index=completed_window.window_index,
+                                start_counts=start_counts,
+                            )
+                    else:
+                        can_drain_trace_stream = True
+                        drain_deadline = (
+                            time.monotonic()
+                            + (selected_trace_drain_grace_ms / 1000.0)
+                        )
+
+                        if pending_trace_event is not None:
+                            normalized_event, event_ts = pending_trace_event
+                            if not boundary_ts_us or not event_ts or event_ts <= boundary_ts_us:
+                                _append_trace_event_to_window(
+                                    normalized_event,
+                                    pulled_events,
+                                    window_index=completed_window.window_index,
+                                )
+                                pending_trace_event = None
+                            else:
+                                can_drain_trace_stream = False
+
+                        if can_drain_trace_stream:
+                            while True:
+                                remaining_ms = int(
+                                    max(
+                                        0.0,
+                                        min(
+                                            float(trace_drain_timeout_ms),
+                                            (drain_deadline - time.monotonic()) * 1000.0,
+                                        ),
+                                    )
+                                )
+                                if remaining_ms <= 0:
+                                    break
+                                trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                                if trace_mofka_event is None:
+                                    continue
+                                normalized_event, event_ts, _event_pid = _normalize_trace_event(trace_mofka_event)
+                                trace_future = trace_consumer.pull()
+                                # Stop draining once we've passed the window boundary.
+                                if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                    pending_trace_event = (normalized_event, event_ts)
+                                    break
+                                _append_trace_event_to_window(
+                                    normalized_event,
+                                    pulled_events,
+                                    window_index=completed_window.window_index,
+                                )
 
                     if not pulled_events:
+                        logger.warning(
+                            "mofka.window.empty",
+                            window=completed_window.window_index,
+                            close_reason=close_reason,
+                            trigger=trigger_name,
+                            target_counts=target_counts,
+                            boundary_ts_us=boundary_ts_us,
+                        )
                         continue
 
                     # Log event category breakdown for debugging
-                    from collections import Counter
-
                     cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
                     name_sample = Counter(e.get("name", "?") for e in pulled_events)
                     logger.info(
                         "mofka.window.drain_summary",
                         window=completed_window.window_index,
                         event_count=len(pulled_events),
+                        target_counts=target_counts,
+                        seen_counts={pid: trace_events_seen_by_pid.get(pid, 0) for pid in sorted(target_counts)},
                         cat_counts=dict(cat_counts),
                         top_names=dict(name_sample.most_common(10)),
                     )
@@ -601,13 +855,25 @@ class Analyzer(abc.ABC):
                         view_types=proc_view_types,
                         extra_columns=extra_columns,
                     )
-                    result = self._analyze_trace(
-                        traces=traces,
-                        proc_view_types=proc_view_types,
-                        logical_view_types=logical_view_types,
-                        raw_stats={},
-                        metric_boundaries=metric_boundaries,
-                    )
+                    try:
+                        result = self._analyze_trace(
+                            traces=traces,
+                            proc_view_types=proc_view_types,
+                            logical_view_types=logical_view_types,
+                            raw_stats={},
+                            metric_boundaries=metric_boundaries,
+                        )
+                    except KeyError as exc:
+                        trace_columns = list(traces.columns) if hasattr(traces, "columns") else []
+                        logger.warning(
+                            "mofka.window.analysis_skipped_missing_column",
+                            window=completed_window.window_index,
+                            missing_column=str(exc),
+                            columns=trace_columns,
+                            event_count=len(pulled_events),
+                            target_counts=target_counts,
+                        )
+                        continue
                     logger.info(
                         "mofka.window.analysis_complete",
                         window=completed_window.window_index,
@@ -635,6 +901,12 @@ class Analyzer(abc.ABC):
         metric_boundaries: ViewMetricBoundaries = {},
         epoch_start_name: str = "epoch.start",
         epoch_end_name: str = "epoch.block",
+        control_window_start_name: Optional[str] = None,
+        control_window_end_name: Optional[str] = None,
+        step_trigger_name: Optional[str] = None,
+        step_trigger_every: int = 0,
+        step_trigger_warmup: int = 0,
+        trace_drain_grace_ms: int = 5000,
         process_key: str = "pid",
         control_topic_name: Optional[str] = None,
         trace_consumer_name: Optional[str] = None,
@@ -669,6 +941,12 @@ class Analyzer(abc.ABC):
             metric_boundaries=metric_boundaries,
             epoch_start_name=epoch_start_name,
             epoch_end_name=epoch_end_name,
+            control_window_start_name=control_window_start_name,
+            control_window_end_name=control_window_end_name,
+            step_trigger_name=step_trigger_name,
+            step_trigger_every=step_trigger_every,
+            step_trigger_warmup=step_trigger_warmup,
+            trace_drain_grace_ms=trace_drain_grace_ms,
             process_key=process_key,
             trace_consumer_name=trace_consumer_name,
             control_consumer_name=control_consumer_name,

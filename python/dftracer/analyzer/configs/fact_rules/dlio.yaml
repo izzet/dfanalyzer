@@ -20,6 +20,24 @@ rules:
       - dataloader_prefetch
       - reader_parallelism
 
+  - id: dlio.step.fetch_pressure.v1
+    priority: 101
+    source_view: step
+    fact_type: fetch_pressure
+    required_metrics:
+      - fetch_data_time_max
+      - compute_time_max
+    derived_metrics:
+      step_active_time: "fillna0(fetch_data_time_max) + fillna0(compute_time_max)"
+      fetch_frac_step: "fillna0(fetch_data_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
+      compute_frac_step: "fillna0(compute_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
+    when: "fetch_frac_step >= 0.20"
+    severity_score: "clip01((fetch_frac_step - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_frac_step - 0.20))"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
   - id: dlio.compute_dominance.v1
     priority: 90
     source_view: epoch
