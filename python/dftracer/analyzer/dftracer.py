@@ -529,7 +529,7 @@ class DFTracerAnalyzer(Analyzer):
         traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
         traces["ts"] = traces["ts"].astype("Int64")
         traces["te"] = traces["te"].astype("Int64")
-        traces["trange"] = traces["trange"].astype("Int16")
+        traces["trange"] = traces["trange"].fillna(0).astype("Int32")
         traces["dur"] = traces["dur"] / self.time_resolution
         logger.debug(
             "Fixed time columns",

@@ -20,6 +20,68 @@ rules:
       - dataloader_prefetch
       - reader_parallelism
 
+  - id: dlio.reader_open_pressure.v1
+    priority: 98
+    source_view: epoch
+    fact_type: reader_open_pressure
+    required_metrics:
+      - reader_open_time_max
+      - compute_time_max
+    derived_metrics:
+      reader_open_ratio: "fillna0(reader_open_time_max) / max(fillna0(compute_time_max), 1e-9)"
+    when: "reader_open_ratio > 1.05"
+    severity_score: "clip01((reader_open_ratio - 1.0) / 0.50)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_open_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: dlio.step.reader_open_pressure.v1
+    priority: 99
+    source_view: step
+    fact_type: reader_open_pressure
+    required_metrics:
+      - reader_open_time_max
+      - compute_time_max
+    derived_metrics:
+      reader_open_ratio: "fillna0(reader_open_time_max) / max(fillna0(compute_time_max), 1e-9)"
+    when: "reader_open_ratio > 1.05"
+    severity_score: "clip01((reader_open_ratio - 1.0) / 0.50)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_open_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: dlio.reader_posix_pressure.v1
+    priority: 97
+    source_view: epoch
+    fact_type: reader_posix_pressure
+    required_metrics:
+      - reader_posix_time_max
+      - compute_time_max
+    derived_metrics:
+      reader_posix_ratio: "fillna0(reader_posix_time_max) / max(fillna0(compute_time_max), 1e-9)"
+      reader_open_guard: "fillna0(reader_open_time_max)"
+    when: "reader_posix_ratio > 1.5 and reader_open_guard == 0"
+    severity_score: "clip01((reader_posix_ratio - 1.0) / 2.0)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_posix_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: dlio.step.reader_posix_pressure.v1
+    priority: 96
+    source_view: step
+    fact_type: reader_posix_pressure
+    required_metrics:
+      - reader_posix_time_max
+      - compute_time_max
+    derived_metrics:
+      reader_posix_ratio: "fillna0(reader_posix_time_max) / max(fillna0(compute_time_max), 1e-9)"
+      reader_open_guard: "fillna0(reader_open_time_max)"
+    when: "reader_posix_ratio > 1.5 and reader_open_guard == 0"
+    severity_score: "clip01((reader_posix_ratio - 1.0) / 2.0)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_posix_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
   - id: dlio.step.fetch_pressure.v1
     priority: 101
     source_view: step

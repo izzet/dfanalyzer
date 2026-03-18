@@ -306,9 +306,29 @@ class Analyzer(abc.ABC):
 
         context, consumer = open_consumer(address)
         logger.debug("ZMQ consumer started", address=address)
+
+        # Buffer for unpacking newline-delimited JSON batches from ZMQ messages.
+        pending_events: List[dict] = []
+
+        def pull_batch_event():
+            while not pending_events:
+                data = consumer.recv()
+                text = data.decode("utf-8", errors="replace")
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        pending_events.append(event)
+            return pending_events.pop(0)
+
         try:
             self._analyze_stream(
-                pull_event=consumer.recv_json,
+                pull_event=pull_batch_event,
                 view_types=view_types,
                 exclude_characteristics=exclude_characteristics,
                 logical_view_types=logical_view_types,
@@ -467,7 +487,8 @@ class Analyzer(abc.ABC):
 
         control_wait_timeout_ms = 1000
         trace_drain_timeout_ms = 100
-        pending_trace_event: Optional[Tuple[dict, Optional[int]]] = None
+        # pending_trace_events deque holds buffered events from batch splits
+        # (used by both target_counts and timestamp-based drain paths)
 
         def _parse_control_int(control_event: dict, key: str) -> Optional[int]:
             value = control_event.get(key)
@@ -522,36 +543,66 @@ class Analyzer(abc.ABC):
                 return False
             return True
 
-        def _normalize_trace_event(
-            mofka_event,
+        def _normalize_single_trace(
+            trace_event: dict,
         ) -> Tuple[Optional[dict], Optional[int], Optional[int]]:
-            """Normalize a trace event and return it with timestamp/pid context."""
-            trace_event = mofka_event.metadata
+            """Normalize a single trace event dict and return (event, ts, pid)."""
+            normalized_event = self.normalize_stream_event(
+                event=trace_event,
+                extra_columns=normalized_extra_columns,
+                extra_columns_fn=extra_columns_fn,
+            )
             event_ts = None
             event_pid = None
-            normalized_event = None
-            if isinstance(trace_event, dict):
-                normalized_event = self.normalize_stream_event(
-                    event=trace_event,
-                    extra_columns=normalized_extra_columns,
-                    extra_columns_fn=extra_columns_fn,
-                )
-                try:
-                    event_ts = int(trace_event.get("ts", 0))
-                except (TypeError, ValueError):
-                    pass
-                raw_pid = trace_event.get(process_key)
-                if raw_pid is None and isinstance(normalized_event, dict):
-                    raw_pid = normalized_event.get(process_key)
-                try:
-                    if raw_pid is not None:
-                        event_pid = int(raw_pid)
-                except (TypeError, ValueError):
-                    event_pid = None
+            try:
+                event_ts = int(trace_event.get("ts", 0))
+            except (TypeError, ValueError):
+                pass
+            raw_pid = trace_event.get(process_key)
+            if raw_pid is None and isinstance(normalized_event, dict):
+                raw_pid = normalized_event.get(process_key)
+            try:
+                if raw_pid is not None:
+                    event_pid = int(raw_pid)
+            except (TypeError, ValueError):
+                event_pid = None
+            return normalized_event, event_ts, event_pid
+
+        def _normalize_trace_event(
+            mofka_event,
+        ) -> List[Tuple[Optional[dict], Optional[int], Optional[int]]]:
+            """Unpack a Mofka trace event into one or more normalized events.
+
+            Supports both batched format (newline-delimited JSON in DataView)
+            and legacy single-event format (JSON in metadata).
+            """
+            results = []
+            metadata = mofka_event.metadata
+
+            if isinstance(metadata, dict) and metadata.get("type") == "batch":
+                # Batched format: events are in DataView as newline-delimited JSON
+                data = mofka_event.data
+                if isinstance(data, list):
+                    data = b"".join(data)
+                if isinstance(data, (bytes, bytearray)) and len(data) > 0:
+                    text = data.decode("utf-8", errors="replace")
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            trace_event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(trace_event, dict):
+                            results.append(_normalize_single_trace(trace_event))
+            elif isinstance(metadata, dict):
+                # Legacy single-event format: event JSON in metadata
+                results.append(_normalize_single_trace(metadata))
 
             if hasattr(mofka_event, "acknowledge"):
                 mofka_event.acknowledge()
-            return normalized_event, event_ts, event_pid
+            return results
 
         def _append_trace_event_to_window(
             normalized_event: Optional[dict],
@@ -767,18 +818,19 @@ class Analyzer(abc.ABC):
                             trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
                             if trace_mofka_event is None:
                                 continue
-                            normalized_event, event_ts, event_pid = _normalize_trace_event(trace_mofka_event)
+                            unpacked = _normalize_trace_event(trace_mofka_event)
                             trace_future = trace_consumer.pull()
-                            if _event_exceeds_target(event_pid, target_counts):
-                                pending_trace_events.append((normalized_event, event_ts, event_pid))
-                                continue
-                            _record_trace_event(
-                                normalized_event,
-                                event_pid,
-                                pulled_events,
-                                window_index=completed_window.window_index,
-                                start_counts=start_counts,
-                            )
+                            for normalized_event, event_ts, event_pid in unpacked:
+                                if _event_exceeds_target(event_pid, target_counts):
+                                    pending_trace_events.append((normalized_event, event_ts, event_pid))
+                                    continue
+                                _record_trace_event(
+                                    normalized_event,
+                                    event_pid,
+                                    pulled_events,
+                                    window_index=completed_window.window_index,
+                                    start_counts=start_counts,
+                                )
                     else:
                         can_drain_trace_stream = True
                         drain_deadline = (
@@ -786,20 +838,22 @@ class Analyzer(abc.ABC):
                             + (selected_trace_drain_grace_ms / 1000.0)
                         )
 
-                        if pending_trace_event is not None:
-                            normalized_event, event_ts = pending_trace_event
-                            if not boundary_ts_us or not event_ts or event_ts <= boundary_ts_us:
+                        # Drain any buffered events from previous batch splits.
+                        while pending_trace_events and can_drain_trace_stream:
+                            normalized_event, event_ts, _pid = pending_trace_events.popleft()
+                            if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                pending_trace_events.appendleft((normalized_event, event_ts, _pid))
+                                can_drain_trace_stream = False
+                            else:
                                 _append_trace_event_to_window(
                                     normalized_event,
                                     pulled_events,
                                     window_index=completed_window.window_index,
                                 )
-                                pending_trace_event = None
-                            else:
-                                can_drain_trace_stream = False
 
                         if can_drain_trace_stream:
-                            while True:
+                            past_boundary = False
+                            while not past_boundary:
                                 remaining_ms = int(
                                     max(
                                         0.0,
@@ -814,17 +868,19 @@ class Analyzer(abc.ABC):
                                 trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
                                 if trace_mofka_event is None:
                                     continue
-                                normalized_event, event_ts, _event_pid = _normalize_trace_event(trace_mofka_event)
+                                unpacked = _normalize_trace_event(trace_mofka_event)
                                 trace_future = trace_consumer.pull()
-                                # Stop draining once we've passed the window boundary.
-                                if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
-                                    pending_trace_event = (normalized_event, event_ts)
-                                    break
-                                _append_trace_event_to_window(
-                                    normalized_event,
-                                    pulled_events,
-                                    window_index=completed_window.window_index,
-                                )
+                                for normalized_event, event_ts, event_pid in unpacked:
+                                    # Buffer events past the window boundary for the next window.
+                                    if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                        pending_trace_events.append((normalized_event, event_ts, event_pid))
+                                        past_boundary = True
+                                        continue
+                                    _append_trace_event_to_window(
+                                        normalized_event,
+                                        pulled_events,
+                                        window_index=completed_window.window_index,
+                                    )
 
                     if not pulled_events:
                         logger.warning(
