@@ -159,6 +159,12 @@ def set_size_bins(df: pd.DataFrame):
         include_lowest=True,
     )
     size_bin_dummies = pd.get_dummies(df['size_bin_temp'], prefix='size_bin', dtype=int)
+    # Ensure all expected columns are present — pd.get_dummies returns an empty DataFrame
+    # when all size values are NaN, causing dask schema mismatches across partitions.
+    for suffix in SIZE_BIN_SUFFIXES:
+        col = f'size_bin_{suffix}'
+        if col not in size_bin_dummies.columns:
+            size_bin_dummies[col] = 0
     df = pd.concat([df, size_bin_dummies], axis=1)
     df = df.drop('size_bin_temp', axis=1)
     return df
