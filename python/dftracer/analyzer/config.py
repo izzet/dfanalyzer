@@ -4,7 +4,7 @@ import socket
 from hydra.core.config_store import ConfigStore
 from hydra.conf import HelpConf, JobConf
 from omegaconf import MISSING
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .constants import COL_TIME_RANGE
 from .types import ViewMetricBoundaries
@@ -40,7 +40,7 @@ class AdditionalFieldConfig:
 @dc.dataclass
 class TimeCorrelationConfig:
     enabled: bool = False
-    field: str = ""
+    field: Union[str, List[str]] = ""
     layer: Optional[str] = None
 
 
@@ -264,9 +264,12 @@ class AnalyzerPresetConfigAgentic(AnalyzerPresetConfig):
             'tool_name': AdditionalFieldConfig(source='args.tool_name', dtype='string', agg='unique_set'),
             'total_tokens': AdditionalFieldConfig(source='args.total_tokens', dtype='float64', agg='sum'),
             'workflow_id': AdditionalFieldConfig(source='args.workflow_id', dtype='string', agg='unique_set'),
+            'io_phase': AdditionalFieldConfig(source='args.io_phase', dtype='string', agg='unique_set'),
         }
     )
-    hlm_fields: List[str] = dc.field(default_factory=lambda: ["cat", "io_cat", "acc_pat", "func_name", "step"])
+    hlm_fields: List[str] = dc.field(
+        default_factory=lambda: ["cat", "io_cat", "acc_pat", "func_name", "step", "io_phase"]
+    )
     additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'proc_name': {
@@ -329,7 +332,11 @@ class AnalyzerPresetConfigAgentic(AnalyzerPresetConfig):
                 'evaluate': 'func_name == "evaluate"',
                 'retry': 'func_name == "retry"',
             },
-            'posix': DERIVED_POSIX_METRICS,
+            'posix': {
+                **DERIVED_POSIX_METRICS,
+                'solution': 'io_phase == "solution"',
+                'exploration': 'io_phase == "exploration"',
+            },
         }
     )
     layer_defs: Dict[str, Optional[str]] = dc.field(
@@ -372,14 +379,14 @@ class AnalyzerPresetConfigAgentic(AnalyzerPresetConfig):
     name: str = "agentic"
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
         default_factory=lambda: {
-            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+            'posix': list(DERIVED_POSIX_SIZE_METRICS) + ['solution', 'exploration'],
         }
     )
     size_layers: Optional[List[str]] = dc.field(default_factory=lambda: ['posix'])
     time_correlation: Optional[TimeCorrelationConfig] = dc.field(
         default_factory=lambda: TimeCorrelationConfig(
             enabled=True,
-            field="step",
+            field=["step", "io_phase"],
             layer="step",
         )
     )

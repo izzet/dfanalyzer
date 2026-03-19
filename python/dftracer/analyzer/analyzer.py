@@ -239,8 +239,7 @@ class Analyzer(abc.ABC):
 
     def _build_additional_field_extractor(self) -> Callable[[dict], dict]:
         field_specs = tuple(
-            (field_name, field_cfg.source, field_cfg.dtype)
-            for field_name, field_cfg in self.additional_fields.items()
+            (field_name, field_cfg.source, field_cfg.dtype) for field_name, field_cfg in self.additional_fields.items()
         )
 
         def extract_additional_fields(json_dict: dict) -> dict:
@@ -877,46 +876,67 @@ class Analyzer(abc.ABC):
         return traces
 
     def apply_time_correlation(self, traces: dd.DataFrame) -> dd.DataFrame:
-        """Propagate a field from source-layer events to all events via time-window overlap."""
+        """Propagate fields from source-layer events to all events via time-window overlap."""
         tc = self.preset.time_correlation
         if not tc or not tc.enabled or not tc.field:
             return traces
-        field = tc.field
-        if field not in traces.columns:
+        fields = [tc.field] if isinstance(tc.field, str) else list(tc.field)
+        fields = [f for f in fields if f in traces.columns]
+        if not fields:
             return traces
         if tc.layer and tc.layer in (self.preset.layer_defs or {}):
             layer_query = self.preset.layer_defs[tc.layer]
             source = traces.query(layer_query)
         else:
-            source = traces[traces[field].notna()]
-        boundaries = source[[COL_TIME_START, COL_TIME_END, field]].compute()
+            source = traces[traces[fields[0]].notna()]
+        boundary_cols = [COL_TIME_START, COL_TIME_END] + fields
+        boundaries = source[boundary_cols].compute()
         if boundaries.empty:
             return traces
         boundaries = boundaries.sort_values(COL_TIME_START).reset_index(drop=True)
-        traces = traces.map_partitions(self._correlate_partition, boundaries=boundaries, field=field)
+        traces = traces.map_partitions(
+            self._correlate_partition,
+            boundaries=boundaries,
+            fields=fields,
+        )
         return traces
 
     @staticmethod
-    def _correlate_partition(partition, boundaries, field):
-        """Assign field values to events based on time-window overlap with boundary events."""
+    def _correlate_partition(partition, boundaries, fields):
+        """Assign field values to events based on time-window overlap with boundary events.
+
+        Computes the time-window index mapping once, then fills all requested
+        fields in a single pass over the partition.
+        """
         partition = partition.copy()
-        needs_fill = partition[field].isna()
-        if not needs_fill.any():
+        boundary_starts = boundaries[COL_TIME_START].to_numpy(dtype='int64', na_value=0)
+        boundary_ends = boundaries[COL_TIME_END].to_numpy(dtype='int64', na_value=0)
+        if len(boundary_starts) == 0:
             return partition
-        starts = boundaries[COL_TIME_START].to_numpy(dtype='int64', na_value=0)
-        ends = boundaries[COL_TIME_END].to_numpy(dtype='int64', na_value=0)
-        values = boundaries[field].to_numpy(dtype='float64', na_value=np.nan)
-        fill_ts = partition.loc[needs_fill, COL_TIME_START]
-        event_starts = fill_ts.to_numpy(dtype='int64', na_value=0)
-        if len(event_starts) == 0 or len(starts) == 0:
-            return partition
-        indices = np.searchsorted(starts, event_starts, side='right') - 1
-        valid = (indices >= 0) & (indices < len(starts))
-        clipped = np.clip(indices, 0, max(len(starts) - 1, 0))
-        valid &= (event_starts >= starts[clipped]) & (event_starts <= ends[clipped])
-        result = np.full(len(event_starts), fill_value=np.nan, dtype='float64')
-        result[valid] = values[clipped[valid]]
-        partition.loc[needs_fill, field] = result
+
+        for field in fields:
+            needs_fill = partition[field].isna()
+            if not needs_fill.any():
+                continue
+            event_starts = partition.loc[needs_fill, COL_TIME_START].to_numpy(
+                dtype='int64',
+                na_value=0,
+            )
+            if len(event_starts) == 0:
+                continue
+            indices = np.searchsorted(boundary_starts, event_starts, side='right') - 1
+            valid = (indices >= 0) & (indices < len(boundary_starts))
+            clipped = np.clip(indices, 0, max(len(boundary_starts) - 1, 0))
+            valid &= (event_starts >= boundary_starts[clipped]) & (event_starts <= boundary_ends[clipped])
+            boundary_values = boundaries[field]
+            if pd.api.types.is_string_dtype(boundary_values):
+                values = boundary_values.to_numpy(dtype='object')
+                result = np.full(len(event_starts), fill_value=None, dtype='object')
+            else:
+                values = boundary_values.to_numpy(dtype='float64', na_value=np.nan)
+                result = np.full(len(event_starts), fill_value=np.nan, dtype='float64')
+            result[valid] = values[clipped[valid]]
+            partition.loc[needs_fill, field] = result
         return partition
 
     @staticmethod
@@ -1011,7 +1031,7 @@ class Analyzer(abc.ABC):
 
     def validate_time_granularity(self, hlm: dd.DataFrame, view_types: List[ViewType]):
         if "io_time" in hlm.columns:
-            max_io_time = hlm.groupby(view_types)["io_time"].sum().max().compute()
+            max_io_time = hlm.groupby(view_types, dropna=False)["io_time"].sum().max().compute()
             if max_io_time > self.time_granularity:
                 raise ValueError(
                     f"The max 'io_time' exceeds the 'time_granularity' '{self.time_granularity}'. "
@@ -1223,7 +1243,7 @@ class Analyzer(abc.ABC):
         hlm_fields_set = set(hlm_groupby)
         hlm_agg.update({k: v for k, v in additional_agg.items() if k not in hlm_fields_set})
         hlm = (
-            traces.groupby(hlm_groupby)
+            traces.groupby(hlm_groupby, dropna=False)
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
             .persist()
             .repartition(partition_size=partition_size)
@@ -1263,7 +1283,7 @@ class Analyzer(abc.ABC):
                 main_view_agg[col] = self._get_rollup_aggregation(col=col, view_type_suffixes=view_types_diff)
         with log_block("compute_main_view", layer=layer):
             main_view = (
-                hlm.groupby(list(view_types))
+                hlm.groupby(list(view_types), dropna=False)
                 .agg(main_view_agg, split_out=hlm.npartitions)
                 .map_partitions(set_main_metrics)
                 .replace(0, pd.NA)
@@ -1319,7 +1339,9 @@ class Analyzer(abc.ABC):
                     )
             view_agg.update(
                 {
-                    col: [unique_set_flatten() if view_type != COL_PROC_NAME and col != COL_PROC_NAME else unique_set()]
+                    col: [
+                        unique_set_flatten() if view_type != COL_PROC_NAME and col != COL_PROC_NAME else unique_set()
+                    ]
                     for col in local_view_types_diff
                 }
             )
@@ -1340,10 +1362,10 @@ class Analyzer(abc.ABC):
                         pre_group_agg[col] = unique_set()
                     else:
                         pre_group_agg[col] = self._get_rollup_aggregation(col=col, view_type_suffixes=view_types_diff)
-                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_group_agg).reset_index()
+                pre_view = pre_view.groupby([view_type, COL_PROC_NAME], dropna=False).agg(pre_group_agg).reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
+            view = pre_view.groupby([view_type], dropna=False).agg(view_agg).replace(0, pd.NA)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
             view = (
