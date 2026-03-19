@@ -426,13 +426,6 @@ class Analyzer(abc.ABC):
         exclude_characteristics: List[str] = [],
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        epoch_start_name: str = "epoch.start",
-        epoch_end_name: str = "epoch.block",
-        control_window_start_name: Optional[str] = None,
-        control_window_end_name: Optional[str] = None,
-        step_trigger_name: Optional[str] = None,
-        step_trigger_every: int = 0,
-        step_trigger_warmup: int = 0,
         trace_drain_grace_ms: int = 5000,
         process_key: str = "pid",
         trace_consumer_name: Optional[str] = None,
@@ -472,17 +465,12 @@ class Analyzer(abc.ABC):
             normalized_extra_columns.pop("step", None)
             normalized_extra_columns.pop("window", None)
 
-        selected_control_window_start_name = (control_window_start_name or "").strip()
-        selected_control_window_end_name = (control_window_end_name or "").strip()
+        # Window-based analysis: the Window class handles cadence gating.
+        # The analyzer processes every window.start / window.stop pair.
         window_tracker = WindowBoundaryTracker(
             num_ranks=num_ranks,
-            require_explicit_start=bool(selected_control_window_start_name),
+            require_explicit_start=True,
         )
-        window_start_name = selected_control_window_start_name or epoch_start_name
-        window_end_name = selected_control_window_end_name or epoch_end_name
-        selected_step_trigger_name = (step_trigger_name or "").strip()
-        selected_step_trigger_every = max(step_trigger_every, 0)
-        selected_step_trigger_warmup = max(step_trigger_warmup, 0)
         selected_trace_drain_grace_ms = max(trace_drain_grace_ms, 0)
 
         control_wait_timeout_ms = 1000
@@ -498,50 +486,6 @@ class Analyzer(abc.ABC):
                 return int(value)
             except (TypeError, ValueError):
                 return None
-
-        def _should_close_on_step_trigger(control_event: dict) -> bool:
-            if not selected_step_trigger_name or selected_step_trigger_every <= 0:
-                return False
-            pid = _parse_control_int(control_event, "pid")
-            if pid is None or pid < 0:
-                logger.debug(
-                    "mofka.step_boundary.skipped",
-                    reason="missing_pid",
-                    trigger=control_event.get("trigger_event_name"),
-                    pid=control_event.get("pid"),
-                )
-                return False
-            step = _parse_control_int(control_event, "step")
-            if step is not None and step > 0:
-                boundary_kind = "step"
-                boundary_value = step
-            else:
-                step_trigger_counts_by_pid[pid] += 1
-                boundary_kind = "trigger_count"
-                boundary_value = step_trigger_counts_by_pid[pid]
-            if boundary_value <= selected_step_trigger_warmup:
-                logger.debug(
-                    "mofka.step_boundary.skipped",
-                    reason="warmup",
-                    trigger=control_event.get("trigger_event_name"),
-                    pid=pid,
-                    boundary_kind=boundary_kind,
-                    boundary_value=boundary_value,
-                    warmup=selected_step_trigger_warmup,
-                )
-                return False
-            if boundary_value % selected_step_trigger_every != 0:
-                logger.debug(
-                    "mofka.step_boundary.skipped",
-                    reason="cadence",
-                    trigger=control_event.get("trigger_event_name"),
-                    pid=pid,
-                    boundary_kind=boundary_kind,
-                    boundary_value=boundary_value,
-                    every=selected_step_trigger_every,
-                )
-                return False
-            return True
 
         def _normalize_single_trace(
             trace_event: dict,
@@ -636,7 +580,6 @@ class Analyzer(abc.ABC):
 
         trace_events_seen_by_pid = defaultdict(int)
         pending_trace_events = deque()
-        step_trigger_counts_by_pid = defaultdict(int)
 
         def _targets_satisfied(target_counts: Dict[int, int]) -> bool:
             if not target_counts:
@@ -714,7 +657,7 @@ class Analyzer(abc.ABC):
                 if hasattr(control_mofka_event, "acknowledge"):
                     control_mofka_event.acknowledge()
 
-                if trigger_name == window_start_name:
+                if trigger_name == "window.start":
                     started_window = window_tracker.observe_start_boundary(
                         pid,
                         events_written=events_written,
@@ -727,14 +670,8 @@ class Analyzer(abc.ABC):
                     )
                     continue
                 close_reason = None
-                if trigger_name == window_end_name:
-                    close_reason = "hard_end"
-                elif (
-                    selected_step_trigger_name
-                    and trigger_name == selected_step_trigger_name
-                    and _should_close_on_step_trigger(control_event)
-                ):
-                    close_reason = "step_trigger"
+                if trigger_name == "window.stop":
+                    close_reason = "window_stop"
                 if close_reason is None:
                     logger.debug(
                         "mofka.control_boundary.ignored",
@@ -955,13 +892,6 @@ class Analyzer(abc.ABC):
         exclude_characteristics: List[str] = [],
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-        epoch_start_name: str = "epoch.start",
-        epoch_end_name: str = "epoch.block",
-        control_window_start_name: Optional[str] = None,
-        control_window_end_name: Optional[str] = None,
-        step_trigger_name: Optional[str] = None,
-        step_trigger_every: int = 0,
-        step_trigger_warmup: int = 0,
         trace_drain_grace_ms: int = 5000,
         process_key: str = "pid",
         control_topic_name: Optional[str] = None,
@@ -978,11 +908,10 @@ class Analyzer(abc.ABC):
             else os.getenv("DFTRACER_MOFKA_CONTROL_TOPIC_NAME", "")
         )
         if not resolved_control_topic:
-            # Keep analyzer aligned with dftracer writer defaults when env is unset.
             resolved_control_topic = "control_events"
 
         logger.debug(
-            "Mofka analyzer control mode",
+            "Mofka analyzer window mode",
             trace_topic=topic_name,
             control_topic=resolved_control_topic,
             num_ranks=num_ranks,
@@ -995,13 +924,6 @@ class Analyzer(abc.ABC):
             exclude_characteristics=exclude_characteristics,
             logical_view_types=logical_view_types,
             metric_boundaries=metric_boundaries,
-            epoch_start_name=epoch_start_name,
-            epoch_end_name=epoch_end_name,
-            control_window_start_name=control_window_start_name,
-            control_window_end_name=control_window_end_name,
-            step_trigger_name=step_trigger_name,
-            step_trigger_every=step_trigger_every,
-            step_trigger_warmup=step_trigger_warmup,
             trace_drain_grace_ms=trace_drain_grace_ms,
             process_key=process_key,
             trace_consumer_name=trace_consumer_name,

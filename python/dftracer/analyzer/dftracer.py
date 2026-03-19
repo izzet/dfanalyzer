@@ -151,8 +151,8 @@ def io_function(json_dict: dict):
             d["file_hash"] = str(json_dict["args"]["fhash"])
         if "size_sum" in json_dict["args"]:
             d["size"] = int(json_dict["args"]["size_sum"])
-        elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
-            name = json_dict["name"]
+        elif json_dict.get("cat") in [CAT_POSIX, CAT_STDIO]:
+            name = json_dict.get("name", "")
             io_cat = get_io_cat(name)
             if "ret" in json_dict["args"]:
                 size = int(json_dict["args"]["ret"])
@@ -222,27 +222,28 @@ def load_objects_dict(
                     step = int(json_dict["args"]["step"])
                     if step > 0:
                         final_dict["step"] = step
-            if "M" == json_dict["ph"]:
-                if final_dict["name"] == "FH":
-                    final_dict["type"] = 1  # 1-> file hash
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "HH":
-                    final_dict["type"] = 2  # 2-> hostname hash
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "SH":
-                    final_dict["type"] = 3  # 3-> string hash
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "PR":
-                    final_dict["type"] = 5  # 5-> process metadata
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
+            if "M" == json_dict.get("ph"):
+                if "name" in final_dict:
+                    if final_dict["name"] == "FH":
+                        final_dict["type"] = 1  # 1-> file hash
+                        if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
+                            final_dict["name"] = json_dict["args"]["name"]
+                            final_dict["hash"] = str(json_dict["args"]["value"])
+                    elif final_dict["name"] == "HH":
+                        final_dict["type"] = 2  # 2-> hostname hash
+                        if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
+                            final_dict["name"] = json_dict["args"]["name"]
+                            final_dict["hash"] = str(json_dict["args"]["value"])
+                    elif final_dict["name"] == "SH":
+                        final_dict["type"] = 3  # 3-> string hash
+                        if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
+                            final_dict["name"] = json_dict["args"]["name"]
+                            final_dict["hash"] = str(json_dict["args"]["value"])
+                    elif final_dict["name"] == "PR":
+                        final_dict["type"] = 5  # 5-> process metadata
+                        if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
+                            final_dict["name"] = json_dict["args"]["name"]
+                            final_dict["hash"] = str(json_dict["args"]["value"])
                 else:
                     final_dict["type"] = 4  # 4-> others
                     if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
@@ -250,7 +251,7 @@ def load_objects_dict(
                         final_dict["value"] = str(json_dict["args"]["value"])
             else:
                 final_dict["type"] = 0  # 0->regular event
-                if "dur" in json_dict:
+                if "dur" in json_dict and "ts" in json_dict:
                     if type(json_dict["dur"]) is not int:
                         json_dict["dur"] = int(json_dict["dur"])
                     if type(json_dict["ts"]) is not int:
