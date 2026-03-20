@@ -182,7 +182,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             },
         }
     )
-    name: str = "dlio"
+    name: str = "dlio-prev"
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
         default_factory=lambda: {
             'posix': list(DERIVED_POSIX_SIZE_METRICS),
@@ -202,6 +202,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
+    name: str = "dlio"
     layer_defs: Dict[str, Optional[str]] = dc.field(
         default_factory=lambda: {
             'app': 'func_name == "ai_root"',
