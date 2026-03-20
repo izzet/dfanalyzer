@@ -23,6 +23,71 @@ from .constants import (
 logger = structlog.get_logger()
 
 
+
+def build_view_rename_map(columns):
+    """Build a column rename dict for view-level statistics.
+
+    Renames per-process stats (e.g., time_min → time_proc_min) and
+    fixes double-suffixed per-call stats (e.g., time_call_min_min → time_call_min).
+    """
+    rename_map = {}
+    for col in columns:
+        if col.endswith("_call_min_min"):
+            rename_map[col] = col[: -len("_min")]
+        elif col.endswith("_call_max_max"):
+            rename_map[col] = col[: -len("_max")]
+        elif col.endswith("_min") and not col.endswith("_call_min"):
+            rename_map[col] = col[: -len("_min")] + "_proc_min"
+        elif col.endswith("_max") and not col.endswith("_call_max"):
+            rename_map[col] = col[: -len("_max")] + "_proc_max"
+        elif col.endswith("_mean"):
+            rename_map[col] = col[: -len("_mean")] + "_proc_mean"
+        elif col.endswith("_std"):
+            rename_map[col] = col[: -len("_std")] + "_proc_std"
+    return rename_map
+
+
+def derive_call_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive per-call mean and std from sum-of-squares support columns.
+
+    For each column ending in '_sq_sum', computes:
+      - {prefix}_call_mean = sum / count
+      - {prefix}_call_std  = sqrt(sq/n - mean^2)
+    Then drops the support column.
+    """
+    sq_cols = [c for c in df.columns if c.endswith("_sq_sum")]
+    if not sq_cols:
+        return df
+    df = df.copy()
+    for sq_col in sq_cols:
+        prefix = sq_col[: -len("_sq_sum")]
+        sum_col = f"{prefix}_sum"
+
+        # Determine the count column for this metric family
+        if prefix in ("time", "size"):
+            count_col = "count_sum"
+        elif prefix.endswith("_time"):
+            count_col = prefix[: -len("time")] + "count_sum"
+        elif prefix.endswith("_size"):
+            count_col = prefix[: -len("size")] + "count_sum"
+        else:
+            continue
+
+        if sum_col not in df.columns or count_col not in df.columns:
+            continue
+
+        n = df[count_col].astype("Float64")
+        s = df[sum_col].astype("Float64")
+        sq = df[sq_col].astype("Float64")
+        mean = s / n
+        var = (sq / n - mean**2).clip(lower=0)
+        df[f"{prefix}_call_mean"] = mean
+        df[f"{prefix}_call_std"] = var ** 0.5
+
+    df = df.drop(columns=sq_cols)
+    return df
+
+
 def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
     if df.empty:
         return df
