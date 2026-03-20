@@ -95,6 +95,7 @@ TYPE_STRING_HASH = 3
 TYPE_METADATA = 4
 TYPE_PROC_METADATA = 5
 TYPE_PROFILE = 6
+TYPE_SYSTEM = 7
 PROFILE_COLUMN_MAPPING = {
     "count": "Int64",
     "count_max": "Int64",
@@ -153,6 +154,27 @@ PROFILE_IDENTITY_COLUMNS = [
     col for col in PROFILE_OUTPUT_COLUMNS
     if col not in PROFILE_MEASURE_COLUMNS and col not in PROFILE_STAT_COLUMNS
 ]
+
+# System metric columns extracted from cat="sys" ph="C" events
+SYSTEM_CPU_METRICS = ["user_pct", "system_pct", "iowait_pct", "idle_pct", "irq_pct", "softirq_pct"]
+SYSTEM_MEMORY_METRICS = ["MemAvailable", "MemFree", "Cached", "Dirty", "Active"]
+SYSTEM_COLUMN_MAPPING = {
+    **{m: "float64" for m in SYSTEM_CPU_METRICS},
+    **{m: "float64" for m in SYSTEM_MEMORY_METRICS},
+}
+SYSTEM_OUTPUT_COLUMNS = {
+    "host_hash": "string",
+    COL_TIME_RANGE: "Int64",
+    "sys_cpu_iowait_pct": "float64",
+    "sys_cpu_user_pct": "float64",
+    "sys_cpu_system_pct": "float64",
+    "sys_cpu_idle_pct": "float64",
+    "sys_core_iowait_pct_max": "float64",
+    "sys_core_iowait_pct_p95": "float64",
+    "sys_mem_dirty": "float64",
+    "sys_mem_cached": "float64",
+    "sys_mem_available": "float64",
+}
 
 
 def create_index(filename):
@@ -258,6 +280,18 @@ def profile_function(json_dict: dict):
     return d
 
 
+def system_function(json_dict: dict):
+    """Extract CPU/memory metric args from a cat='sys' ph='C' event."""
+    args = json_dict.get("args", {})
+    d = {}
+    if "hhash" in args:
+        d["host_hash"] = str(args["hhash"])
+    for key in SYSTEM_COLUMN_MAPPING:
+        if key in args:
+            d[key] = float(args[key])
+    return d
+
+
 def load_indexed_gzip_files(filename, start, end):
     index_file = f"{filename}.idx"
     reader = Reader(filename, index_file)
@@ -327,13 +361,17 @@ def load_objects_dict(
                         final_dict["name"] = json_dict["args"]["name"]
                         final_dict["value"] = str(json_dict["args"]["value"])
             elif "C" == ph:
-                final_dict["type"] = TYPE_PROFILE
+                is_system = json_dict.get("cat", "").lower() == "sys"
+                final_dict["type"] = TYPE_SYSTEM if is_system else TYPE_PROFILE
                 if "ts" in json_dict:
                     if type(json_dict["ts"]) is not int:
                         json_dict["ts"] = int(json_dict["ts"])
                     final_dict["ts"] = json_dict["ts"]
-                final_dict.update(profile_function(json_dict))
-                final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
+                if is_system:
+                    final_dict.update(system_function(json_dict))
+                else:
+                    final_dict.update(profile_function(json_dict))
+                    final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
             else:
                 final_dict["type"] = TYPE_EVENT
                 if "dur" in json_dict:
@@ -462,12 +500,17 @@ class DFTracerAnalyzer(Analyzer):
             with log_block("to_dataframe"):
                 raw_traces = main_bag.to_dataframe(meta=self._columns)
             with log_block("_handle_metadata"):
-                traces, profiles = self._handle_metadata(raw_traces)
+                traces, profiles, system_events = self._handle_metadata(raw_traces)
             with log_block("compute_time_origin"):
-                trace_min, profile_min = dask.compute(traces["ts"].min(), profiles["ts"].min())
-                time_origin_candidates = [ts for ts in [trace_min, profile_min] if pd.notna(ts)]
+                trace_min, profile_min, system_min = dask.compute(
+                    traces["ts"].min(), profiles["ts"].min(), system_events["ts"].min()
+                )
+                time_origin_candidates = [
+                    ts for ts in [trace_min, profile_min, system_min] if pd.notna(ts)
+                ]
                 time_origin = min(time_origin_candidates) if time_origin_candidates else 0
                 has_profiles = pd.notna(profile_min)
+                has_system = pd.notna(system_min)
                 if has_profiles:
                     # DFTracer counter buckets are emitted on absolute 5s boundaries,
                     # while trace_min is arbitrary. Snap the shared origin down to the
@@ -487,10 +530,16 @@ class DFTracerAnalyzer(Analyzer):
                 traces = self._fix_time(traces, time_origin=time_origin).persist()
                 if profiles is not None:
                     profiles = self._standardize_profiles(profiles, time_origin=time_origin).persist()
+                if has_system:
+                    system_metrics = self._standardize_system(system_events, time_origin=time_origin).persist()
+                else:
+                    system_metrics = None
             with log_block("wait_all"):
                 wait_list = [traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata]
                 if profiles is not None:
                     wait_list.append(profiles)
+                if system_metrics is not None:
+                    wait_list.append(system_metrics)
                 wait(wait_list)
         else:
             logger.error("Unable to load traces")
@@ -499,6 +548,7 @@ class DFTracerAnalyzer(Analyzer):
             traces=self._rename_columns(traces),
             profiles=profiles,
             profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
+            system_metrics=system_metrics,
         )
 
     def postread_trace(
@@ -774,6 +824,86 @@ class DFTracerAnalyzer(Analyzer):
         ).astype("Int64")
         return profile_df[list(PROFILE_OUTPUT_COLUMNS)]
 
+    @staticmethod
+    def _standardize_system_partition(
+        df: pd.DataFrame,
+        time_origin: int,
+        time_granularity: float,
+        time_resolution: float,
+    ) -> pd.DataFrame:
+        """Aggregate raw system events into per-time_range system metric rows."""
+        empty = pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in SYSTEM_OUTPUT_COLUMNS.items()})
+        if df.empty:
+            return empty
+
+        df = df.copy()
+        bucket_width_us = int(time_granularity * time_resolution)
+        df[COL_TIME_RANGE] = ((df["ts"] - time_origin) // bucket_width_us).astype("Int64")
+
+        group_keys = ["host_hash", COL_TIME_RANGE]
+
+        # Aggregate CPU (name == "cpu"): mean of samples per bucket
+        agg_cpu = df[df["name"] == "cpu"]
+        cpu_agg = pd.DataFrame()
+        if not agg_cpu.empty:
+            agg_dict = {}
+            for m, out in [("iowait_pct", "sys_cpu_iowait_pct"),
+                           ("user_pct", "sys_cpu_user_pct"),
+                           ("system_pct", "sys_cpu_system_pct"),
+                           ("idle_pct", "sys_cpu_idle_pct")]:
+                if m in agg_cpu.columns:
+                    agg_dict[out] = (m, "mean")
+            if agg_dict:
+                cpu_agg = agg_cpu.groupby(group_keys).agg(**agg_dict).reset_index()
+
+        # Per-core cross-core stats (name starts with "cpu-")
+        per_core = df[df["name"].str.startswith("cpu-")]
+        core_agg = pd.DataFrame()
+        if not per_core.empty and "iowait_pct" in per_core.columns:
+            core_agg = per_core.groupby(group_keys).agg(
+                sys_core_iowait_pct_max=("iowait_pct", "max"),
+                sys_core_iowait_pct_p95=("iowait_pct", lambda x: x.quantile(0.95)),
+            ).reset_index()
+
+        # Memory (name == "memory"): mean of samples per bucket
+        mem = df[df["name"] == "memory"]
+        mem_agg = pd.DataFrame()
+        if not mem.empty:
+            mem_dict = {}
+            for m, out in [("Dirty", "sys_mem_dirty"),
+                           ("Cached", "sys_mem_cached"),
+                           ("MemAvailable", "sys_mem_available")]:
+                if m in mem.columns:
+                    mem_dict[out] = (m, "mean")
+            if mem_dict:
+                mem_agg = mem.groupby(group_keys).agg(**mem_dict).reset_index()
+
+        # Merge all on (host_hash, time_range)
+        dfs = [d for d in [cpu_agg, core_agg, mem_agg] if not d.empty]
+        if not dfs:
+            return empty
+
+        result = dfs[0]
+        for d in dfs[1:]:
+            result = result.merge(d, on=group_keys, how="outer")
+
+        for col, dtype in SYSTEM_OUTPUT_COLUMNS.items():
+            if col not in result.columns:
+                result[col] = pd.Series(dtype=dtype)
+            result[col] = result[col].astype(dtype)
+        return result[list(SYSTEM_OUTPUT_COLUMNS)]
+
+    def _standardize_system(self, system_events: dd.DataFrame, time_origin: int) -> dd.DataFrame:
+        """Standardize raw system events into per-time_range metrics."""
+        meta = pd.DataFrame({col: pd.Series(dtype=dtype) for col, dtype in SYSTEM_OUTPUT_COLUMNS.items()})
+        return system_events.map_partitions(
+            self._standardize_system_partition,
+            time_origin=time_origin,
+            time_granularity=self.time_granularity,
+            time_resolution=self.time_resolution,
+            meta=meta,
+        )
+
     def _get_columns(self, extra_columns: Optional[Dict[str, str]]):
         columns = {
             "name": "string",
@@ -797,19 +927,17 @@ class DFTracerAnalyzer(Analyzer):
         }
         columns.update(io_columns())
         columns.update(PROFILE_COLUMN_MAPPING)
+        columns.update(SYSTEM_COLUMN_MAPPING)
         columns.update(metadata_columns)
         columns.update(extra_columns or {})
         logger.debug("get_columns", columns=columns)
         return columns
 
-    def _handle_metadata(self, raw_traces: dd.DataFrame) -> Tuple[dd.DataFrame, dd.DataFrame]:
-        # print('=' * 33)
-        # print('Handling metadata:\n')
-        # print('>Raw traces:\n')
-        # print(raw_traces)
+    def _handle_metadata(self, raw_traces: dd.DataFrame) -> Tuple[dd.DataFrame, dd.DataFrame, dd.DataFrame]:
         is_dask = isinstance(raw_traces, dd.DataFrame)
         traces = raw_traces.query(f"type == {TYPE_EVENT}")
         profiles = raw_traces.query(f"type == {TYPE_PROFILE}")
+        system_events = raw_traces.query(f"type == {TYPE_SYSTEM}")
         file_hashes = raw_traces.query(f"type == {TYPE_FILE_HASH}")[["name", "hash"]].groupby("hash").first()
         host_hashes = raw_traces.query(f"type == {TYPE_HOST_HASH}")[["name", "hash"]].groupby("hash").first()
         string_hashes = raw_traces.query(f"type == {TYPE_STRING_HASH}")[["name", "hash"]].groupby("hash").first()
@@ -822,20 +950,13 @@ class DFTracerAnalyzer(Analyzer):
             host_hashes = host_hashes.persist()
             string_hashes = string_hashes.persist()
             metadata = metadata.persist()
-        # print('file_hash dtype', traces["file_hash"].dtype)
-        # print('host_hash dtype', traces["host_hash"].dtype)
-        # print('file_hash index dtype', file_hashes.index.dtype)
-        # print('host_hash index dtype', host_hashes.index.dtype)
         traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
         profiles = self._attach_metadata(profiles, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes
         self._host_hashes = host_hashes
         self._string_hashes = string_hashes
         self._metadata = metadata
-        # print('>Traces:\n')
-        # print(traces)
-        # print('=' * 33)
-        return traces, profiles
+        return traces, profiles, system_events
 
     @staticmethod
     def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):

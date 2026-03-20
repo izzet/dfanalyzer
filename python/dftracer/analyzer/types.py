@@ -56,6 +56,7 @@ class ReadTraceResult:
     traces: dd.DataFrame
     profiles: Optional[dd.DataFrame] = None
     profile_time_granularity: Optional[float] = None
+    system_metrics: Optional[dd.DataFrame] = None
 
 
 @dc.dataclass
@@ -230,6 +231,12 @@ class AnalysisResult:
         if self._read_result is None:
             return None
         return self._read_result.profiles
+
+    @property
+    def system_metrics(self) -> Optional[dd.DataFrame]:
+        if self._read_result is None:
+            return None
+        return self._read_result.system_metrics
 
     def get_flat_view(self, view_key_type: Union[ViewKey, ViewType]) -> pd.DataFrame:
         if not isinstance(view_key_type, tuple):

@@ -30,6 +30,7 @@ from .constants import (
     COL_HOST_NAME,
     COL_PROC_NAME,
     COL_TIME_END,
+    COL_TIME_RANGE,
     COL_TIME_START,
     VIEW_TYPES,
     Layer,
@@ -232,6 +233,12 @@ class Analyzer(abc.ABC):
         # Validate time granularity
         # self.validate_time_granularity(hlm=hlm, view_types=hlm_view_types)
 
+        # Compute system metrics (small table, safe to materialize)
+        system_metrics = None
+        if read_result.system_metrics is not None:
+            with log_block("compute_system_metrics"):
+                system_metrics = read_result.system_metrics.compute()
+
         # Analyze HLM
         result = self._analyze_hlm(
             hlm=hlm,
@@ -240,6 +247,7 @@ class Analyzer(abc.ABC):
             profile_hlm=profile_hlm,
             proc_view_types=proc_view_types,
             raw_stats=raw_stats,
+            system_metrics=system_metrics,
             trace_hlm=trace_hlm,
         )
 
@@ -925,6 +933,7 @@ class Analyzer(abc.ABC):
         raw_stats: RawStats,
         logical_view_types: bool,
         layer_main_views: Optional[Dict[Layer, dd.DataFrame]] = None,
+        system_metrics: Optional[pd.DataFrame] = None,
     ) -> AnalysisResult:
         """
         Analyze the high-level metrics (HLM) and compute views for each layer.
@@ -1078,6 +1087,7 @@ class Analyzer(abc.ABC):
                             flat_view=flat_views[view_key],
                             view_key=view_key,
                             metric_boundaries=metric_boundaries,
+                            system_metrics=system_metrics,
                         )
 
         # Checkpoint flat views if enabled
@@ -1442,6 +1452,7 @@ class Analyzer(abc.ABC):
         flat_view: pd.DataFrame,
         view_key: ViewKey,
         metric_boundaries: ViewMetricBoundaries,
+        system_metrics: Optional[pd.DataFrame] = None,
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
@@ -1466,6 +1477,12 @@ class Analyzer(abc.ABC):
                 flat_view,
                 view_key=view_key,
             )
+        if system_metrics is not None and not system_metrics.empty and COL_TIME_RANGE in view_key:
+            with log_block("join_system_metrics", view_key=view_key):
+                sys_cols = [c for c in system_metrics.columns if c.startswith("sys_")]
+                if sys_cols:
+                    sys_lookup = system_metrics.set_index(COL_TIME_RANGE)[sys_cols]
+                    flat_view = flat_view.join(sys_lookup, how="left")
         return flat_view.sort_index(axis=1)
 
     @staticmethod
