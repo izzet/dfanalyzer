@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-
 import pandas as pd
 import pytest
 from dask.distributed import Client, LocalCluster
@@ -16,6 +15,8 @@ from dftracer.analyzer.dftracer import (
     SYSTEM_OUTPUT_COLUMNS,
     TYPE_SYSTEM,
 )
+
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 # ---------------------------------------------------------------------------

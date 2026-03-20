@@ -1,11 +1,12 @@
 import json
-
 import pytest
 from dask.distributed import Client, LocalCluster
 from omegaconf import OmegaConf
 
 from dftracer.analyzer.config import AnalyzerPresetConfigDLIOAILogging, AnalyzerPresetConfigPOSIX
 from dftracer.analyzer.dftracer import DFTracerAnalyzer
+
+pytestmark = [pytest.mark.smoke, pytest.mark.full]
 
 
 TRACE_CONTENT = [
