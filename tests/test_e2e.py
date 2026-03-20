@@ -13,6 +13,7 @@ full_analyzer_trace_params = [
     ("darshan", "posix", "tests/data/extracted/darshan-posix"),
     ("darshan", "posix", "tests/data/extracted/darshan-posix-dxt"),
     ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio"),
+    ("dftracer", "dlio-prev", "tests/data/extracted/dftracer-dlio-prev"),
     ("dftracer", "posix", "tests/data/extracted/dftracer-posix"),
     ("recorder", "posix", "tests/data/extracted/recorder-posix-parquet"),
 ]
@@ -138,7 +139,7 @@ def _test_e2e(
     if os.getenv("DFANALYZER_DEBUG", "").lower() in {"1", "true", "yes"}:
         hydra_overrides.append("debug=True")
 
-    assign_epochs = analyzer == "dftracer" and preset == "dlio"
+    assign_epochs = analyzer == "dftracer" and preset.startswith("dlio")
     if assign_epochs:
         hydra_overrides.append("analyzer.assign_epochs=True")
 
