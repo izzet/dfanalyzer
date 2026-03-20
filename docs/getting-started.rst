@@ -56,51 +56,56 @@ This command analyzes the traces and prints a high-level summary of the applicat
 
 .. code-block:: none
 
-                                                   Time Period Summary
-   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
-   ┃ Metric                                                                        ┃ Unit           ┃              Value ┃
-   ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┩
-   │ Job Time                                                                      │ seconds        │             56.695 │
-   │ Total Count                                                                   │ count          │             15,901 │
-   │ Total Files                                                                   │ count          │                 87 │
-   │ Total Nodes                                                                   │ count          │                  0 │
-   │ Total Processes                                                               │ count          │                 23 │
-   │ App Count                                                                     │ count          │                  8 │
-   │ Training Count                                                                │ count          │                 40 │
-   │ Compute Count                                                                 │ count          │                200 │
-   │ Fetch Data Count                                                              │ count          │                160 │
-   │ Data Loader Count                                                             │ count          │                808 │
-   │ Data Loader Fork Count                                                        │ count          │                 96 │
-   │ Reader Count                                                                  │ count          │              4,008 │
-   │ Reader POSIX (Lustre) Count                                                   │ count          │             10,432 │
-   │ Reader POSIX (Lustre) Size                                                    │ MB             │         111833.161 │
-   │ Reader POSIX (Lustre) Bandwidth                                               │ MB/s           │            874.982 │
-   │ Reader POSIX (Lustre) Avg Transfer Size                                       │ MB             │             10.720 │
-   │ Checkpoint Count                                                              │ count          │                  8 │
-   │ Checkpoint POSIX (Lustre) Count                                               │ count          │                 45 │
-   │ Checkpoint POSIX (Lustre) Size                                                │ MB             │              0.011 │
-   │ Checkpoint POSIX (Lustre) Bandwidth                                           │ MB/s           │              0.791 │
-   │ Checkpoint POSIX (Lustre) Avg Transfer Size                                   │ MB             │              0.000 │
-   │ Other POSIX Count                                                             │ count          │                 96 │
-   └───────────────────────────────────────────────────────────────────────────────┴────────────────┴────────────────────┘
+                                                     Time Period Summary
+   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┓
+   ┃ Metric                                                                    ┃ Unit             ┃                 Value ┃
+   ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━┩
+   │ Job Time                                                                  │ seconds          │                56.695 │
+   │ Total Count                                                               │ count            │                18,039 │
+   │ Total Files                                                               │ count            │                   166 │
+   │ Total Nodes                                                               │ count            │                     1 │
+   │ Total Processes                                                           │ count            │                     8 │
+   │ App Count                                                                 │ count            │                     8 │
+   │ Training Count                                                            │ count            │                     8 │
+   │ Epoch Count                                                               │ count            │                    40 │
+   │ Compute Count                                                             │ count            │                   200 │
+   │ Fetch Data Count                                                          │ count            │                   160 │
+   │ Checkpoint Count                                                          │ count            │                     8 │
+   │ Data Loader Count                                                         │ count            │                   816 │
+   │ Data Loader Fork Count                                                    │ count            │                    96 │
+   │ Reader Count                                                              │ count            │                 3,200 │
+   │ POSIX - All Count                                                         │ count            │                10,581 │
+   │ POSIX - All Size                                                          │ MB               │            111833.172 │
+   │ POSIX - All Bandwidth                                                     │ MB/s             │              6048.367 │
+   │ POSIX - All Avg Transfer Size                                             │ MB               │                10.569 │
+   │ POSIX - Reader Count                                                      │ count            │                10,432 │
+   │ POSIX - Reader Size                                                       │ MB               │            111833.161 │
+   │ POSIX - Reader Bandwidth                                                  │ MB/s             │              6095.909 │
+   │ POSIX - Reader Avg Transfer Size                                          │ MB               │                10.720 │
+   │ POSIX - Checkpoint Count                                                  │ count            │                    45 │
+   │ POSIX - Checkpoint Size                                                   │ MB               │                 0.011 │
+   │ POSIX - Checkpoint Bandwidth                                              │ MB/s             │                 2.525 │
+   │ POSIX - Checkpoint Avg Transfer Size                                      │ MB               │                 0.000 │
+   └───────────────────────────────────────────────────────────────────────────┴──────────────────┴───────────────────────┘
 
 DFAnalyzer also provides a detailed breakdown of performance metrics for each layer of the application. Here is a snippet of the "Layer Breakdown" section from the same run, which includes the percentage of time each layer overlaps with its parent layer:
 
 .. code-block:: none
 
-                                             Layer Breakdown (w/ overlap %)
-   ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
-   ┃ Layer                       ┃         Time (s) ┃            Ops ┃   Ops/sec ┃          Size (MB) ┃ Bandwidth (MB/s) ┃
-   ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
-   │ App                         │   441.967 (----) │       8 (----) │     0.018 │                  - │                - │
-   │ Training                    │   439.442 (----) │      40 (----) │     0.091 │                  - │                - │
-   │ Compute                     │   272.356 (----) │     200 (----) │     0.734 │                  - │                - │
-   │ Fetch Data                  │   126.179 ( 16%) │     160 ( 25%) │     1.268 │                  - │                - │
-   │ Data Loader                 │   151.471 ( 45%) │     808 ( 46%) │     5.334 │                  - │                - │
-   │ Data Loader Fork            │     2.392 (  0%) │      96 (  0%) │    40.135 │                  - │                - │
-   │ Reader                      │   299.992 ( 40%) │   4,008 ( 51%) │    13.360 │                  - │                - │
-   │ Reader POSIX (Lustre)       │   127.812 ( 45%) │  10,432 ( 48%) │    81.620 │  111833.161 ( 46%) │          874.982 │
-   │ Checkpoint                  │     0.014 (  0%) │       8 (  0%) │   571.551 │                  - │                - │
-   │ Checkpoint POSIX (Lustre)   │     0.014 (  0%) │      45 (  0%) │  3268.686 │       0.011 (  0%) │            0.791 │
-   │ Other POSIX                 │     2.392 (  0%) │      96 (  0%) │    40.135 │       0.000 (----) │                - │
-   └─────────────────────────────┴──────────────────┴────────────────┴───────────┴────────────────────┴──────────────────┘
+                                                Layer Breakdown (w/ overlap %)
+   ┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+   ┃ Layer                  ┃         Time (s) ┃             Ops ┃     Ops/sec ┃            Size (MB) ┃  Bandwidth (MB/s) ┃
+   ┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+   │ App                    │    55.246 (----) │        8 (----) │       0.145 │                    - │                 - │
+   │ Training               │    55.246 (----) │        8 (----) │       0.145 │                    - │                 - │
+   │ Epoch                  │    54.937 (----) │       40 (----) │       0.728 │                    - │                 - │
+   │ Compute                │    40.854 (----) │      200 (----) │       4.895 │                    - │                 - │
+   │ Fetch Data             │    16.889 (----) │      160 (----) │       9.474 │                    - │                 - │
+   │ Checkpoint             │     0.005 (----) │        8 (----) │    1762.503 │                    - │                 - │
+   │ Data Loader            │    21.871 ( 54%) │      816 ( 57%) │      37.310 │                    - │                 - │
+   │ Data Loader Fork       │     0.181 (  0%) │       96 (  0%) │     530.903 │                    - │                 - │
+   │ Reader                 │    21.480 ( 55%) │    3,200 ( 67%) │     148.979 │                    - │                 - │
+   │ POSIX - All            │    18.490 ( 54%) │   10,581 ( 59%) │     572.261 │    111833.172 ( 59%) │          6048.367 │
+   │ POSIX - Reader         │    18.346 ( 55%) │   10,432 ( 60%) │     568.637 │    111833.161 ( 59%) │          6095.909 │
+   │ POSIX - Checkpoint     │     0.004 (----) │       45 (----) │   10433.573 │         0.011 (----) │             2.525 │
+   └────────────────────────┴──────────────────┴─────────────────┴─────────────┴──────────────────────┴───────────────────┘
