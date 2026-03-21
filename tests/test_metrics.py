@@ -136,11 +136,17 @@ def test_set_view_metrics_process_based_basic():
     # frac_total values
     assert pytest.approx(out.loc[0, "count_frac_total"], rel=1e-6) == 6.0 / 8.0
     assert pytest.approx(out.loc[1, "count_frac_total"], rel=1e-6) == 2.0 / 8.0
-    assert pytest.approx(out.loc[0, "size_frac_total"], rel=1e-6) == 300.0 / 400.0
-    assert pytest.approx(out.loc[1, "size_frac_total"], rel=1e-6) == 100.0 / 400.0
-    assert pytest.approx(out.loc[0, "time_frac_total"], rel=1e-6) == 3.0 / 4.0
-    assert pytest.approx(out.loc[1, "time_frac_total"], rel=1e-6) == 1.0 / 4.0
-    # ops slope = time_frac_total / count_frac_total
+    assert pytest.approx(out.loc[0, "size_proc_frac_total"], rel=1e-6) == 300.0 / 400.0
+    assert pytest.approx(out.loc[1, "size_proc_frac_total"], rel=1e-6) == 100.0 / 400.0
+    # size_call_frac_total (same as proc when process-based, both from size_sum)
+    assert pytest.approx(out.loc[0, "size_call_frac_total"], rel=1e-6) == 300.0 / 400.0
+    assert pytest.approx(out.loc[1, "size_call_frac_total"], rel=1e-6) == 100.0 / 400.0
+    assert pytest.approx(out.loc[0, "time_proc_frac_total"], rel=1e-6) == 3.0 / 4.0
+    assert pytest.approx(out.loc[1, "time_proc_frac_total"], rel=1e-6) == 1.0 / 4.0
+    # time_call_frac_total (same as proc when process-based, both from time_sum)
+    assert pytest.approx(out.loc[0, "time_call_frac_total"], rel=1e-6) == 3.0 / 4.0
+    assert pytest.approx(out.loc[1, "time_call_frac_total"], rel=1e-6) == 1.0 / 4.0
+    # ops slope = time_proc_frac_total / count_frac_total
     assert pytest.approx(out.loc[0, "ops_slope"], rel=1e-6) == 1.0
     assert pytest.approx(out.loc[1, "ops_slope"], rel=1e-6) == 1.0
     # ops percentile ranks; equal slopes -> equal percentile
@@ -151,25 +157,34 @@ def test_set_view_metrics_process_based_basic():
 
 
 def test_set_view_metrics_non_process_based_basic():
-    # Uses time_max when not process-based
+    # Uses time_proc_max / size_proc_max when not process-based
     df = pd.DataFrame(
         {
             "count_sum": [6.0, 2.0],
             "size_sum": [300.0, 100.0],
-            "time_max": [3.0, 1.0],
+            "size_proc_max": [200.0, 80.0],
+            "time_sum": [5.0, 3.0],
+            "time_proc_max": [3.0, 1.0],
         }
     )
-    metric_boundaries = {"time_max": 10.0}
+    metric_boundaries = {"time_proc_max": 10.0}
 
     out = set_view_metrics(df.copy(), metric_boundaries=metric_boundaries, is_view_process_based=False)
 
-    assert pytest.approx(out.loc[0, "time_frac_total"], rel=1e-6) == 3.0 / 4.0
-    assert pytest.approx(out.loc[1, "time_frac_total"], rel=1e-6) == 1.0 / 4.0
-    # count/size fractions based on sums
+    assert pytest.approx(out.loc[0, "time_proc_frac_total"], rel=1e-6) == 3.0 / 4.0
+    assert pytest.approx(out.loc[1, "time_proc_frac_total"], rel=1e-6) == 1.0 / 4.0
+    # time_call_frac_total (from time_sum, not time_proc_max)
+    assert pytest.approx(out.loc[0, "time_call_frac_total"], rel=1e-6) == 5.0 / 8.0
+    assert pytest.approx(out.loc[1, "time_call_frac_total"], rel=1e-6) == 3.0 / 8.0
+    # count fractions based on sums
     assert pytest.approx(out.loc[0, "count_frac_total"], rel=1e-6) == 6.0 / 8.0
     assert pytest.approx(out.loc[1, "count_frac_total"], rel=1e-6) == 2.0 / 8.0
-    assert pytest.approx(out.loc[0, "size_frac_total"], rel=1e-6) == 300.0 / 400.0
-    assert pytest.approx(out.loc[1, "size_frac_total"], rel=1e-6) == 100.0 / 400.0
+    # size_proc_frac_total (from size_proc_max, not size_sum)
+    assert pytest.approx(out.loc[0, "size_proc_frac_total"], rel=1e-6) == 200.0 / 280.0
+    assert pytest.approx(out.loc[1, "size_proc_frac_total"], rel=1e-6) == 80.0 / 280.0
+    # size_call_frac_total (from size_sum)
+    assert pytest.approx(out.loc[0, "size_call_frac_total"], rel=1e-6) == 300.0 / 400.0
+    assert pytest.approx(out.loc[1, "size_call_frac_total"], rel=1e-6) == 100.0 / 400.0
     # ops slope defined and finite
     assert pytest.approx(out.loc[0, "ops_slope"], rel=1e-6) == (3 / 4) / (6 / 8)
     assert pytest.approx(out.loc[1, "ops_slope"], rel=1e-6) == (1 / 4) / (2 / 8)
@@ -213,10 +228,16 @@ def test_set_view_metrics_multiple_prefixes():
 
     # read_* fractions
     assert pytest.approx(out.loc[0, "read_count_frac_total"], rel=1e-6) == 4.0 / 10.0
-    assert pytest.approx(out.loc[0, "read_time_frac_total"], rel=1e-6) == 1.0 / 4.0
+    assert pytest.approx(out.loc[0, "read_time_proc_frac_total"], rel=1e-6) == 1.0 / 4.0
     # write_* fractions
     assert pytest.approx(out.loc[1, "write_count_frac_total"], rel=1e-6) == 8.0 / 10.0
-    assert pytest.approx(out.loc[1, "write_time_frac_total"], rel=1e-6) == 2.0 / 4.0
+    assert pytest.approx(out.loc[1, "write_time_proc_frac_total"], rel=1e-6) == 2.0 / 4.0
+    # size_call_frac_total (same as proc when process-based)
+    assert pytest.approx(out.loc[0, "read_size_call_frac_total"], rel=1e-6) == 40.0 / 100.0
+    assert pytest.approx(out.loc[1, "write_size_call_frac_total"], rel=1e-6) == 80.0 / 100.0
+    # time_call_frac_total (same as proc when process-based)
+    assert pytest.approx(out.loc[0, "read_time_call_frac_total"], rel=1e-6) == 1.0 / 4.0
+    assert pytest.approx(out.loc[1, "write_time_call_frac_total"], rel=1e-6) == 2.0 / 4.0
     # ops_slope & ops_percentile exist per family
     assert "read_ops_slope" in out.columns and "write_ops_slope" in out.columns
     assert "read_ops_percentile" in out.columns and "write_ops_percentile" in out.columns
@@ -224,7 +245,7 @@ def test_set_view_metrics_multiple_prefixes():
 
 
 def test_set_view_metrics_zero_size_sum_denominator_safe():
-    # Sum of size_sum is zero -> size_frac_total should be NA, not raise
+    # Sum of size_sum is zero -> size_proc_frac_total and size_call_frac_total should be NA
     df = pd.DataFrame(
         {
             "count_sum": [1.0, 2.0],
@@ -234,7 +255,8 @@ def test_set_view_metrics_zero_size_sum_denominator_safe():
     )
     metric_boundaries = {"time_sum": 10.0}
     out = set_view_metrics(df.copy(), metric_boundaries=metric_boundaries, is_view_process_based=True)
-    assert pd.isna(out.loc[0, "size_frac_total"]) and pd.isna(out.loc[1, "size_frac_total"])
+    assert pd.isna(out.loc[0, "size_proc_frac_total"]) and pd.isna(out.loc[1, "size_proc_frac_total"])
+    assert pd.isna(out.loc[0, "size_call_frac_total"]) and pd.isna(out.loc[1, "size_call_frac_total"])
     _assert_no_infinities(out)
 
 
@@ -256,7 +278,7 @@ def test_set_view_metrics_zero_count_sum_denominator_safe():
 
 
 def test_set_view_metrics_zero_time_denominator_safe_process_and_non():
-    # All time metrics zero -> time_frac_total should be NA
+    # All time metrics zero -> time_proc_frac_total should be NA
     df_proc = pd.DataFrame(
         {
             "count_sum": [1.0, 1.0],
@@ -265,17 +287,23 @@ def test_set_view_metrics_zero_time_denominator_safe_process_and_non():
         }
     )
     out_proc = set_view_metrics(df_proc.copy(), metric_boundaries={}, is_view_process_based=True)
-    assert pd.isna(out_proc.loc[0, "time_frac_total"]) and pd.isna(out_proc.loc[1, "time_frac_total"])
+    assert pd.isna(out_proc.loc[0, "time_proc_frac_total"]) and pd.isna(out_proc.loc[1, "time_proc_frac_total"])
+    assert pd.isna(out_proc.loc[0, "time_call_frac_total"]) and pd.isna(out_proc.loc[1, "time_call_frac_total"])
 
     df_non = pd.DataFrame(
         {
             "count_sum": [1.0, 1.0],
-            "size_sum": [10.0, 20.0],
-            "time_max": [0.0, 0.0],
+            "size_sum": [0.0, 0.0],
+            "size_proc_max": [0.0, 0.0],
+            "time_sum": [0.0, 0.0],
+            "time_proc_max": [0.0, 0.0],
         }
     )
     out_non = set_view_metrics(df_non.copy(), metric_boundaries={}, is_view_process_based=False)
-    assert pd.isna(out_non.loc[0, "time_frac_total"]) and pd.isna(out_non.loc[1, "time_frac_total"])
+    assert pd.isna(out_non.loc[0, "time_proc_frac_total"]) and pd.isna(out_non.loc[1, "time_proc_frac_total"])
+    assert pd.isna(out_non.loc[0, "time_call_frac_total"]) and pd.isna(out_non.loc[1, "time_call_frac_total"])
+    assert pd.isna(out_non.loc[0, "size_proc_frac_total"]) and pd.isna(out_non.loc[1, "size_proc_frac_total"])
+    assert pd.isna(out_non.loc[0, "size_call_frac_total"]) and pd.isna(out_non.loc[1, "size_call_frac_total"])
     _assert_no_infinities(out_proc)
     _assert_no_infinities(out_non)
 
@@ -305,36 +333,46 @@ def test_set_cross_layer_metrics_process_based_basic():
     )
 
     # Root boundary fractions present and correct (A_time / A_time)
-    assert pytest.approx(out.loc[0, "A_time_frac_A"], rel=1e-6) == 1.0
-    assert pytest.approx(out.loc[1, "A_time_frac_A"], rel=1e-6) == 1.0
-    assert pd.isna(out.loc[2, "A_time_frac_A"])  # 0/0 -> NA
+    assert pytest.approx(out.loc[0, "A_time_proc_frac_A"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[1, "A_time_proc_frac_A"], rel=1e-6) == 1.0
+    assert pd.isna(out.loc[2, "A_time_proc_frac_A"])  # 0/0 -> NA
 
     # Child boundary fractions: layer_time / A_time
-    assert pytest.approx(out.loc[0, "B_time_frac_A"], rel=1e-6) == 3.0 / 10.0
-    assert pytest.approx(out.loc[1, "B_time_frac_A"], rel=1e-6) == 8.0 / 8.0
-    assert pytest.approx(out.loc[0, "C_time_frac_A"], rel=1e-6) == 2.0 / 10.0
+    assert pytest.approx(out.loc[0, "B_time_proc_frac_A"], rel=1e-6) == 3.0 / 10.0
+    assert pytest.approx(out.loc[1, "B_time_proc_frac_A"], rel=1e-6) == 8.0 / 8.0
+    assert pytest.approx(out.loc[0, "C_time_proc_frac_A"], rel=1e-6) == 2.0 / 10.0
 
     # Overhead for A: max(A - B - C, 0)
     assert pytest.approx(out.loc[0, "o_A_time_sum"], rel=1e-6) == 5.0
     assert pytest.approx(out.loc[1, "o_A_time_sum"], rel=1e-6) == 0.0
-    assert pytest.approx(out.loc[0, "o_A_time_frac_self"], rel=1e-6) == 5.0 / 10.0
-    assert pytest.approx(out.loc[0, "o_A_time_frac_A"], rel=1e-6) == 5.0 / 10.0
+    assert pytest.approx(out.loc[0, "o_A_time_proc_frac_self"], rel=1e-6) == 5.0 / 10.0
+    assert pytest.approx(out.loc[0, "o_A_time_proc_frac_A"], rel=1e-6) == 5.0 / 10.0
     # Total overhead fraction across rows: 5 / (5 + 0 + 0)
-    assert pytest.approx(out.loc[0, "o_A_time_frac_total"], rel=1e-6) == 1.0
-    assert pytest.approx(out.loc[1, "o_A_time_frac_total"], rel=1e-6) == 0.0
+    assert pytest.approx(out.loc[0, "o_A_time_proc_frac_total"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[1, "o_A_time_proc_frac_total"], rel=1e-6) == 0.0
 
     # Child to parent fractions
-    assert pytest.approx(out.loc[0, "B_time_frac_parent"], rel=1e-6) == 3.0 / 10.0
-    assert pytest.approx(out.loc[1, "B_time_frac_parent"], rel=1e-6) == 8.0 / 8.0
+    assert pytest.approx(out.loc[0, "B_time_proc_frac_parent"], rel=1e-6) == 3.0 / 10.0
+    assert pytest.approx(out.loc[1, "B_time_proc_frac_parent"], rel=1e-6) == 8.0 / 8.0
 
     # Unoverlapped for async layer B: max(B - compute, 0)
     assert pytest.approx(out.loc[0, "u_B_time_sum"], rel=1e-6) == 0.0
     assert pytest.approx(out.loc[1, "u_B_time_sum"], rel=1e-6) == 7.0
     # Fractions
-    assert pytest.approx(out.loc[1, "u_B_time_frac_self"], rel=1e-6) == 7.0 / 8.0
-    assert pytest.approx(out.loc[1, "u_B_time_frac_A"], rel=1e-6) == 7.0 / 8.0
-    assert pytest.approx(out.loc[1, "u_B_time_frac_total"], rel=1e-6) == 1.0
-    assert pytest.approx(out.loc[1, "u_B_time_frac_parent"], rel=1e-6) == 7.0 / 8.0
+    assert pytest.approx(out.loc[1, "u_B_time_proc_frac_self"], rel=1e-6) == 7.0 / 8.0
+    assert pytest.approx(out.loc[1, "u_B_time_proc_frac_A"], rel=1e-6) == 7.0 / 8.0
+    assert pytest.approx(out.loc[1, "u_B_time_proc_frac_total"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[1, "u_B_time_proc_frac_parent"], rel=1e-6) == 7.0 / 8.0
+
+    # Call variants: for process-based views, call == proc (both use time_sum)
+    assert pytest.approx(out.loc[0, "A_time_call_frac_A"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[0, "B_time_call_frac_A"], rel=1e-6) == 3.0 / 10.0
+    assert pytest.approx(out.loc[0, "o_A_time_call_frac_self"], rel=1e-6) == 5.0 / 10.0
+    assert pytest.approx(out.loc[0, "o_A_time_call_frac_A"], rel=1e-6) == 5.0 / 10.0
+    assert pytest.approx(out.loc[0, "o_A_time_call_frac_total"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[0, "B_time_call_frac_parent"], rel=1e-6) == 3.0 / 10.0
+    assert pytest.approx(out.loc[1, "u_B_time_call_frac_self"], rel=1e-6) == 7.0 / 8.0
+    assert pytest.approx(out.loc[1, "u_B_time_call_frac_parent"], rel=1e-6) == 7.0 / 8.0
 
     # NA cleanup (no infinities)
     _assert_no_infinities(out)
@@ -345,9 +383,13 @@ def test_set_cross_layer_metrics_non_process_based_basic():
     async_layers = ["B"]
     df = pd.DataFrame(
         {
-            "A_time_max": [5.0, 0.0],
-            "B_time_max": [2.0, 0.0],
-            "compute_time_max": [1.0, 0.0],
+            "A_time_proc_max": [5.0, 0.0],
+            "B_time_proc_max": [2.0, 0.0],
+            "compute_time_proc_max": [1.0, 0.0],
+            # Call track always uses time_sum (aggregate across processes)
+            "A_time_sum": [12.0, 0.0],
+            "B_time_sum": [7.0, 0.0],
+            "compute_time_sum": [3.0, 0.0],
         }
     )
 
@@ -361,14 +403,45 @@ def test_set_cross_layer_metrics_non_process_based_basic():
         time_boundary_layer="A",
     )
 
-    # Root boundary fraction present
-    assert pytest.approx(out.loc[0, "A_time_frac_A"], rel=1e-6) == 1.0
-    assert pd.isna(out.loc[1, "A_time_frac_A"])  # 0/0 -> NA
+    # Proc: root boundary fraction
+    assert pytest.approx(out.loc[0, "A_time_proc_frac_A"], rel=1e-6) == 1.0
+    assert pd.isna(out.loc[1, "A_time_proc_frac_A"])  # 0/0 -> NA
 
-    # Unoverlapped for B with time_max
-    assert pytest.approx(out.loc[0, "u_B_time_max"], rel=1e-6) == 1.0
-    assert pytest.approx(out.loc[0, "u_B_time_frac_self"], rel=1e-6) == 1.0 / 2.0
-    assert pytest.approx(out.loc[0, "u_B_time_frac_A"], rel=1e-6) == 1.0 / 5.0
+    # Proc: unoverlapped for B with time_proc_max
+    assert pytest.approx(out.loc[0, "u_B_time_proc_max"], rel=1e-6) == 1.0
+    assert pytest.approx(out.loc[0, "u_B_time_proc_frac_self"], rel=1e-6) == 1.0 / 2.0
+    assert pytest.approx(out.loc[0, "u_B_time_proc_frac_A"], rel=1e-6) == 1.0 / 5.0
+
+    # Proc: overhead for A: max(5 - 2, 0) = 3
+    assert pytest.approx(out.loc[0, "o_A_time_proc_max"], rel=1e-6) == 3.0
+    assert pytest.approx(out.loc[0, "o_A_time_proc_frac_A"], rel=1e-6) == 3.0 / 5.0
+
+    # Proc: child to parent: B/A = 2/5
+    assert pytest.approx(out.loc[0, "B_time_proc_frac_parent"], rel=1e-6) == 2.0 / 5.0
+
+    # Call: boundary fractions (uses time_sum)
+    assert pytest.approx(out.loc[0, "A_time_call_frac_A"], rel=1e-6) == 1.0
+    assert pd.isna(out.loc[1, "A_time_call_frac_A"])  # 0/0 -> NA
+    assert pytest.approx(out.loc[0, "B_time_call_frac_A"], rel=1e-6) == 7.0 / 12.0
+
+    # Call: overhead for A: max(12 - 7, 0) = 5
+    assert pytest.approx(out.loc[0, "o_A_time_sum"], rel=1e-6) == 5.0
+    assert pytest.approx(out.loc[0, "o_A_time_call_frac_A"], rel=1e-6) == 5.0 / 12.0
+    assert pytest.approx(out.loc[0, "o_A_time_call_frac_self"], rel=1e-6) == 5.0 / 12.0
+
+    # Call: child to parent: B/A = 7/12
+    assert pytest.approx(out.loc[0, "B_time_call_frac_parent"], rel=1e-6) == 7.0 / 12.0
+
+    # Call: unoverlapped for B: max(7 - 3, 0) = 4
+    assert pytest.approx(out.loc[0, "u_B_time_sum"], rel=1e-6) == 4.0
+    assert pytest.approx(out.loc[0, "u_B_time_call_frac_self"], rel=1e-6) == 4.0 / 7.0
+    assert pytest.approx(out.loc[0, "u_B_time_call_frac_A"], rel=1e-6) == 4.0 / 12.0
+    assert pytest.approx(out.loc[0, "u_B_time_call_frac_parent"], rel=1e-6) == 4.0 / 12.0
+
+    # Verify proc and call differ (non-process-based view)
+    assert out.loc[0, "B_time_proc_frac_A"] != out.loc[0, "B_time_call_frac_A"]
+    assert out.loc[0, "o_A_time_proc_frac_A"] != out.loc[0, "o_A_time_call_frac_A"]
+
     _assert_no_infinities(out)
 
 
@@ -395,12 +468,18 @@ def test_set_cross_layer_metrics_zero_denominators_produce_na():
     )
 
     # Divisions by zero -> NA
-    assert pd.isna(out.loc[0, "A_time_frac_A"])  # 0/0
-    assert pd.isna(out.loc[0, "B_time_frac_A"])  # 1/0 -> NA after cleanup
-    assert pd.isna(out.loc[0, "B_time_frac_parent"])  # 1/0
+    assert pd.isna(out.loc[0, "A_time_proc_frac_A"])  # 0/0
+    assert pd.isna(out.loc[0, "B_time_proc_frac_A"])  # 1/0 -> NA after cleanup
+    assert pd.isna(out.loc[0, "B_time_proc_frac_parent"])  # 1/0
     # Unoverlapped 0 vs compute
     assert pytest.approx(out.loc[0, "u_B_time_sum"], rel=1e-6) == 0.0
-    assert pd.isna(out.loc[0, "u_B_time_frac_A"])  # 0/0
+    assert pd.isna(out.loc[0, "u_B_time_proc_frac_A"])  # 0/0
+
+    # Call variants: same zero-denominator behavior
+    assert pd.isna(out.loc[0, "A_time_call_frac_A"])  # 0/0
+    assert pd.isna(out.loc[0, "B_time_call_frac_A"])  # 1/0 -> NA
+    assert pd.isna(out.loc[0, "B_time_call_frac_parent"])  # 1/0
+    assert pd.isna(out.loc[0, "u_B_time_call_frac_A"])  # 0/0
     _assert_no_infinities(out)
 
 
@@ -428,13 +507,19 @@ def test_set_cross_layer_metrics_with_derived_metrics():
         time_boundary_layer="A",
     )
 
-    # Derived metric fractions
-    assert pytest.approx(out.loc[0, "A_foo_time_frac_A"], rel=1e-6) == 4.0 / 10.0
-    assert pytest.approx(out.loc[1, "A_foo_time_frac_A"], rel=1e-6) == 6.0 / 10.0
-    assert pytest.approx(out.loc[0, "A_foo_time_frac_parent"], rel=1e-6) == 4.0 / 10.0
-    assert pytest.approx(out.loc[1, "A_foo_time_frac_parent"], rel=1e-6) == 6.0 / 10.0
-    assert pytest.approx(out.loc[0, "A_foo_time_frac_total"], rel=1e-6) == 0.4
-    assert pytest.approx(out.loc[1, "A_foo_time_frac_total"], rel=1e-6) == 0.6
+    # Derived metric fractions (proc)
+    assert pytest.approx(out.loc[0, "A_foo_time_proc_frac_A"], rel=1e-6) == 4.0 / 10.0
+    assert pytest.approx(out.loc[1, "A_foo_time_proc_frac_A"], rel=1e-6) == 6.0 / 10.0
+    assert pytest.approx(out.loc[0, "A_foo_time_proc_frac_parent"], rel=1e-6) == 4.0 / 10.0
+    assert pytest.approx(out.loc[1, "A_foo_time_proc_frac_parent"], rel=1e-6) == 6.0 / 10.0
+    assert pytest.approx(out.loc[0, "A_foo_time_proc_frac_total"], rel=1e-6) == 0.4
+    assert pytest.approx(out.loc[1, "A_foo_time_proc_frac_total"], rel=1e-6) == 0.6
+
+    # Derived metric fractions (call): same as proc for process-based views
+    assert pytest.approx(out.loc[0, "A_foo_time_call_frac_A"], rel=1e-6) == 4.0 / 10.0
+    assert pytest.approx(out.loc[1, "A_foo_time_call_frac_A"], rel=1e-6) == 6.0 / 10.0
+    assert pytest.approx(out.loc[0, "A_foo_time_call_frac_parent"], rel=1e-6) == 4.0 / 10.0
+    assert pytest.approx(out.loc[0, "A_foo_time_call_frac_total"], rel=1e-6) == 0.4
     _assert_no_infinities(out)
 
 
@@ -461,10 +546,15 @@ def test_set_cross_layer_metrics_derived_metrics_zero_denoms():
         time_boundary_layer="A",
     )
 
-    assert pd.isna(out.loc[0, "A_foo_time_frac_A"])  # 0/0
-    assert pd.isna(out.loc[0, "A_foo_time_frac_parent"])  # 0/0
+    assert pd.isna(out.loc[0, "A_foo_time_proc_frac_A"])  # 0/0
+    assert pd.isna(out.loc[0, "A_foo_time_proc_frac_parent"])  # 0/0
     # total fraction is 0/0 as well -> NA for both rows
-    assert pd.isna(out.loc[0, "A_foo_time_frac_total"]) and pd.isna(out.loc[1, "A_foo_time_frac_total"])
+    assert pd.isna(out.loc[0, "A_foo_time_proc_frac_total"]) and pd.isna(out.loc[1, "A_foo_time_proc_frac_total"])
+
+    # Call variants: same zero-denominator behavior
+    assert pd.isna(out.loc[0, "A_foo_time_call_frac_A"])  # 0/0
+    assert pd.isna(out.loc[0, "A_foo_time_call_frac_parent"])  # 0/0
+    assert pd.isna(out.loc[0, "A_foo_time_call_frac_total"]) and pd.isna(out.loc[1, "A_foo_time_call_frac_total"])
     _assert_no_infinities(out)
 
 

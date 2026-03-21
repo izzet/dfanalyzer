@@ -182,7 +182,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             },
         }
     )
-    name: str = "dlio"
+    name: str = "dlio-prev"
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
         default_factory=lambda: {
             'posix': list(DERIVED_POSIX_SIZE_METRICS),
@@ -272,6 +272,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'checkpoint_posix': 'checkpoint',
         }
     )
+    name: str = "dlio"
 
 
 @dc.dataclass

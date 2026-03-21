@@ -93,7 +93,7 @@ class Output(abc.ABC):
             unique_process_count=int(raw_stats.unique_process_count),
         )
         is_process_based = view_key[-1] == COL_PROC_NAME
-        time_metric = 'time_sum' if is_process_based else 'time_max'
+        time_metric = 'time_sum' if is_process_based else 'time_proc_max'
         for layer in result.layers:
             times = flat_view.get(f"{layer}_{time_metric}", pd.Series([0.0]))
             time = times.max() if is_process_based else times.sum()

@@ -14,6 +14,8 @@ from omegaconf import OmegaConf
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .analysis_utils import (
+    build_view_rename_map,
+    derive_call_stats,
     fix_dtypes,
     fix_std_cols,
     set_file_dir,
@@ -1099,12 +1101,12 @@ class Analyzer(abc.ABC):
                         continue
                     view_type = view_key[-1]
                     top_layer = list(self.preset.layer_defs)[0]
-                    time_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_max"
+                    time_proc_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_proc_max"
                     with log_block("calculate_metric_boundary", view_key=view_key):
-                        time_boundary = flat_views[view_key][f"{top_layer}_{time_suffix}"].sum()
+                        time_boundary = flat_views[view_key][f"{top_layer}_{time_proc_suffix}"].sum()
                         metric_boundaries.setdefault(view_type, {})
                         for layer in self.preset.layer_defs:
-                            metric_boundaries[view_type][f"{layer}_{time_suffix}"] = time_boundary
+                            metric_boundaries[view_type][f"{layer}_{time_proc_suffix}"] = time_boundary
                     with log_block("process_flat_view", view_key=view_key):
                         # Process flat views to compute metrics and scores
                         flat_views[view_key] = self._process_flat_view(
@@ -1151,9 +1153,25 @@ class Analyzer(abc.ABC):
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
+        # Pre-compute alias columns for per-call statistics
+        traces = traces.assign(
+            time_sq=traces["time"] ** 2,
+            size_sq=traces["size"] ** 2,
+            time_call_min=traces["time"],
+            time_call_max=traces["time"],
+            size_call_min=traces["size"],
+            size_call_max=traces["size"],
+        )
         hlm_agg = dict(HLM_AGG)
         hlm_agg.update({col: "sum" for col in bin_cols})
         hlm_agg.update({col: unique_set() for col in view_types_diff})
+        # Per-call support columns
+        hlm_agg["time_sq"] = "sum"
+        hlm_agg["size_sq"] = "sum"
+        hlm_agg["time_call_min"] = "min"
+        hlm_agg["time_call_max"] = "max"
+        hlm_agg["size_call_min"] = "min"
+        hlm_agg["size_call_max"] = "max"
         hlm = (
             traces.groupby(hlm_groupby)
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
@@ -1394,7 +1412,12 @@ class Analyzer(abc.ABC):
                 if any(map(col.endswith, view_types_diff)):
                     main_view_agg[col] = unique_set_flatten()
                 elif col not in HLM_EXTRA_COLS:
-                    main_view_agg[col] = "sum"
+                    if col.endswith("_call_min"):
+                        main_view_agg[col] = "min"
+                    elif col.endswith("_call_max"):
+                        main_view_agg[col] = "max"
+                    else:
+                        main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
             main_view = (
                 hlm.groupby(list(view_types))
@@ -1429,6 +1452,12 @@ class Analyzer(abc.ABC):
                     view_agg[col] = [unique_set_flatten()]
                 elif col in it.chain.from_iterable(self.logical_views.values()):
                     view_agg[col] = [unique_set_flatten()]
+                elif col.endswith("_sq"):
+                    view_agg[col] = ["sum"]
+                elif col.endswith("_call_min"):
+                    view_agg[col] = ["min"]
+                elif col.endswith("_call_max"):
+                    view_agg[col] = ["max"]
                 elif pd.api.types.is_numeric_dtype(records[col].dtype):
                     view_agg[col] = [
                         "sum",
@@ -1457,14 +1486,26 @@ class Analyzer(abc.ABC):
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
             if view_type != COL_PROC_NAME:
-                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
+                pre_agg = {}
+                for col in pre_view.columns:
+                    if col in (view_type, COL_PROC_NAME):
+                        continue
+                    if col.endswith("_call_min"):
+                        pre_agg[col] = "min"
+                    elif col.endswith("_call_max"):
+                        pre_agg[col] = "max"
+                    else:
+                        pre_agg[col] = "sum"
+                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
             view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
+            view = view.rename(columns=build_view_rename_map(view.columns))
             view = (
-                view.map_partitions(set_unique_counts, layer=layer)
+                view.map_partitions(derive_call_stats)
+                .map_partitions(set_unique_counts, layer=layer)
                 .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
                 .persist()
             )
@@ -1516,13 +1557,13 @@ class Analyzer(abc.ABC):
     def _set_additional_metrics(self, view: pd.DataFrame, view_key: ViewKey, epsilon=1e-9) -> pd.DataFrame:
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
-        time_metric = "time_sum" if is_view_process_based else "time_max"
+        time_proc_metric = "time_sum" if is_view_process_based else "time_proc_max"
         view_additional_metrics = (self.preset.additional_metrics or {}).get(view_type, {})
         for metric, eval_condition in view_additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
                 time_interval=self.time_granularity,
-                time_metric=time_metric,
+                time_metric=time_proc_metric,
             )
             view = view.eval(f"{metric} = {eval_condition}")
             numerator_denominators = extract_numerator_and_denominators(eval_condition)
