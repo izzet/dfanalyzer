@@ -11,11 +11,11 @@ rules:
     source_view: epoch
     fact_type: fetch_pressure
     required_metrics:
-      - fetch_data_time_frac_parent
-      - compute_time_frac_parent
-    when: "fetch_data_time_frac_parent >= 0.20"
-    severity_score: "clip01((fetch_data_time_frac_parent - 0.10) / 0.25)"
-    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_frac_parent - 0.20))"
+      - fetch_data_time_proc_frac_parent
+      - compute_time_proc_frac_parent
+    when: "fetch_data_time_proc_frac_parent >= 0.20"
+    severity_score: "clip01((fetch_data_time_proc_frac_parent - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_proc_frac_parent - 0.20))"
     opportunity_tags:
       - dataloader_prefetch
       - reader_parallelism
@@ -25,10 +25,10 @@ rules:
     source_view: epoch
     fact_type: reader_open_pressure
     required_metrics:
-      - reader_open_time_max
-      - compute_time_max
+      - reader_open_time_proc_max
+      - compute_time_proc_max
     derived_metrics:
-      reader_open_ratio: "fillna0(reader_open_time_max) / max(fillna0(compute_time_max), 1e-9)"
+      reader_open_ratio: "fillna0(reader_open_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
     when: "reader_open_ratio > 1.05"
     severity_score: "clip01((reader_open_ratio - 1.0) / 0.50)"
     confidence: "clip01(0.70 + 0.20 * min(reader_open_ratio - 1.0, 1.0))"
@@ -40,10 +40,10 @@ rules:
     source_view: step
     fact_type: reader_open_pressure
     required_metrics:
-      - reader_open_time_max
-      - compute_time_max
+      - reader_open_time_proc_max
+      - compute_time_proc_max
     derived_metrics:
-      reader_open_ratio: "fillna0(reader_open_time_max) / max(fillna0(compute_time_max), 1e-9)"
+      reader_open_ratio: "fillna0(reader_open_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
     when: "reader_open_ratio > 1.05"
     severity_score: "clip01((reader_open_ratio - 1.0) / 0.50)"
     confidence: "clip01(0.70 + 0.20 * min(reader_open_ratio - 1.0, 1.0))"
@@ -55,11 +55,11 @@ rules:
     source_view: epoch
     fact_type: reader_posix_pressure
     required_metrics:
-      - reader_posix_time_max
-      - compute_time_max
+      - reader_posix_time_proc_max
+      - compute_time_proc_max
     derived_metrics:
-      reader_posix_ratio: "fillna0(reader_posix_time_max) / max(fillna0(compute_time_max), 1e-9)"
-      reader_open_guard: "fillna0(reader_open_time_max)"
+      reader_posix_ratio: "fillna0(reader_posix_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
+      reader_open_guard: "fillna0(reader_open_time_proc_max)"
     when: "reader_posix_ratio > 1.5 and reader_open_guard == 0"
     severity_score: "clip01((reader_posix_ratio - 1.0) / 2.0)"
     confidence: "clip01(0.70 + 0.20 * min(reader_posix_ratio - 1.0, 1.0))"
@@ -71,11 +71,11 @@ rules:
     source_view: step
     fact_type: reader_posix_pressure
     required_metrics:
-      - reader_posix_time_max
-      - compute_time_max
+      - reader_posix_time_proc_max
+      - compute_time_proc_max
     derived_metrics:
-      reader_posix_ratio: "fillna0(reader_posix_time_max) / max(fillna0(compute_time_max), 1e-9)"
-      reader_open_guard: "fillna0(reader_open_time_max)"
+      reader_posix_ratio: "fillna0(reader_posix_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
+      reader_open_guard: "fillna0(reader_open_time_proc_max)"
     when: "reader_posix_ratio > 1.5 and reader_open_guard == 0"
     severity_score: "clip01((reader_posix_ratio - 1.0) / 2.0)"
     confidence: "clip01(0.70 + 0.20 * min(reader_posix_ratio - 1.0, 1.0))"
@@ -87,8 +87,8 @@ rules:
     source_view: step
     fact_type: fetch_pressure
     required_metrics:
-      - fetch_data_time_max
-      - compute_time_max
+      - fetch_data_time_proc_max
+      - compute_time_proc_max
     # The step/window view does not have _frac_parent columns natively because
     # parent layers (step, pipeline, app) span entire epochs and their time
     # aggregates are NULL within a single window. We derive the canonical
@@ -96,12 +96,12 @@ rules:
     # downstream consumers (diagnoser key_metrics, optimizer evidence planner)
     # see the same metric names regardless of which view the fact came from.
     derived_metrics:
-      step_active_time: "fillna0(fetch_data_time_max) + fillna0(compute_time_max)"
-      fetch_data_time_frac_parent: "fillna0(fetch_data_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
-      compute_time_frac_parent: "fillna0(compute_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
-    when: "fetch_data_time_frac_parent >= 0.20"
-    severity_score: "clip01((fetch_data_time_frac_parent - 0.10) / 0.25)"
-    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_frac_parent - 0.20))"
+      step_active_time: "fillna0(fetch_data_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_data_time_proc_frac_parent: "fillna0(fetch_data_time_proc_max) / max(fillna0(fetch_data_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+      compute_time_proc_frac_parent: "fillna0(compute_time_proc_max) / max(fillna0(fetch_data_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+    when: "fetch_data_time_proc_frac_parent >= 0.20"
+    severity_score: "clip01((fetch_data_time_proc_frac_parent - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_proc_frac_parent - 0.20))"
     opportunity_tags:
       - dataloader_prefetch
       - reader_parallelism
@@ -111,11 +111,11 @@ rules:
     source_view: epoch
     fact_type: compute_dominance
     required_metrics:
-      - compute_time_frac_parent
-      - fetch_data_time_frac_parent
-    when: "compute_time_frac_parent >= 0.90 and fetch_data_time_frac_parent <= 0.10"
-    severity_score: "clip01((compute_time_frac_parent - 0.85) / 0.20)"
-    confidence: "clip01(0.70 + 0.25 * compute_time_frac_parent)"
+      - compute_time_proc_frac_parent
+      - fetch_data_time_proc_frac_parent
+    when: "compute_time_proc_frac_parent >= 0.90 and fetch_data_time_proc_frac_parent <= 0.10"
+    severity_score: "clip01((compute_time_proc_frac_parent - 0.85) / 0.20)"
+    confidence: "clip01(0.70 + 0.25 * compute_time_proc_frac_parent)"
     opportunity_tags:
       - none
 
@@ -125,11 +125,11 @@ rules:
     fact_type: small_read_dominance
     scope_layer: reader_posix
     required_metrics:
-      - reader_posix_read_time_frac_parent
-      - reader_posix_read_size_mean
-    when: "reader_posix_read_time_frac_parent > 0.50 and reader_posix_read_size_mean < 1048576"
-    severity_score: "clip01(0.5 * ((reader_posix_read_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_mean) / 1048576))"
-    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_mean) / 1048576))"
+      - reader_posix_read_time_proc_frac_parent
+      - reader_posix_read_size_proc_mean
+    when: "reader_posix_read_time_proc_frac_parent > 0.50 and reader_posix_read_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_read_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
     opportunity_tags:
       - small_io_reduction
 
@@ -139,11 +139,11 @@ rules:
     fact_type: small_write_dominance
     scope_layer: reader_posix
     required_metrics:
-      - reader_posix_write_time_frac_parent
-      - reader_posix_write_size_mean
-    when: "reader_posix_write_time_frac_parent > 0.50 and reader_posix_write_size_mean < 1048576"
-    severity_score: "clip01(0.5 * ((reader_posix_write_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_write_size_mean) / 1048576))"
-    confidence: "clip01(0.75 + 0.10 * reader_posix_write_time_frac_parent + 0.10 * ((1048576 - reader_posix_write_size_mean) / 1048576))"
+      - reader_posix_write_time_proc_frac_parent
+      - reader_posix_write_size_proc_mean
+    when: "reader_posix_write_time_proc_frac_parent > 0.50 and reader_posix_write_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_write_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_write_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
     opportunity_tags:
       - small_io_reduction
 
@@ -153,14 +153,14 @@ rules:
     fact_type: excessive_metadata_access
     scope_layer: reader_posix
     required_metrics:
-      - reader_posix_metadata_time_frac_parent
-      - reader_posix_open_time_frac_parent
-      - reader_posix_close_time_frac_parent
-      - reader_posix_seek_time_frac_parent
-      - reader_posix_stat_time_frac_parent
-    when: "reader_posix_metadata_time_frac_parent > 0.50"
-    severity_score: "clip01((reader_posix_metadata_time_frac_parent - 0.50) / 0.50)"
-    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_frac_parent)"
+      - reader_posix_metadata_time_proc_frac_parent
+      - reader_posix_open_time_proc_frac_parent
+      - reader_posix_close_time_proc_frac_parent
+      - reader_posix_seek_time_proc_frac_parent
+      - reader_posix_stat_time_proc_frac_parent
+    when: "reader_posix_metadata_time_proc_frac_parent > 0.50"
+    severity_score: "clip01((reader_posix_metadata_time_proc_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_proc_frac_parent)"
     opportunity_tags:
       - metadata_reduction
 
@@ -204,11 +204,11 @@ rules:
     fact_type: small_read_dominance
     scope_layer: checkpoint_posix
     required_metrics:
-      - checkpoint_posix_read_time_frac_parent
-      - checkpoint_posix_read_size_mean
-    when: "checkpoint_posix_read_time_frac_parent > 0.50 and checkpoint_posix_read_size_mean < 1048576"
-    severity_score: "clip01(0.5 * ((checkpoint_posix_read_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_read_size_mean) / 1048576))"
-    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_read_time_frac_parent + 0.10 * ((1048576 - checkpoint_posix_read_size_mean) / 1048576))"
+      - checkpoint_posix_read_time_proc_frac_parent
+      - checkpoint_posix_read_size_proc_mean
+    when: "checkpoint_posix_read_time_proc_frac_parent > 0.50 and checkpoint_posix_read_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((checkpoint_posix_read_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_read_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_read_time_proc_frac_parent + 0.10 * ((1048576 - checkpoint_posix_read_size_proc_mean) / 1048576))"
     opportunity_tags:
       - small_io_reduction
 
@@ -218,11 +218,11 @@ rules:
     fact_type: small_write_dominance
     scope_layer: checkpoint_posix
     required_metrics:
-      - checkpoint_posix_write_time_frac_parent
-      - checkpoint_posix_write_size_mean
-    when: "checkpoint_posix_write_time_frac_parent > 0.50 and checkpoint_posix_write_size_mean < 1048576"
-    severity_score: "clip01(0.5 * ((checkpoint_posix_write_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_write_size_mean) / 1048576))"
-    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_write_time_frac_parent + 0.10 * ((1048576 - checkpoint_posix_write_size_mean) / 1048576))"
+      - checkpoint_posix_write_time_proc_frac_parent
+      - checkpoint_posix_write_size_proc_mean
+    when: "checkpoint_posix_write_time_proc_frac_parent > 0.50 and checkpoint_posix_write_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((checkpoint_posix_write_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - checkpoint_posix_write_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * checkpoint_posix_write_time_proc_frac_parent + 0.10 * ((1048576 - checkpoint_posix_write_size_proc_mean) / 1048576))"
     opportunity_tags:
       - small_io_reduction
 
@@ -232,14 +232,14 @@ rules:
     fact_type: excessive_metadata_access
     scope_layer: checkpoint_posix
     required_metrics:
-      - checkpoint_posix_metadata_time_frac_parent
-      - checkpoint_posix_open_time_frac_parent
-      - checkpoint_posix_close_time_frac_parent
-      - checkpoint_posix_seek_time_frac_parent
-      - checkpoint_posix_stat_time_frac_parent
-    when: "checkpoint_posix_metadata_time_frac_parent > 0.50"
-    severity_score: "clip01((checkpoint_posix_metadata_time_frac_parent - 0.50) / 0.50)"
-    confidence: "clip01(0.75 + 0.20 * checkpoint_posix_metadata_time_frac_parent)"
+      - checkpoint_posix_metadata_time_proc_frac_parent
+      - checkpoint_posix_open_time_proc_frac_parent
+      - checkpoint_posix_close_time_proc_frac_parent
+      - checkpoint_posix_seek_time_proc_frac_parent
+      - checkpoint_posix_stat_time_proc_frac_parent
+    when: "checkpoint_posix_metadata_time_proc_frac_parent > 0.50"
+    severity_score: "clip01((checkpoint_posix_metadata_time_proc_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * checkpoint_posix_metadata_time_proc_frac_parent)"
     opportunity_tags:
       - metadata_reduction
 
@@ -285,9 +285,9 @@ rules:
     emit_mode: window
     fact_type: epoch_straggler
     required_metrics:
-      - epoch_time_max
+      - epoch_time_proc_max
     derived_metrics:
-      epoch_straggler_ratio: "max(epoch_time_max) / max(min(epoch_time_max), 1e-9)"
+      epoch_straggler_ratio: "max(epoch_time_proc_max) / max(min(epoch_time_proc_max), 1e-9)"
     when: "epoch_straggler_ratio > 1.05"
     severity_score: "clip01((epoch_straggler_ratio - 1.0) / 0.20)"
     confidence: "clip01(0.75 + 0.25 * (epoch_straggler_ratio - 1.0))"
@@ -301,11 +301,11 @@ rules:
     emit_mode: window
     fact_type: fetch_rank_imbalance
     required_metrics:
-      - fetch_data_time_max
-      - fetch_data_time_frac_parent
+      - fetch_data_time_proc_max
+      - fetch_data_time_proc_frac_parent
     derived_metrics:
-      fetch_rank_ratio: "max(fetch_data_time_max) / max(min(fetch_data_time_max), 1e-9)"
-      fetch_share_max: "max(fetch_data_time_frac_parent)"
+      fetch_rank_ratio: "max(fetch_data_time_proc_max) / max(min(fetch_data_time_proc_max), 1e-9)"
+      fetch_share_max: "max(fetch_data_time_proc_frac_parent)"
     when: "fetch_rank_ratio >= 1.5"
     severity_score: "clip01((fetch_rank_ratio - 1.0) / 2.5)"
     confidence: "clip01(0.70 + 0.20 * fetch_share_max + 0.10 * (fetch_rank_ratio - 1.0))"
@@ -319,11 +319,11 @@ rules:
     emit_mode: window
     fact_type: checkpoint_tail_skew
     required_metrics:
-      - checkpoint_time_max
-      - checkpoint_time_frac_parent
+      - checkpoint_time_proc_max
+      - checkpoint_time_proc_frac_parent
     derived_metrics:
-      checkpoint_rank_ratio: "max(checkpoint_time_max) / max(min(checkpoint_time_max), 1e-9)"
-      checkpoint_share_max: "max(checkpoint_time_frac_parent)"
+      checkpoint_rank_ratio: "max(checkpoint_time_proc_max) / max(min(checkpoint_time_proc_max), 1e-9)"
+      checkpoint_share_max: "max(checkpoint_time_proc_frac_parent)"
     when: "checkpoint_rank_ratio >= 10 and checkpoint_share_max >= 0.001"
     severity_score: "clip01(0.5 * ((checkpoint_rank_ratio - 1.0) / 20.0) + 0.5 * (checkpoint_share_max / 0.02))"
     confidence: "clip01(0.75 + 0.10 * checkpoint_share_max + 0.10 * (checkpoint_rank_ratio - 1.0) / 20.0)"
@@ -336,13 +336,13 @@ rules:
     source_view: time_range
     fact_type: fetch_interval_pressure
     required_metrics:
-      - fetch_data_time_frac_parent
-      - compute_time_frac_parent
-      - epoch_time_max
+      - fetch_data_time_proc_frac_parent
+      - compute_time_proc_frac_parent
+      - epoch_time_proc_max
     derived_metrics:
-      fetch_minus_compute: "fetch_data_time_frac_parent - compute_time_frac_parent"
-    when: "fetch_data_time_frac_parent >= 0.60 and epoch_time_max >= 1.0"
-    severity_score: "clip01((fetch_data_time_frac_parent - 0.40) / 0.40)"
+      fetch_minus_compute: "fetch_data_time_proc_frac_parent - compute_time_proc_frac_parent"
+    when: "fetch_data_time_proc_frac_parent >= 0.60 and epoch_time_proc_max >= 1.0"
+    severity_score: "clip01((fetch_data_time_proc_frac_parent - 0.40) / 0.40)"
     confidence: "clip01(0.70 + 0.20 * abs(fetch_minus_compute))"
     opportunity_tags:
       - dataloader_prefetch
@@ -353,12 +353,12 @@ rules:
     source_view: time_range
     fact_type: compute_interval_dominance
     required_metrics:
-      - compute_time_frac_parent
-      - fetch_data_time_frac_parent
-      - epoch_time_max
-    when: "compute_time_frac_parent >= 0.45 and fetch_data_time_frac_parent <= 0.50 and epoch_time_max >= 1.0"
-    severity_score: "clip01((compute_time_frac_parent - 0.35) / 0.40)"
-    confidence: "clip01(0.70 + 0.20 * compute_time_frac_parent)"
+      - compute_time_proc_frac_parent
+      - fetch_data_time_proc_frac_parent
+      - epoch_time_proc_max
+    when: "compute_time_proc_frac_parent >= 0.45 and fetch_data_time_proc_frac_parent <= 0.50 and epoch_time_proc_max >= 1.0"
+    severity_score: "clip01((compute_time_proc_frac_parent - 0.35) / 0.40)"
+    confidence: "clip01(0.70 + 0.20 * compute_time_proc_frac_parent)"
     opportunity_tags:
       - kernel_overlap
       - pipeline_tuning
@@ -368,14 +368,14 @@ rules:
     source_view: time_range
     fact_type: checkpoint_interval_burst
     required_metrics:
-      - checkpoint_time_max
-      - checkpoint_time_frac_parent
-      - fetch_data_time_max
+      - checkpoint_time_proc_max
+      - checkpoint_time_proc_frac_parent
+      - fetch_data_time_proc_max
     derived_metrics:
-      checkpoint_to_fetch_ratio: "checkpoint_time_max / (fetch_data_time_max + 1e-9)"
-    when: "checkpoint_time_max >= 0.02 and checkpoint_to_fetch_ratio >= 0.10"
-    severity_score: "clip01(0.5 * (checkpoint_to_fetch_ratio / 0.30) + 0.5 * (checkpoint_time_max / 0.20))"
-    confidence: "clip01(0.70 + 0.20 * checkpoint_time_frac_parent + 0.10 * checkpoint_to_fetch_ratio)"
+      checkpoint_to_fetch_ratio: "checkpoint_time_proc_max / (fetch_data_time_proc_max + 1e-9)"
+    when: "checkpoint_time_proc_max >= 0.02 and checkpoint_to_fetch_ratio >= 0.10"
+    severity_score: "clip01(0.5 * (checkpoint_to_fetch_ratio / 0.30) + 0.5 * (checkpoint_time_proc_max / 0.20))"
+    confidence: "clip01(0.70 + 0.20 * checkpoint_time_proc_frac_parent + 0.10 * checkpoint_to_fetch_ratio)"
     opportunity_tags:
       - checkpoint_aggregation
       - io_batching
