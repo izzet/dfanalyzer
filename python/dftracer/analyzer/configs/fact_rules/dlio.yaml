@@ -89,13 +89,19 @@ rules:
     required_metrics:
       - fetch_data_time_max
       - compute_time_max
+    # The step/window view does not have _frac_parent columns natively because
+    # parent layers (step, pipeline, app) span entire epochs and their time
+    # aggregates are NULL within a single window. We derive the canonical
+    # _frac_parent names here from the available leaf-layer times so that
+    # downstream consumers (diagnoser key_metrics, optimizer evidence planner)
+    # see the same metric names regardless of which view the fact came from.
     derived_metrics:
       step_active_time: "fillna0(fetch_data_time_max) + fillna0(compute_time_max)"
-      fetch_frac_step: "fillna0(fetch_data_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
-      compute_frac_step: "fillna0(compute_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
-    when: "fetch_frac_step >= 0.20"
-    severity_score: "clip01((fetch_frac_step - 0.10) / 0.25)"
-    confidence: "clip01(0.75 + 0.20 * abs(fetch_frac_step - 0.20))"
+      fetch_data_time_frac_parent: "fillna0(fetch_data_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
+      compute_time_frac_parent: "fillna0(compute_time_max) / max(fillna0(fetch_data_time_max) + fillna0(compute_time_max), 1e-9)"
+    when: "fetch_data_time_frac_parent >= 0.20"
+    severity_score: "clip01((fetch_data_time_frac_parent - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_data_time_frac_parent - 0.20))"
     opportunity_tags:
       - dataloader_prefetch
       - reader_parallelism
