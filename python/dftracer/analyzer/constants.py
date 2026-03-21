@@ -205,6 +205,13 @@ HUMANIZED_COLS = dict(
     u_read_io_time='Unoverlapped Read I/O Time',
 )
 HUMANIZED_LAYERS = dict(
+    workflow='Workflow',
+    step='Agent Step',
+    llm='LLM',
+    tool='Tool',
+    data='Agent Data',
+    message='Message',
+    judge='Judge',
     posix='POSIX - All',
     posix_reader='POSIX - Reader',
     posix_checkpoint='POSIX - Checkpoint',
