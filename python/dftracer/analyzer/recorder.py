@@ -7,7 +7,7 @@ from typing import List, Union
 
 from .analyzer import Analyzer
 from .constants import COL_FUNC_NAME, COL_TIME, COL_TIME_END, COL_TIME_START, IO_CATS
-from .types import ViewType
+from .types import ReadTraceResult, ViewType
 
 
 CAT_POSIX = 0
@@ -41,7 +41,7 @@ class RecorderAnalyzer(Analyzer):
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         self.global_min_max = self._load_global_min_max(trace_path=trace_path)
         traces = dd.read_parquet(trace_path).rename(columns=TRACE_COL_MAPPING)
-        return traces
+        return ReadTraceResult(traces=traces)
 
     def postread_trace(
         self,

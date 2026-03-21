@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, GiB, Layer, MiB
 from .types import (
-    AnalyzerResultType,
+    AnalysisResult,
     RawStats,
     ViewKey,
     humanized_view_name,
@@ -43,6 +43,8 @@ class OutputSummary:
     layers: List[Layer]
     time_granularity: float
     time_resolution: float
+    trace_event_count: int
+    profile_event_count: int
     total_event_count: int
     unique_file_count: int
     unique_host_count: int
@@ -64,16 +66,16 @@ class Output(abc.ABC):
         self.root_only = root_only
         self.view_names = view_names
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError
 
-    def _compute_raw_stats(self, result: AnalyzerResultType) -> RawStats:
+    def _compute_raw_stats(self, result: AnalysisResult) -> RawStats:
         raw_stats = dask.compute(result.raw_stats)[0]
         if isinstance(raw_stats, dict):
             raw_stats = RawStats(**raw_stats)
         return raw_stats
 
-    def _create_summary(self, result: AnalyzerResultType, view_key: ViewKey, raw_stats: Optional[RawStats] = None) -> OutputSummary:
+    def _create_summary(self, result: AnalysisResult, view_key: ViewKey, raw_stats: Optional[RawStats] = None) -> OutputSummary:
         flat_view = result.flat_views[view_key]
         if raw_stats is None:
             raw_stats = self._compute_raw_stats(result)
@@ -83,6 +85,8 @@ class Output(abc.ABC):
             layers=result.layers,
             time_granularity=float(raw_stats.time_granularity),
             time_resolution=float(raw_stats.time_resolution),
+            trace_event_count=int(raw_stats.trace_event_count),
+            profile_event_count=int(raw_stats.profile_event_count),
             total_event_count=int(raw_stats.total_event_count),
             unique_file_count=int(raw_stats.unique_file_count),
             unique_host_count=int(raw_stats.unique_host_count),
@@ -169,7 +173,7 @@ class ConsoleOutput(Output):
         self.show_debug = show_debug
         self.show_header = show_header
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raw_stats = self._compute_raw_stats(result)
         print_objects = []
         for view_key in result.flat_views:
@@ -240,6 +244,8 @@ class ConsoleOutput(Output):
         summary_table.add_column(header='Value', justify='right')
 
         summary_table.add_row('Job Time', 'seconds', f"{summary.job_time:.3f}")
+        summary_table.add_row('Trace Count', 'count', f"{summary.trace_event_count:,}")
+        summary_table.add_row('Profile Count', 'count', f"{summary.profile_event_count:,}")
         summary_table.add_row('Total Count', 'count', f"{summary.total_event_count:,}")
         summary_table.add_row('Total Files', 'count', f"{summary.unique_file_count:,}")
         summary_table.add_row('Total Nodes', 'count', f"{summary.unique_host_count:,}")
@@ -259,7 +265,7 @@ class ConsoleOutput(Output):
 
         return summary_table
 
-    def _create_additional_metrics_table(self, result: AnalyzerResultType, view_key: ViewKey) -> Optional[Table]:
+    def _create_additional_metrics_table(self, result: AnalysisResult, view_key: ViewKey) -> Optional[Table]:
         if not result.additional_metrics:
             return None
 
@@ -346,7 +352,7 @@ class JSONOutput(Output):
         super().__init__(compact, name, root_only, view_names)
         self.file_path = file_path
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raw_stats = self._compute_raw_stats(result)
         output = {
             "schema_version": "1",
@@ -427,7 +433,7 @@ class JSONOutput(Output):
             }
         return summary_payload
 
-    def _create_additional_metrics_payload(self, result: AnalyzerResultType, view_key: ViewKey):
+    def _create_additional_metrics_payload(self, result: AnalysisResult, view_key: ViewKey):
         payload = {}
         flat_view = result.flat_views[view_key]
         view_type = view_key[-1]
@@ -459,7 +465,7 @@ class JSONOutput(Output):
 
 
 class CSVOutput(Output):
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError("CSVOutput is not implemented yet.")
 
 
@@ -476,5 +482,5 @@ class SQLiteOutput(Output):
         super().__init__(compact, name, root_only, view_names)
         self.run_db_path = run_db_path
 
-    def handle_result(self, result: AnalyzerResultType):
+    def handle_result(self, result: AnalysisResult):
         raise NotImplementedError("SQLiteOutput is not implemented yet.")

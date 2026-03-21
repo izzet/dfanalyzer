@@ -43,10 +43,20 @@ class RawStats:
     job_time: "dd.Scalar"
     time_granularity: int
     time_resolution: int
+    trace_event_count: "dd.Scalar"
+    profile_event_count: "dd.Scalar"
     total_event_count: "dd.Scalar"
     unique_file_count: "dd.Scalar"
     unique_host_count: "dd.Scalar"
     unique_process_count: "dd.Scalar"
+
+
+@dc.dataclass
+class ReadTraceResult:
+    traces: dd.DataFrame
+    profiles: Optional[dd.DataFrame] = None
+    profile_time_granularity: Optional[float] = None
+    system_metrics: Optional[dd.DataFrame] = None
 
 
 @dc.dataclass
@@ -191,7 +201,7 @@ class OutputType:
 
 
 @dc.dataclass
-class AnalyzerResultType:
+class AnalysisResult:
     additional_metrics: Dict[ViewType, List[str]]
     checkpoint_dir: str
     flat_views: Dict[ViewKey, pd.DataFrame]
@@ -202,13 +212,31 @@ class AnalyzerResultType:
     _hlms: Dict[Layer, dd.DataFrame]
     _main_views: Dict[Layer, dd.DataFrame]
     _metric_boundaries: ViewMetricBoundaries
-    _traces: Optional[dd.DataFrame] = None
+    _read_result: Optional[ReadTraceResult] = None
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
         return self._hlms[layer]
 
     def get_main_view(self, layer: Layer) -> dd.DataFrame:
         return self._main_views[layer]
+
+    @property
+    def traces(self) -> Optional[dd.DataFrame]:
+        if self._read_result is None:
+            return None
+        return self._read_result.traces
+
+    @property
+    def profiles(self) -> Optional[dd.DataFrame]:
+        if self._read_result is None:
+            return None
+        return self._read_result.profiles
+
+    @property
+    def system_metrics(self) -> Optional[dd.DataFrame]:
+        if self._read_result is None:
+            return None
+        return self._read_result.system_metrics
 
     def get_flat_view(self, view_key_type: Union[ViewKey, ViewType]) -> pd.DataFrame:
         if not isinstance(view_key_type, tuple):
