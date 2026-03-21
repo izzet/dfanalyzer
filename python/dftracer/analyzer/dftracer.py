@@ -648,7 +648,7 @@ class DFTracerAnalyzer(Analyzer):
     ) -> pd.DataFrame:
         columns = self._get_columns(extra_columns)
         traces = pd.DataFrame(events, columns=columns)
-        traces = self._handle_metadata(traces)
+        traces, _profiles, _system_events = self._handle_metadata(traces)
         traces = self._fix_time(traces)
         traces = self._rename_columns(traces)
         traces = traces.assign(time_range=1)
