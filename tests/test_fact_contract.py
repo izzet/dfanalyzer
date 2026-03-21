@@ -3,7 +3,7 @@ import pytest
 
 from dftracer.analyzer.types import (
     AnalysisFact,
-    AnalyzerResultType,
+    AnalysisResult,
     FactProvenance,
     FactScope,
     FactSeverity,
@@ -35,10 +35,11 @@ def _build_fact(view_type: str, entity: str, run_id: str = "run-abc") -> Analysi
 
 
 def test_analyzer_result_to_fact_envelope_contract():
-    result = AnalyzerResultType(
+    result = AnalysisResult(
         _hlms={},
         _main_views={},
         _metric_boundaries={},
+        additional_metrics={},
         checkpoint_dir=".",
         flat_views={("epoch",): pd.DataFrame({"epoch_time_max": [1.0]}, index=[1])},
         layers=["epoch", "fetch_data"],
@@ -46,6 +47,8 @@ def test_analyzer_result_to_fact_envelope_contract():
             job_time=10,
             time_granularity=10,
             time_resolution=1_000_000,
+            trace_event_count=100,
+            profile_event_count=0,
             total_event_count=100,
             unique_file_count=2,
             unique_host_count=1,

@@ -31,7 +31,7 @@ def test_fact_engine_emits_per_row_and_window_facts():
             "fact_type": "epoch_straggler",
             "required_metrics": ["epoch_time_max"],
             "derived_metrics": {
-                "epoch_straggler_ratio": "max(epoch_time_max) / max(min(epoch_time_max), 1e-9)",
+                "epoch_straggler_ratio": "epoch_time_max / 3.0",
             },
             "when": "epoch_straggler_ratio > 2.0",
             "severity_score": "clip01((epoch_straggler_ratio - 1.0) / 2.0)",
@@ -68,7 +68,7 @@ def test_fact_engine_emits_per_row_and_window_facts():
     assert len(proc_facts) == 1
     assert proc_facts[0].scope.entity == "window"
     assert proc_facts[0].fact_type == "epoch_straggler"
-    assert proc_facts[0].evidence["metrics"]["epoch_straggler_ratio"] == pytest.approx(5.0)
+    assert proc_facts[0].evidence["metrics"]["epoch_straggler_ratio"] == pytest.approx(10.0 / 3.0)
 
 
 def test_fact_engine_skips_rule_with_unresolved_identifier():

@@ -15,9 +15,9 @@ from .cluster import ClusterType, ExternalCluster
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
 from .input import FileInput, MofkaInput, ZMQInput
-from .output import ConsoleOutput, CSVOutput, MofkaOutput, SQLiteOutput, ZMQOutput
+from .output import ConsoleOutput, CSVOutput, JSONOutput, MofkaOutput, SQLiteOutput, ZMQOutput
 from .recorder import RecorderAnalyzer
-from .types import AnalyzerResultType, ViewType
+from .types import AnalysisResult, ViewType
 from .utils.log_utils import configure_logging, log_block
 
 try:
@@ -36,7 +36,7 @@ except ModuleNotFoundError:
 
 AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
 InputType = Union[FileInput, ZMQInput, MofkaInput]
-OutputType = Union[ConsoleOutput, CSVOutput, SQLiteOutput, ZMQOutput, MofkaOutput]
+OutputType = Union[ConsoleOutput, JSONOutput, CSVOutput, SQLiteOutput, ZMQOutput, MofkaOutput]
 
 
 @dataclass
@@ -70,7 +70,7 @@ class DFAnalyzerInstance:
         view_types: Optional[List[ViewType]] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
     ):
         """Analyze the ZMQ trace using the configured analyzer."""
         return self.analyzer.analyze_zmq(
@@ -90,7 +90,7 @@ class DFAnalyzerInstance:
         control_topic_name: Optional[str] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
     ):
         """Analyze the Mofka trace using the configured analyzer."""

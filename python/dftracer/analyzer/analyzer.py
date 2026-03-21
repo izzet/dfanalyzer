@@ -7,6 +7,7 @@ import hashlib
 import itertools as it
 import json
 import math
+import numpy as np
 import os
 import pandas as pd
 import signal
@@ -31,6 +32,8 @@ def install_shutdown_handler():
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
 from .analysis_utils import (
+    build_view_rename_map,
+    derive_call_stats,
     fix_dtypes,
     fix_hlm_dtypes,
     fix_std_cols,
@@ -42,6 +45,7 @@ from .analysis_utils import (
 )
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
 from .constants import (
+    COL_COUNT,
     COL_FILE_NAME,
     COL_HOST_NAME,
     COL_PROC_NAME,
@@ -60,20 +64,22 @@ from .metrics import (
 )
 from .fact_engine import FactEngine
 from .types import (
-    AnalyzerResultType,
+    AnalysisResult,
+    ReadTraceResult,
     RawStats,
     ViewKey,
     ViewMetricBoundaries,
     ViewType,
     Views,
 )
+from .utils.collection_utils import is_set_like_series
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
 from .utils.log_utils import console_block, log_block
 from .utils.pandas_agg import unique_set_flatten_pd, unique_set_pd
-from .utils.pandas_utils import flatten_column_names
+from .utils.pandas_utils import flatten_column_names, to_nullable_numeric
 from .streaming.window_buffer import WindowBoundaryTracker, WindowBuffer
 
 
@@ -104,6 +110,8 @@ class Analyzer(abc.ABC):
         checkpoint_dir: str = "",
         debug: bool = False,
         facts_config: Optional[Union[FactsConfig, Dict[str, Any]]] = None,
+        profile_distribution: str = "uniform",
+        profile_time_granularity: float = 5,
         quantile_stats: bool = False,
         time_approximate: bool = True,
         time_granularity: float = 1,
@@ -118,6 +126,10 @@ class Analyzer(abc.ABC):
             checkpoint: Whether to enable checkpointing of intermediate results.
             checkpoint_dir: Directory to store checkpoint data.
             debug: Whether to enable debug mode.
+            profile_distribution: Strategy for distributing profile measures
+                when expanding buckets ('uniform' or 'weighted').
+            profile_time_granularity: The time granularity of profile buckets
+                emitted by the tracer, in seconds.
             time_approximate: Whether to use approximate time for I/O operations.
             time_granularity: The time granularity for analysis, in seconds.
             time_resolution: The time resolution for analysis, in microseconds.
@@ -126,12 +138,16 @@ class Analyzer(abc.ABC):
         """
         if checkpoint:
             assert checkpoint_dir != "", "Checkpoint directory must be defined"
+        if profile_distribution not in ("uniform", "weighted"):
+            raise ValueError(f"profile_distribution must be 'uniform' or 'weighted', got '{profile_distribution}'")
 
         self.checkpoint = checkpoint
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_tasks = []
         self.dask_client = get_client()
         self.debug = debug
+        self.profile_distribution = profile_distribution
+        self.profile_time_granularity = profile_time_granularity
         self.quantile_stats = quantile_stats
         self.layers = list(preset.layer_defs.keys())
         self.facts_config = self._build_facts_config(facts_config)
@@ -208,7 +224,7 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         logical_view_types: bool = False,
         metric_boundaries: ViewMetricBoundaries = {},
-    ) -> AnalyzerResultType:
+    ) -> AnalysisResult:
         """Analyzes I/O trace data to identify performance bottlenecks.
 
         This method orchestrates the entire analysis process, including reading
@@ -216,32 +232,41 @@ class Analyzer(abc.ABC):
         to detect bottlenecks, and applying rules to characterize them.
 
         Args:
-            trace_path: Path to the I/O trace file or directory.
-            accuracy: The analysis accuracy mode ('optimistic' or 'pessimistic').
+            path: Path to the I/O trace file or directory.
             exclude_characteristics: A list of I/O characteristics to exclude.
             logical_view_types: Whether to compute views based on logical relationships.
-            metrics: A list of metrics to analyze (e.g., 'iops', 'bw', 'time').
             view_types: A list of view types to compute (e.g., 'file_name', 'proc_name').
 
         Returns:
-            An AnalyzerResultType object containing the analysis results.
+            An AnalysisResult object containing the analysis results.
         """
-        # Check if high-level metrics are checkpointed
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
+        read_result = None
+        profiles = None
         traces = None
         raw_stats = None
         with console_block("Read trace & stats"):
             if not self.checkpoint or not self.has_checkpoint(name=hlm_checkpoint_name):
                 # Read trace & stats
                 with log_block("read_trace"):
-                    traces = self.read_trace(
+                    read_result = self.read_trace(
                         trace_path=path,
                         extra_columns=extra_columns,
                         extra_columns_fn=extra_columns_fn,
                     )
+                    traces = read_result.traces
+                    profiles = read_result.profiles
+                if profiles is not None:
+                    with log_block("validate_and_expand_profiles"):
+                        ptg = read_result.profile_time_granularity or self.profile_time_granularity
+                        profiles = self._validate_and_expand_profiles(
+                            profiles=profiles,
+                            profile_time_granularity=ptg,
+                        )
+                        read_result.profiles = profiles
                 with log_block("read_stats"):
-                    raw_stats = self.read_stats(traces=traces)
+                    raw_stats = self.read_stats(traces=traces, profiles=profiles)
                 with log_block("postread_trace"):
                     traces = self.postread_trace(
                         traces=traces,
@@ -256,6 +281,8 @@ class Analyzer(abc.ABC):
                             time_granularity=self.time_granularity,
                             time_resolution=self.time_resolution,
                         )
+                if read_result is not None:
+                    read_result.traces = traces
             else:
                 # Restore stats
                 with log_block("restore_raw_stats"):
@@ -266,27 +293,66 @@ class Analyzer(abc.ABC):
 
         # Compute high-level metrics
         is_dask = isinstance(traces, dd.DataFrame)
+        hlm = None
+        trace_hlm = None
+        profile_hlm = None
         with console_block("Compute high-level metrics"):
-            with log_block("compute_high_level_metrics"):
-                hlm = self.compute_high_level_metrics(
-                    checkpoint_name=hlm_checkpoint_name,
-                    traces=traces,
-                    view_types=view_types,
-                )
-
-            if is_dask:
+            if profiles is None:
+                with log_block("compute_high_level_metrics"):
+                    hlm = self.compute_high_level_metrics(
+                        checkpoint_name=hlm_checkpoint_name,
+                        traces=traces,
+                        view_types=proc_view_types,
+                    )
+                if is_dask:
+                    with log_block("persist"):
+                        (hlm, raw_stats) = dask.persist(hlm, raw_stats)
+                    with log_block("wait"):
+                        wait([hlm, raw_stats])
+            else:
+                with log_block("compute_trace_hlm"):
+                    trace_hlm = self.compute_high_level_metrics(
+                        checkpoint_name=self.get_trace_hlm_checkpoint_name(view_types=proc_view_types),
+                        traces=traces,
+                        view_types=proc_view_types,
+                    )
+                with log_block("compute_profile_hlm"):
+                    profile_hlm = self.compute_profile_hlm(
+                        checkpoint_name=self.get_profile_hlm_checkpoint_name(view_types=proc_view_types),
+                        profiles=profiles,
+                        view_types=proc_view_types,
+                    )
+                hlm = None
                 with log_block("persist"):
-                    (hlm, raw_stats) = dask.persist(hlm, raw_stats)
+                    (trace_hlm, profile_hlm, raw_stats) = dask.persist(trace_hlm, profile_hlm, raw_stats)
                 with log_block("wait"):
-                    wait([hlm, raw_stats])
+                    wait([trace_hlm, profile_hlm, raw_stats])
 
-        return self._analyze_trace(
-            traces=traces,
-            proc_view_types=proc_view_types,
+        # Compute system metrics (small table, safe to materialize)
+        system_metrics = None
+        if read_result is not None and read_result.system_metrics is not None:
+            with log_block("compute_system_metrics"):
+                system_metrics = read_result.system_metrics.compute()
+
+        # Analyze HLM
+        result = self._analyze_hlm(
+            hlm=hlm,
+            is_dask=is_dask,
             logical_view_types=logical_view_types,
-            raw_stats=raw_stats,
             metric_boundaries=metric_boundaries,
+            profile_hlm=profile_hlm,
+            proc_view_types=proc_view_types,
+            raw_stats=raw_stats,
+            system_metrics=system_metrics,
+            trace_hlm=trace_hlm,
         )
+
+        # Attach correct traces & view types
+        if read_result is not None:
+            result._read_result = read_result
+        result.view_types = view_types
+
+        return result
 
     def analyze_zmq(
         self,
@@ -300,7 +366,7 @@ class Analyzer(abc.ABC):
         process_key: str = "pid",
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
     ) -> None:
         from .streaming.zmq_io import open_consumer
 
@@ -357,7 +423,7 @@ class Analyzer(abc.ABC):
         process_key: str = "pid",
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         stream_name: str = "stream",
     ) -> None:
         install_shutdown_handler()
@@ -432,7 +498,7 @@ class Analyzer(abc.ABC):
         control_consumer_name: Optional[str] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
     ) -> None:
         from .streaming.mofka_io import open_consumer
@@ -899,7 +965,7 @@ class Analyzer(abc.ABC):
         control_consumer_name: Optional[str] = None,
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
-        output_handler: Optional[Callable[[AnalyzerResultType], None]] = None,
+        output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
     ) -> None:
         resolved_control_topic = (
@@ -934,7 +1000,7 @@ class Analyzer(abc.ABC):
             num_ranks=num_ranks,
         )
 
-    def read_stats(self, traces: dd.DataFrame) -> RawStats:
+    def read_stats(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
         Calculates job time and total event count from the traces.
@@ -949,24 +1015,35 @@ class Analyzer(abc.ABC):
             and 'total_count'.
         """
         job_time = self.get_job_time(traces)
-        total_event_count = self.get_total_event_count(traces)
+        trace_event_count = self.get_total_event_count(traces)
+        profile_event_count = self.get_profile_event_count(profiles)
+        total_event_count = trace_event_count + profile_event_count
         unique_file_count = self.get_unique_file_count(traces)
         unique_host_count = self.get_unique_host_count(traces)
         unique_process_count = self.get_unique_process_count(traces)
-        raw_stats = RawStats(
-            **self.restore_extra_data(
-                name=self.get_stats_checkpoint_name(),
-                fallback=lambda: dict(
-                    job_time=job_time,
-                    time_granularity=self.time_granularity,
-                    time_resolution=self.time_resolution,
-                    total_event_count=total_event_count,
-                    unique_file_count=unique_file_count,
-                    unique_host_count=unique_host_count,
-                    unique_process_count=unique_process_count,
-                ),
-            )
+        raw_stats_data = self.restore_extra_data(
+            name=self.get_stats_checkpoint_name(),
+            fallback=lambda: dict(
+                job_time=job_time,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+                trace_event_count=trace_event_count,
+                profile_event_count=profile_event_count,
+                total_event_count=total_event_count,
+                unique_file_count=unique_file_count,
+                unique_host_count=unique_host_count,
+                unique_process_count=unique_process_count,
+            ),
         )
+        if "trace_event_count" not in raw_stats_data:
+            raw_stats_data["trace_event_count"] = raw_stats_data.get("total_event_count", 0)
+        if "profile_event_count" not in raw_stats_data:
+            raw_stats_data["profile_event_count"] = 0
+        if "total_event_count" not in raw_stats_data:
+            raw_stats_data["total_event_count"] = (
+                raw_stats_data["trace_event_count"] + raw_stats_data["profile_event_count"]
+            )
+        raw_stats = RawStats(**raw_stats_data)
         return raw_stats
 
     @abc.abstractmethod
@@ -975,7 +1052,7 @@ class Analyzer(abc.ABC):
         trace_path: str,
         extra_columns: Optional[Dict[str, str]],
         extra_columns_fn: Optional[Callable[[dict], dict]],
-    ) -> dd.DataFrame:
+    ) -> ReadTraceResult:
         """Reads I/O trace data from the specified path.
 
         This is an abstract method that must be implemented by subclasses
@@ -985,7 +1062,8 @@ class Analyzer(abc.ABC):
             trace_path: Path to the I/O trace file or directory.
 
         Returns:
-            A Dask DataFrame containing the parsed I/O trace data.
+            A ReadTraceResult containing the parsed I/O trace data and any
+            additional native profile streams for the analyzer.
 
         Raises:
             NotImplementedError: If the subclass does not implement this method.
@@ -1092,6 +1170,58 @@ class Analyzer(abc.ABC):
                 traces=traces,
                 view_types=view_types,
             ),
+        )
+
+    def compute_profile_hlm(
+        self,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+        checkpoint_name: Optional[str] = None,
+    ) -> dd.DataFrame:
+        checkpoint_name = checkpoint_name or self.get_profile_hlm_checkpoint_name(view_types)
+        return self.restore_view(
+            name=checkpoint_name,
+            fallback=lambda: self._compute_profile_hlm(
+                partition_size=partition_size,
+                profiles=profiles,
+                view_types=view_types,
+            ),
+        )
+
+    def compute_hybrid_hlm(
+        self,
+        traces: dd.DataFrame,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+        checkpoint_name: Optional[str] = None,
+    ) -> dd.DataFrame:
+        checkpoint_name = checkpoint_name or self.get_hlm_checkpoint_name(view_types)
+        return self.restore_view(
+            name=checkpoint_name,
+            fallback=lambda: self._compute_hybrid_hlm(
+                partition_size=partition_size,
+                profiles=profiles,
+                traces=traces,
+                view_types=view_types,
+            ),
+        )
+
+    def reconcile_hlm(
+        self,
+        trace_hlm: dd.DataFrame,
+        profile_hlm: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str = PARTITION_SIZE,
+        layer: Optional[Layer] = None,
+    ) -> dd.DataFrame:
+        return self._reconcile_hlm(
+            layer=layer,
+            partition_size=partition_size,
+            profile_hlm=profile_hlm,
+            trace_hlm=trace_hlm,
+            view_types=view_types,
         )
 
     def compute_main_view(
@@ -1234,7 +1364,7 @@ class Analyzer(abc.ABC):
             view_cols = flat_views[view_key].columns
             view_type = view_key[-1]
             time_layer = self.preset.time_boundary_layer
-            time_metric = "time_sum" if self.is_view_process_based(view_key) else "time_max"
+            time_metric = "time_sum" if self.is_view_process_based(view_key) else "time_proc_max"
             with log_block("calculate_time_boundary", view_key=view_key):
                 if self.time_sliced and view_type == COL_TIME_RANGE:
                     time_boundary = self.time_granularity
@@ -1316,6 +1446,12 @@ class Analyzer(abc.ABC):
     def get_hlm_checkpoint_name(self, view_types: List[ViewType]) -> str:
         return self.get_checkpoint_name(CHECKPOINT_HLM, *sorted(view_types))
 
+    def get_profile_hlm_checkpoint_name(self, view_types: List[ViewType]) -> str:
+        return self.get_checkpoint_name(CHECKPOINT_HLM, "profile", *sorted(view_types))
+
+    def get_trace_hlm_checkpoint_name(self, view_types: List[ViewType]) -> str:
+        return self.get_checkpoint_name(CHECKPOINT_HLM, "trace", *sorted(view_types))
+
     def get_job_time(self, traces: dd.DataFrame) -> float:
         """Computes the total job execution time from the traces.
 
@@ -1352,6 +1488,13 @@ class Analyzer(abc.ABC):
             The total count of I/O events as an integer.
         """
         return traces.index.count().persist()
+
+    def get_profile_event_count(self, profiles: Optional[dd.DataFrame]):
+        if profiles is None:
+            return 0
+        if COL_COUNT in profiles.columns:
+            return profiles[COL_COUNT].fillna(0).sum().persist()
+        return profiles.index.count().persist()
 
     def get_unique_host_count(self, traces: dd.DataFrame):
         """Computes the total number of unique hosts accessed in the traces.
@@ -1495,23 +1638,51 @@ class Analyzer(abc.ABC):
             return fallback()
 
     @staticmethod
-    def set_layer_metrics(hlm: pd.DataFrame, derived_metrics: Dict[str, str]) -> pd.DataFrame:
+    def set_layer_metrics(
+        hlm: pd.DataFrame,
+        derived_metrics: Dict[str, str],
+        size_derived_metrics: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
         # Create an explicit copy to avoid SettingWithCopyWarning
         hlm = hlm.copy()
         hlm_columns = list(hlm.columns)
+        size_derived_metric_set = set(size_derived_metrics or [])
+        is_size_col = {col: (col == "size" or "size_bin" in col) for col in hlm_columns}
+        col_kinds = {}
+        numeric_cols = {}
+
+        for col in hlm_columns:
+            series = hlm[col]
+            if is_size_col[col] or pd.api.types.is_numeric_dtype(series.dtype):
+                col_kinds[col] = "numeric"
+                numeric_cols[col] = to_nullable_numeric(series)
+            elif pd.api.types.is_string_dtype(series.dtype):
+                col_kinds[col] = "string"
+            elif is_set_like_series(series):
+                col_kinds[col] = "set_like"
+            else:
+                raise TypeError(
+                    f"Unsupported data type '{series.dtype}' for column '{col}'. "
+                    "Developer must add explicit handling for this data type in set_layer_metrics."
+                )
+
+        # Build derived columns in-memory and append once to avoid repeated fragmentation.
+        derived_cols: Dict[str, pd.Series] = {}
         for metric, condition in derived_metrics.items():
-            is_data_metric = metric in ["data", "read", "write"]
+            metric_mask = hlm.eval(condition)
+            is_size_metric = metric in size_derived_metric_set
             for col in hlm_columns:
-                is_data_col = col == "size" or "size_bin" in col
-                if not is_data_metric and is_data_col:
+                if not is_size_metric and is_size_col[col]:
                     continue
                 metric_col = f"{metric}_{col}"
-                hlm[metric_col] = pd.NA
-                if pd.api.types.is_string_dtype(hlm.dtypes[col]) and not is_data_col:
-                    hlm[metric_col] = hlm[metric_col].map(lambda x: S())
-                hlm[metric_col] = hlm[metric_col].mask(hlm.eval(condition), hlm[col])
-                if not pd.api.types.is_string_dtype(hlm.dtypes[col]):
-                    hlm[metric_col] = pd.to_numeric(hlm[metric_col], errors="coerce")
+                if col_kinds[col] in {"string", "set_like"}:
+                    # unique_set_flatten skips None for set-like columns downstream.
+                    derived_cols[metric_col] = hlm[col].where(metric_mask, None)
+                else:
+                    derived_cols[metric_col] = numeric_cols[col].where(metric_mask)
+
+        if derived_cols:
+            hlm = pd.concat([hlm, pd.DataFrame(derived_cols, index=hlm.index)], axis=1)
         return hlm
 
     @staticmethod
@@ -1528,20 +1699,18 @@ class Analyzer(abc.ABC):
             return json.dump(data[0], f, cls=NpEncoder)
 
     def store_flat_views(self, flat_views: Dict[ViewKey, pd.DataFrame]):
-        store_flat_view_tasks = []
         for view_key in flat_views:
             flat_view_checkpoint_name = self.get_checkpoint_name(CHECKPOINT_FLAT_VIEW, *list(view_key))
             flat_view_checkpoint_path = self.get_checkpoint_path(name=flat_view_checkpoint_name)
             if self.has_checkpoint(name=flat_view_checkpoint_name):
                 continue
-            store_flat_view_tasks.append(
-                self.dask_client.submit(
-                    self._save_flat_view,
-                    view=flat_views[view_key],
-                    view_path=flat_view_checkpoint_path,
-                )
+            # Save local pandas flat views directly to avoid shipping large payloads
+            # through Dask task graphs.
+            self._save_flat_view(
+                view=flat_views[view_key],
+                view_path=flat_view_checkpoint_path,
             )
-        return store_flat_view_tasks
+        return []
 
     def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
         """Stores a Dask DataFrame view to a Parquet checkpoint.
@@ -1607,9 +1776,12 @@ class Analyzer(abc.ABC):
         metric_boundaries: ViewMetricBoundaries,
         raw_stats: RawStats,
         logical_view_types: bool,
+        trace_hlm: Optional[dd.DataFrame] = None,
+        profile_hlm: Optional[dd.DataFrame] = None,
         layer_main_views: Optional[Dict[Layer, DataFrameType]] = None,
+        system_metrics: Optional[pd.DataFrame] = None,
         is_dask: bool = True,
-    ) -> AnalyzerResultType:
+    ) -> AnalysisResult:
         # Compute layers & views
         with console_block("Compute views"):
             with log_block("create_layers_and_views_tasks"):
@@ -1623,11 +1795,34 @@ class Analyzer(abc.ABC):
                     if layer_main_views is not None and layer in layer_main_views:
                         layer_main_view = layer_main_views[layer]
                     else:
-                        if hlm is None:
-                            raise ValueError("hlm must be provided when layer_main_views is not supplied")
-                        layer_hlm = hlm.copy()
-                        if layer_condition:
-                            layer_hlm = hlm.query(layer_condition)
+                        if hlm is not None:
+                            layer_hlm = hlm.copy()
+                            if layer_condition:
+                                layer_hlm = hlm.query(layer_condition)
+                        else:
+                            if trace_hlm is None and profile_hlm is None:
+                                raise ValueError(
+                                    "Either hlm or at least one of trace_hlm/profile_hlm must be provided "
+                                    "when layer_main_views is not supplied"
+                                )
+                            layer_trace_hlm = trace_hlm
+                            layer_profile_hlm = profile_hlm
+                            if layer_condition:
+                                if layer_trace_hlm is not None:
+                                    layer_trace_hlm = layer_trace_hlm.query(layer_condition)
+                                if layer_profile_hlm is not None:
+                                    layer_profile_hlm = layer_profile_hlm.query(layer_condition)
+                            if layer_trace_hlm is None:
+                                layer_hlm = layer_profile_hlm
+                            elif layer_profile_hlm is None:
+                                layer_hlm = layer_trace_hlm
+                            else:
+                                layer_hlm = self.reconcile_hlm(
+                                    layer=layer,
+                                    profile_hlm=layer_profile_hlm,
+                                    trace_hlm=layer_trace_hlm,
+                                    view_types=proc_view_types,
+                                )
                         layer_main_view = self.compute_main_view(
                             layer=layer,
                             hlm=layer_hlm,
@@ -1715,6 +1910,7 @@ class Analyzer(abc.ABC):
                         flat_view=flat_views[view_key],
                         view_key=view_key,
                         metric_boundaries=metric_boundaries,
+                        system_metrics=system_metrics,
                     )
                     if self.debug:
                         flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
@@ -1740,10 +1936,14 @@ class Analyzer(abc.ABC):
             analysis_facts=analysis_facts,
         )
 
-        return AnalyzerResultType(
+        return AnalysisResult(
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
+            additional_metrics={
+                view_type: list(metrics.keys())
+                for view_type, metrics in (self.preset.additional_metrics or {}).items()
+            },  # type: ignore
             analysis_facts=output_analysis_facts,
             checkpoint_dir=self.checkpoint_dir,
             flat_views=output_flat_views,
@@ -1790,7 +1990,7 @@ class Analyzer(abc.ABC):
         )
 
         # Attach correct traces & view types
-        result._traces = traces
+        result._read_result = ReadTraceResult(traces=traces)
         result.view_types = proc_view_types
 
         return result
@@ -1802,13 +2002,29 @@ class Analyzer(abc.ABC):
         partition_size: str,
     ) -> DataFrameType:
         # Add layer columns
-        hlm_groupby = list(set(view_types).union(HLM_EXTRA_COLS))
+        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
 
+        # Pre-compute alias columns for per-call statistics
+        traces = traces.assign(
+            time_sq=traces["time"] ** 2,
+            size_sq=traces["size"] ** 2,
+            time_call_min=traces["time"],
+            time_call_max=traces["time"],
+            size_call_min=traces["size"],
+            size_call_max=traces["size"],
+        )
         hlm_agg = dict(HLM_AGG)
         hlm_agg.update({col: "sum" for col in bin_cols})
+        # Per-call support columns
+        hlm_agg["time_sq"] = "sum"
+        hlm_agg["size_sq"] = "sum"
+        hlm_agg["time_call_min"] = "min"
+        hlm_agg["time_call_max"] = "max"
+        hlm_agg["size_call_min"] = "min"
+        hlm_agg["size_call_max"] = "max"
 
         if isinstance(traces, dd.DataFrame):
             hlm_agg.update({col: unique_set() for col in view_types_diff})
@@ -1818,8 +2034,6 @@ class Analyzer(abc.ABC):
                 .persist()
                 .repartition(partition_size=partition_size)
                 .replace(0, pd.NA)
-                .map_partitions(fix_hlm_dtypes)
-                .persist()
             )
         else:
             hlm_agg.update({col: unique_set_pd for col in view_types_diff})
@@ -1831,6 +2045,209 @@ class Analyzer(abc.ABC):
 
         return hlm
 
+    def _compute_profile_hlm(
+        self,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str,
+    ) -> dd.DataFrame:
+        profiles = profiles.map_partitions(set_size_bins)
+        return self._compute_high_level_metrics(
+            partition_size=partition_size,
+            traces=profiles,
+            view_types=view_types,
+        )
+
+    def _validate_and_expand_profiles(
+        self,
+        profiles: dd.DataFrame,
+        profile_time_granularity: float,
+    ) -> dd.DataFrame:
+        profile_ratio = self.time_granularity / profile_time_granularity
+        inverse_ratio = profile_time_granularity / self.time_granularity
+        is_coarser_aligned = math.isclose(profile_ratio, round(profile_ratio), rel_tol=0, abs_tol=1e-9)
+        is_finer_aligned = math.isclose(inverse_ratio, round(inverse_ratio), rel_tol=0, abs_tol=1e-9)
+        if not is_coarser_aligned and not is_finer_aligned:
+            raise ValueError(
+                f"Analysis granularity ({self.time_granularity}s) must evenly divide into "
+                f"or be an integer multiple of the profile bucket width "
+                f"({profile_time_granularity}s)"
+            )
+        if self.time_granularity < profile_time_granularity:
+            expansion_factor = int(round(inverse_ratio))
+            profiles = profiles.map_partitions(
+                self._expand_profile_buckets,
+                expansion_factor=expansion_factor,
+                time_resolution=self.time_resolution,
+                time_granularity=self.time_granularity,
+                distribution=self.profile_distribution,
+                meta=profiles._meta,
+            )
+        return profiles
+
+    @staticmethod
+    def _expand_profile_buckets(
+        df: pd.DataFrame,
+        expansion_factor: int,
+        time_resolution: float,
+        time_granularity: float,
+        distribution: str,
+    ) -> pd.DataFrame:
+        """Expand each profile row into ``expansion_factor`` sub-bucket rows.
+
+        When the analysis granularity is finer than the profile bucket width
+        (e.g. 1s analysis vs 5s profiles, expansion_factor=5), each canonical
+        profile row is replicated into *expansion_factor* rows with adjusted
+        ``time_range``, ``time_start``, and ``time_end``.
+
+        Measures (``count``, ``time``, ``size``) are distributed across
+        sub-buckets using the chosen *distribution* strategy:
+
+        * ``"uniform"`` — divide evenly.
+        * ``"weighted"`` — use ``time_min`` / ``time_max`` to shape the
+          distribution so that sub-buckets with higher estimated per-event
+          duration receive proportionally more of the aggregate ``time``.
+          ``count`` and ``size`` remain uniformly split.
+        """
+        if df.empty:
+            return df
+
+        sub_granularity_us = int(time_granularity * time_resolution)
+        output_columns = list(df.columns)
+
+        # Repeat every row expansion_factor times
+        expanded = df.loc[df.index.repeat(expansion_factor)].copy()
+        sub_idx = np.tile(np.arange(expansion_factor), len(df))
+
+        # Recompute time_start / time_end / time_range for each sub-bucket
+        base_start = np.repeat(df["time_start"].values, expansion_factor)
+        expanded["time_start"] = pd.array(
+            (base_start + sub_idx * sub_granularity_us).astype(np.int64), dtype="Int64"
+        )
+        expanded["time_end"] = pd.array(
+            (expanded["time_start"].to_numpy(dtype=np.int64, na_value=0) + sub_granularity_us),
+            dtype="Int64",
+        )
+        expanded["time_range"] = pd.array(
+            expanded["time_start"].to_numpy(dtype=np.int64, na_value=0) // sub_granularity_us,
+            dtype="Int64",
+        )
+
+        # Distribute measures
+        if distribution == "weighted":
+            t_min = np.repeat(df["time_min"].fillna(0).values, expansion_factor)
+            t_max = np.repeat(df["time_max"].fillna(0).values, expansion_factor)
+            if expansion_factor > 1:
+                ramp = t_min + (t_max - t_min) * sub_idx / (expansion_factor - 1)
+            else:
+                ramp = t_min
+            ramp_sums = np.repeat(
+                ramp.reshape(-1, expansion_factor).sum(axis=1),
+                expansion_factor,
+            )
+            weights = np.where(ramp_sums > 0, ramp / ramp_sums, 1.0 / expansion_factor)
+            total_time = np.repeat(df["time"].values, expansion_factor)
+            expanded["time"] = (total_time * weights).astype("float64")
+        else:
+            expanded["time"] = (
+                np.repeat(df["time"].values, expansion_factor) / expansion_factor
+            ).astype("float64")
+
+        # count and size always split uniformly (they are discrete totals)
+        expanded["count"] = (
+            np.repeat(df["count"].fillna(0).values, expansion_factor) / expansion_factor
+        )
+        base_count = expanded["count"].values
+        floor_count = np.floor(base_count).astype(np.int64)
+        remainders = np.repeat(
+            (df["count"].fillna(0).values % expansion_factor).astype(np.int64),
+            expansion_factor,
+        )
+        floor_count = np.where(sub_idx < remainders, floor_count + 1, floor_count)
+        expanded["count"] = pd.array(floor_count, dtype="Int64")
+
+        orig_size = df["size"].values
+        has_size = pd.notna(orig_size)
+        rep_size = np.repeat(
+            np.where(has_size, orig_size.astype(float), 0.0), expansion_factor
+        )
+        rep_has_size = np.repeat(has_size, expansion_factor)
+        size_vals = np.where(rep_has_size, (rep_size / expansion_factor).astype(np.int64), 0)
+        size_mask = ~rep_has_size
+        expanded["size"] = pd.array(size_vals, dtype="Int64")
+        expanded.loc[size_mask, "size"] = pd.NA
+
+        # stat columns carry through unchanged (they are per-event bounds)
+        expanded.reset_index(drop=True, inplace=True)
+        return expanded[output_columns]
+
+    def _compute_hybrid_hlm(
+        self,
+        traces: dd.DataFrame,
+        profiles: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str,
+    ) -> dd.DataFrame:
+        trace_hlm = self._compute_high_level_metrics(
+            partition_size=partition_size,
+            traces=traces,
+            view_types=view_types,
+        )
+        profile_hlm = self.compute_profile_hlm(
+            partition_size=partition_size,
+            profiles=profiles,
+            view_types=view_types,
+        )
+        return self._reconcile_hlm(
+            partition_size=partition_size,
+            profile_hlm=profile_hlm,
+            trace_hlm=trace_hlm,
+            view_types=view_types,
+        )
+
+    def _reconcile_hlm(
+        self,
+        trace_hlm: dd.DataFrame,
+        profile_hlm: dd.DataFrame,
+        view_types: List[ViewType],
+        partition_size: str,
+        layer: Optional[Layer] = None,
+    ) -> dd.DataFrame:
+        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
+        trace_hlm = trace_hlm.reset_index()
+        profile_hlm = profile_hlm.reset_index()
+        for col in hlm_groupby:
+            if col in trace_hlm.columns and col in profile_hlm.columns:
+                profile_dtype = profile_hlm._meta[col].dtype
+                if trace_hlm._meta[col].dtype != profile_dtype:
+                    trace_hlm[col] = trace_hlm[col].astype(profile_dtype)
+        trace_keys = trace_hlm[hlm_groupby].drop_duplicates().assign(_trace_present=1)
+        profile_hlm = profile_hlm.merge(trace_keys, how="left", on=hlm_groupby).persist()
+        overlap_count = int(profile_hlm["_trace_present"].fillna(0).sum().compute())
+        if overlap_count > 0:
+            logger.warning("Hybrid reconcile found overlapping HLM keys", layer=layer, overlap_count=overlap_count)
+        else:
+            logger.info("Hybrid reconcile found no overlapping HLM keys", layer=layer, overlap_count=overlap_count)
+        profile_only = profile_hlm[profile_hlm["_trace_present"].isna()].drop(columns=["_trace_present"])
+        combined_hlm = dd.concat([trace_hlm, profile_only], interleave_partitions=True)
+        bin_cols = [col for col in combined_hlm.columns if "_bin_" in col]
+        view_types_diff = list(set(VIEW_TYPES).difference(view_types))
+        hlm_agg = dict(HLM_AGG)
+        hlm_agg.update({col: "sum" for col in bin_cols})
+        for col in view_types_diff:
+            if col in combined_hlm.columns:
+                hlm_agg[col] = unique_set_flatten()
+        hlm = (
+            combined_hlm.groupby(hlm_groupby)
+            .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
+            .persist()
+            .repartition(partition_size=partition_size)
+            .replace(0, pd.NA)
+        )
+        if bin_cols:
+            hlm[bin_cols] = hlm[bin_cols].astype("Int32")
+        return hlm.persist()
+
     def _compute_main_view(
         self,
         layer: Layer,
@@ -1840,22 +2257,26 @@ class Analyzer(abc.ABC):
     ) -> DataFrameType:
         is_dask = isinstance(hlm, dd.DataFrame)
         with log_block("drop_and_set_metrics", layer=layer):
-            # Set layer metrics
-            if "posix" not in layer.lower():
+            size_layers = {configured_layer.lower() for configured_layer in (self.preset.size_layers or [])}
+            keep_size_for_layer = layer.lower() in size_layers
+            if not keep_size_for_layer:
                 size_cols = [col for col in hlm.columns if col.startswith("size")]
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
             layer_derived_metrics = self.preset.derived_metrics[layer]
+            layer_size_derived_metrics = (self.preset.size_derived_metrics or {}).get(layer.lower(), [])
             if is_dask:
                 hlm = hlm.map_partitions(
                     self.set_layer_metrics,
                     derived_metrics=layer_derived_metrics,
+                    size_derived_metrics=layer_size_derived_metrics,
                 )
             else:
                 hlm = self.set_layer_metrics(
                     hlm=hlm,
                     derived_metrics=layer_derived_metrics,
+                    size_derived_metrics=layer_size_derived_metrics,
                 )
 
         with log_block("build_agg_dict", layer=layer):
@@ -1869,7 +2290,12 @@ class Analyzer(abc.ABC):
                     else:
                         main_view_agg[col] = unique_set_flatten_pd
                 elif col not in HLM_EXTRA_COLS:
-                    main_view_agg[col] = "sum"
+                    if col.endswith("_call_min"):
+                        main_view_agg[col] = "min"
+                    elif col.endswith("_call_max"):
+                        main_view_agg[col] = "max"
+                    else:
+                        main_view_agg[col] = "sum"
 
         with log_block("compute_main_view", layer=layer):
             if is_dask:
@@ -1923,6 +2349,12 @@ class Analyzer(abc.ABC):
                         view_agg[col] = [unique_set_flatten()]
                     else:
                         view_agg[col] = [unique_set_flatten_pd]
+                elif col.endswith("_sq"):
+                    view_agg[col] = ["sum"]
+                elif col.endswith("_call_min"):
+                    view_agg[col] = ["min"]
+                elif col.endswith("_call_max"):
+                    view_agg[col] = ["max"]
                 elif pd.api.types.is_numeric_dtype(records[col].dtype):
                     view_agg[col] = [
                         "sum",
@@ -1960,13 +2392,24 @@ class Analyzer(abc.ABC):
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
             if view_type != COL_PROC_NAME:
-                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).sum().reset_index()
+                pre_agg = {}
+                for col in pre_view.columns:
+                    if col in (view_type, COL_PROC_NAME):
+                        continue
+                    if col.endswith("_call_min"):
+                        pre_agg[col] = "min"
+                    elif col.endswith("_call_max"):
+                        pre_agg[col] = "max"
+                    else:
+                        pre_agg[col] = "sum"
+                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
             view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
 
         with log_block("flatten_column_names", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
+            view = view.rename(columns=build_view_rename_map(view.columns))
 
         with log_block("set_quantile_metrics", layer=layer, view_key=view_key):
             if is_dask:
@@ -1976,8 +2419,13 @@ class Analyzer(abc.ABC):
 
         with log_block("set_unique_counts+fix_dtypes", layer=layer, view_key=view_key):
             if is_dask:
-                view = view.map_partitions(set_unique_counts, layer=layer).map_partitions(fix_dtypes)
+                view = (
+                    view.map_partitions(derive_call_stats)
+                    .map_partitions(set_unique_counts, layer=layer)
+                    .map_partitions(fix_dtypes)
+                )
             else:
+                view = derive_call_stats(view)
                 view = set_unique_counts(view, layer=layer)
                 view = fix_dtypes(view)
 
@@ -1991,6 +2439,7 @@ class Analyzer(abc.ABC):
         flat_view: pd.DataFrame,
         view_key: ViewKey,
         metric_boundaries: ViewMetricBoundaries,
+        system_metrics: Optional[pd.DataFrame] = None,
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
@@ -2011,20 +2460,32 @@ class Analyzer(abc.ABC):
                 time_boundary_layer=self.preset.time_boundary_layer,
             )
         with log_block("set_additional_metrics", view_key=view_key):
-            flat_view = self._set_additional_metrics(flat_view, is_view_process_based=is_view_process_based)
+            flat_view = self._set_additional_metrics(
+                flat_view,
+                view_key=view_key,
+            )
+        if system_metrics is not None and not system_metrics.empty and COL_TIME_RANGE in view_key:
+            with log_block("join_system_metrics", view_key=view_key):
+                sys_cols = [c for c in system_metrics.columns if c.startswith("sys_")]
+                if sys_cols:
+                    sys_lookup = system_metrics.set_index(COL_TIME_RANGE)[sys_cols]
+                    flat_view = flat_view.join(sys_lookup, how="left")
         return flat_view.sort_index(axis=1)
 
     @staticmethod
     def _save_flat_view(view: pd.DataFrame, view_path: str):
         view.to_parquet(f"{view_path}.parquet")
 
-    def _set_additional_metrics(self, view: pd.DataFrame, is_view_process_based: bool, epsilon=1e-9) -> pd.DataFrame:
-        time_metric = "time_sum" if is_view_process_based else "time_max"
-        for metric, eval_condition in self.preset.additional_metrics.items():
+    def _set_additional_metrics(self, view: pd.DataFrame, view_key: ViewKey, epsilon=1e-9) -> pd.DataFrame:
+        view_type = view_key[-1]
+        is_view_process_based = self.is_view_process_based(view_key)
+        time_proc_metric = "time_sum" if is_view_process_based else "time_proc_max"
+        view_additional_metrics = (self.preset.additional_metrics or {}).get(view_type, {})
+        for metric, eval_condition in view_additional_metrics.items():
             eval_condition = eval_condition.format(
                 epsilon=epsilon,
                 time_interval=self.time_granularity,
-                time_metric=time_metric,
+                time_metric=time_proc_metric,
             )
             view = view.eval(f"{metric} = {eval_condition}")
             numerator_denominators = extract_numerator_and_denominators(eval_condition)

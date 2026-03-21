@@ -1,6 +1,7 @@
 py.install_sources(
     [
         '__init__.py',
+        'collection_utils.py',
         'common_utils.py',
         'dask_agg.py',
         'env_utils.py',

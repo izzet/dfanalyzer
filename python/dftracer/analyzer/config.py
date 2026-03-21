@@ -25,18 +25,21 @@ DERIVED_POSIX_METRICS = {
     'other': 'io_cat == 6',
     'sync': 'io_cat == 7',
 }
+DERIVED_POSIX_SIZE_METRICS = ('data', 'read', 'write')
 HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", False)
 
 
 @dc.dataclass
 class AnalyzerPresetConfig:
-    additional_metrics: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
+    additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     async_layers: Optional[List[str]] = dc.field(default_factory=list)
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     layer_defs: Dict[str, Optional[str]] = MISSING
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=dict)
+    size_layers: Optional[List[str]] = dc.field(default_factory=list)
     time_boundary_layer: str = MISSING
     unscored_metrics: Optional[List[str]] = dc.field(default_factory=list)
 
@@ -67,6 +70,12 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
         }
     )
     name: str = "posix"
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=lambda: {
+            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+        }
+    )
+    size_layers: Optional[List[str]] = dc.field(default_factory=lambda: ['posix'])
     time_boundary_layer: str = "posix"
 
 
@@ -90,7 +99,6 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'app': {},
             'training': {},
             'epoch': {},
-            'step': {},
             'compute': {},
             'fetch_data': {},
             'checkpoint': {},
@@ -145,10 +153,9 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'app': None,
             'training': 'app',
             'epoch': 'training',
-            'step': 'epoch',
-            'compute': 'step',
-            'fetch_data': 'step',
-            'checkpoint': 'step',
+            'compute': 'epoch',
+            'fetch_data': 'epoch',
+            'checkpoint': 'epoch',
             'data_loader': 'fetch_data',
             'data_loader_fork': 'fetch_data',
             'reader': 'data_loader',
@@ -177,22 +184,66 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             },
         }
     )
-    name: str = "dlio-pre-ai-logging"
+    name: str = "dlio-prev"
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=lambda: {
+            'posix': list(DERIVED_POSIX_SIZE_METRICS),
+            'reader_posix': list(DERIVED_POSIX_SIZE_METRICS),
+            'checkpoint_posix': list(DERIVED_POSIX_SIZE_METRICS),
+        }
+    )
+    size_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: [
+            'posix',
+            'reader_posix',
+            'checkpoint_posix',
+        ]
+    )
     time_boundary_layer: str = "app"
 
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {
+            'app': {},
+            'training': {},
+            'epoch': {},
+            'step': {},
+            'compute': {},
+            'fetch_data': {},
+            'checkpoint': {},
+            'comm': {},
+            'device': {},
+            'data_loader': {
+                'init': 'func_name.str.contains("init")',
+                'item': 'func_name.str.contains("item")',
+            },
+            'data_loader_fork': {},
+            'reader': {
+                'close': 'func_name.str.contains(".close")',
+                'open': 'func_name.str.contains(".open")',
+                'preprocess': 'func_name.str.contains(".preprocess")',
+                'sample': 'func_name.str.contains(".get_sample")',
+            },
+            'posix': DERIVED_POSIX_METRICS,
+            'reader_posix': DERIVED_POSIX_METRICS,
+            'checkpoint_posix': DERIVED_POSIX_METRICS,
+            'other_posix': DERIVED_POSIX_METRICS,
+        }
+    )
     layer_defs: Dict[str, Optional[str]] = dc.field(
         default_factory=lambda: {
             'app': 'func_name == "ai_root"',
             'training': 'cat == "pipeline" & func_name == "train"',
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
             'step': 'cat == "pipeline" & func_name.str.startswith("step")',
-            'compute': 'cat == "compute" & func_name == "compute"',
+            'compute': 'cat == "compute"',
             'fetch_data': 'func_name == "fetch.iter"',
             'checkpoint': 'cat == "checkpoint"',
-            'data_loader': 'cat == "data"',
+            'comm': 'cat == "comm"',
+            'device': 'cat == "device"',
+            'data_loader': 'cat.isin(["data", "data_loader", "dataloader"])',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader" or func_name == "preprocess"',
             'posix': 'cat.str.contains("posix|stdio")',
@@ -207,6 +258,25 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             # 'other_posix_ssd': 'cat.isin(["posix_ssd", "stdio_ssd"])',
         }
     )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'app': None,
+            'training': 'app',
+            'epoch': 'training',
+            'step': 'epoch',
+            'compute': 'step',
+            'fetch_data': 'step',
+            'checkpoint': 'step',
+            'comm': 'epoch',
+            'device': 'epoch',
+            'data_loader': 'fetch_data',
+            'data_loader_fork': 'fetch_data',
+            'reader': 'data_loader',
+            'posix': None,
+            'reader_posix': 'reader',
+            'checkpoint_posix': 'checkpoint',
+        }
+    )
     name: str = "dlio"
 
 
@@ -214,6 +284,8 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
 class AnalyzerConfig:
     checkpoint: Optional[bool] = False
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
+    profile_distribution: Optional[str] = "uniform"
+    profile_time_granularity: Optional[float] = 5
     preset: Optional[AnalyzerPresetConfig] = MISSING
     quantile_stats: Optional[bool] = False
     time_approximate: Optional[bool] = True
@@ -358,6 +430,12 @@ class ConsoleOutputConfig(OutputConfig):
 
 
 @dc.dataclass
+class JSONOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.JSONOutput"
+    file_path: Optional[str] = ""
+
+
+@dc.dataclass
 class CSVOutputConfig(OutputConfig):
     _target_: str = "dftracer.analyzer.output.CSVOutput"
 
@@ -452,7 +530,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
     cs.store(group="analyzer", name="recorder", node=RecorderAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
-    cs.store(group="analyzer/preset", name="dlio-pre-ai-logging", node=AnalyzerPresetConfigDLIO)
+    cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
@@ -463,6 +541,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="input", name="zmq", node=ZMQInputConfig)
     cs.store(group="input", name="mofka", node=MofkaInputConfig)
     cs.store(group="output", name="console", node=ConsoleOutputConfig)
+    cs.store(group="output", name="json", node=JSONOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
     cs.store(group="output", name="zmq", node=ZMQOutputConfig)

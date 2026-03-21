@@ -83,12 +83,12 @@ The results can then be passed to the output handler to display a summary.
 Result Exploration
 ------------------
 
-The ``result`` object (of type ``AnalyzerResultType``) contains detailed views of the analyzed data, which you can explore using pandas DataFrames. The ``AnalyzerResultType`` provides convenient methods to access different aspects of the analysis results.
+The ``result`` object (of type ``AnalysisResult``) contains detailed views of the analyzed data, which you can explore using pandas DataFrames. The ``AnalysisResult`` provides convenient methods to access different aspects of the analysis results.
 
-AnalyzerResultType Class
-~~~~~~~~~~~~~~~~~~~~~~~~
+AnalysisResult Class
+~~~~~~~~~~~~~~~~~~~~
 
-The ``AnalyzerResultType`` dataclass encapsulates all the results from a DFAnalyzer analysis run. It provides both direct attribute access and convenience methods for exploring the data.
+The ``AnalysisResult`` dataclass encapsulates all the results from a DFAnalyzer analysis run. It provides both direct attribute access and convenience methods for exploring the data.
 
 **Key Distinction**: Most users should primarily use ``flat_views`` (pandas DataFrames) for interactive analysis. The other views are Dask DataFrames exposed for advanced users who need distributed processing capabilities.
 
@@ -139,4 +139,4 @@ Display the raw trace data, showing individual I/O events (returns Dask DataFram
 
 .. code-block:: python
 
-   result._traces.head()
+   result.traces.head()

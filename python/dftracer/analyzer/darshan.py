@@ -7,7 +7,7 @@ import pandas as pd
 
 from .analyzer import Analyzer
 from .constants import COL_TIME_END, COL_TIME_START, IOCategory, Layer
-from .types import RawStats
+from .types import RawStats, ReadTraceResult
 
 DEFAULT_APP_NAME = 'app'
 DEFAULT_HOST_NAME = 'localhost'
@@ -75,6 +75,8 @@ class DarshanAnalyzer(Analyzer):
             job_time=self.job_time,
             time_granularity=self.time_granularity,
             time_resolution=self.time_resolution,
+            trace_event_count=len(file_name_ddf),
+            profile_event_count=0,
             total_event_count=len(file_name_ddf),
             unique_file_count=file_name_ddf['file_name'].nunique(),
             unique_host_count=file_name_ddf['host_name'].nunique(),
@@ -90,13 +92,15 @@ class DarshanAnalyzer(Analyzer):
             layer_main_views={Layer.POSIX: file_name_view},
             logical_view_types=logical_view_types,
             metric_boundaries=metric_boundaries,
+            profile_hlm=None,
             proc_view_types=self.ensure_proc_view_type(view_types=view_types),
             raw_stats=raw_stats,
+            trace_hlm=None,
         )
 
     def read_trace(self, trace_path, extra_columns, extra_columns_fn):
         df = pd.concat(map(self._create_dxt_dataframe, self.reports), ignore_index=True)
-        return dd.from_pandas(df, npartitions=len(self.reports))
+        return ReadTraceResult(traces=dd.from_pandas(df, npartitions=len(self.reports)))
 
     def get_job_time(self, traces: dd.DataFrame) -> float:
         return self.job_time

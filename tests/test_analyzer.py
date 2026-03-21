@@ -467,7 +467,7 @@ def test_compute_view_proc_pandas_basic(dummy_analyzer: DummyAnalyzer):
     # Enrich to compute frac totals and ops metrics
     enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=True)
     ecols = enriched.columns.tolist()
-    assert "time_frac_total" in ecols and "count_frac_total" in ecols and "size_frac_total" in ecols
+    assert "time_proc_frac_total" in ecols and "count_frac_total" in ecols and "size_proc_frac_total" in ecols
     assert "ops_slope" in ecols  # from set_view_metrics
 
     grp = enriched.reset_index()
@@ -477,11 +477,11 @@ def test_compute_view_proc_pandas_basic(dummy_analyzer: DummyAnalyzer):
     assert pytest.approx(row_p["count_sum"], rel=1e-6) == 10.0
     assert pytest.approx(row_p["size_sum"], rel=1e-6) == 300.0
     # Min across grouped (proc,file) rows after pre-grouping: zero got summed into 10
-    assert pytest.approx(row_p["count_min"], rel=1e-6) == 10.0
+    assert pytest.approx(row_p["count_proc_min"], rel=1e-6) == 10.0
     # Frac totals should be 0.5 for both procs; slope 1.0
-    assert pytest.approx(row_p["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["time_proc_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_p["count_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_p["size_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["size_proc_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_p["ops_slope"], rel=1e-6) == 1.0
     # Unique file_name count
     assert row_p["file_name_nunique"] == 1
@@ -513,15 +513,15 @@ def test_compute_view_file_pandas_basic(dummy_analyzer: DummyAnalyzer):
     row_f1 = grp[grp["file_name"] == "f1"].iloc[0]
     row_f2 = grp[grp["file_name"] == "f2"].iloc[0]
     # Process-unaware time metrics use max over per-proc-summed time
-    assert pytest.approx(row_f1["time_max"], rel=1e-6) == 3.0
-    assert pytest.approx(row_f2["time_max"], rel=1e-6) == 3.0
+    assert pytest.approx(row_f1["time_proc_max"], rel=1e-6) == 3.0
+    assert pytest.approx(row_f2["time_proc_max"], rel=1e-6) == 3.0
     # Frac totals 0.5 each
-    assert pytest.approx(row_f1["time_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_f2["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f1["time_proc_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["time_proc_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_f1["count_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_f2["count_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_f1["size_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_f2["size_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f1["size_proc_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["size_proc_frac_total"], rel=1e-6) == 0.5
     # Unique proc_name count per file
     assert row_f1["proc_name_nunique"] == 1
     assert row_f2["proc_name_nunique"] == 1
@@ -550,9 +550,9 @@ def test_compute_view_proc_dask_basic(dummy_analyzer: DummyAnalyzer):
     enriched = set_view_metrics(out.copy(), metric_boundaries={}, is_view_process_based=True)
     grp = enriched.reset_index()
     row_p = grp[grp["proc_name"] == "p#h#1#t"].iloc[0]
-    assert pytest.approx(row_p["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["time_proc_frac_total"], rel=1e-6) == 0.5
     assert pytest.approx(row_p["count_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_p["size_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_p["size_proc_frac_total"], rel=1e-6) == 0.5
 
 
 def test_compute_view_file_dask_basic(dummy_analyzer: DummyAnalyzer):
@@ -579,8 +579,8 @@ def test_compute_view_file_dask_basic(dummy_analyzer: DummyAnalyzer):
     grp = enriched.reset_index()
     row_f1 = grp[grp["file_name"] == "f1"].iloc[0]
     row_f2 = grp[grp["file_name"] == "f2"].iloc[0]
-    assert pytest.approx(row_f1["time_frac_total"], rel=1e-6) == 0.5
-    assert pytest.approx(row_f2["time_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f1["time_proc_frac_total"], rel=1e-6) == 0.5
+    assert pytest.approx(row_f2["time_proc_frac_total"], rel=1e-6) == 0.5
 
 
 # ---------- Dask compute_view quantile stats ----------

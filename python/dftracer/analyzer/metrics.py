@@ -62,15 +62,20 @@ def set_main_metrics(df: pd.DataFrame):
         count_col = size_col.replace('size', 'count')
         intensity_col = size_col.replace('size', 'intensity')
         time_col = size_col.replace('size', 'time')
-        df[size_col] = df[size_col].where(df[size_col] > 0, pd.NA)
-        df[bw_col] = (df[size_col] / df[time_col]).where(df[size_col] > 0, pd.NA)
-        df[intensity_col] = (df[count_col] / df[size_col]).where(df[size_col] > 0, pd.NA)
+        has_size = df[size_col] > 0
+        safe_size = pd.to_numeric(df[size_col], errors="coerce").replace(0, np.nan)
+        safe_time = pd.to_numeric(df[time_col], errors="coerce").replace(0, np.nan)
+        safe_count = pd.to_numeric(df[count_col], errors="coerce")
+        df[size_col] = df[size_col].where(has_size, pd.NA)
+        df[bw_col] = (safe_size / safe_time).where(has_size, pd.NA)
+        df[intensity_col] = (safe_count / safe_size).where(has_size, pd.NA)
         new_metrics.extend([bw_col, intensity_col, time_col])
 
     for count_col in count_cols:
         ops_col = count_col.replace('count', 'ops')
         time_col = count_col.replace('count', 'time')
-        df[ops_col] = df[count_col] / df[time_col]
+        safe_time = pd.to_numeric(df[time_col], errors="coerce").replace(0, np.nan)
+        df[ops_col] = pd.to_numeric(df[count_col], errors="coerce") / safe_time
         new_metrics.append(ops_col)
 
     df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
@@ -86,44 +91,75 @@ def set_view_metrics(
     df = df.copy()
 
     count_metric = 'count_sum'
-    size_metric = 'size_sum'
-    time_metric = 'time_sum' if is_view_process_based else 'time_max'
+    size_proc_metric = 'size_sum' if is_view_process_based else 'size_proc_max'
+    size_call_metric = 'size_sum'
+    time_proc_metric = 'time_sum' if is_view_process_based else 'time_proc_max'
+    time_call_metric = 'time_sum'
 
     view_metrics = list(set(df.columns.tolist()))
-    new_metrics: List[str] = []
+    new_metrics: Dict[str, pd.Series] = {}
 
     for metric in view_metrics:
         if metric.endswith(count_metric):
             count_col = metric
             count_frac_total_col = metric.replace(count_metric, 'count_frac_total')
             count_sum = df[count_col].sum()
-            df[count_frac_total_col] = df[count_col] / count_sum if count_sum > 0 else pd.NA
-            new_metrics.append(count_frac_total_col)
-        elif metric.endswith(size_metric):
+            if count_sum > 0:
+                new_metrics[count_frac_total_col] = df[count_col] / count_sum
+            else:
+                new_metrics[count_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+        elif metric.endswith(size_proc_metric):
             size_col = metric
-            size_frac_total_col = metric.replace(size_metric, 'size_frac_total')
-            size_sum = df[size_col].sum()
-            df[size_frac_total_col] = df[size_col] / size_sum if size_sum > 0 else pd.NA
-            new_metrics.append(size_frac_total_col)
-        elif metric.endswith(time_metric):
+            size_proc_frac_total_col = metric.replace(size_proc_metric, 'size_proc_frac_total')
+            size_total = df[size_col].sum()
+            if size_total > 0:
+                new_metrics[size_proc_frac_total_col] = df[size_col] / size_total
+            else:
+                new_metrics[size_proc_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+        elif metric.endswith(time_proc_metric):
             time_col = metric
-            time_frac_total_col = metric.replace(time_metric, 'time_frac_total')
-            time_sum = df[time_col].sum()
-            df[time_frac_total_col] = df[time_col] / time_sum if time_sum > 0 else pd.NA
-            new_metrics.append(time_frac_total_col)
+            time_proc_frac_total_col = metric.replace(time_proc_metric, 'time_proc_frac_total')
+            time_total = df[time_col].sum()
+            if time_total > 0:
+                new_metrics[time_proc_frac_total_col] = df[time_col] / time_total
+            else:
+                new_metrics[time_proc_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
 
-    count_time_frac_metric_pairs = _find_metric_pairs(new_metrics, 'count_frac_total', 'time_frac_total')
-    for count_frac_total_col, time_frac_total_col in count_time_frac_metric_pairs:
+    # Compute call_frac_total metrics (always from *_sum, regardless of view type)
+    for metric in view_metrics:
+        if metric.endswith(size_call_metric):
+            size_call_col = metric
+            size_call_frac_total_col = metric.replace(size_call_metric, 'size_call_frac_total')
+            size_call_total = df[size_call_col].sum()
+            if size_call_total > 0:
+                new_metrics[size_call_frac_total_col] = df[size_call_col] / size_call_total
+            else:
+                new_metrics[size_call_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+        elif metric.endswith(time_call_metric):
+            time_call_col = metric
+            time_call_frac_total_col = metric.replace(time_call_metric, 'time_call_frac_total')
+            time_call_total = df[time_call_col].sum()
+            if time_call_total > 0:
+                new_metrics[time_call_frac_total_col] = df[time_call_col] / time_call_total
+            else:
+                new_metrics[time_call_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+
+    count_time_proc_frac_metric_pairs = _find_metric_pairs(list(new_metrics.keys()), 'count_frac_total', 'time_proc_frac_total')
+    for count_frac_total_col, time_proc_frac_total_col in count_time_proc_frac_metric_pairs:
         ops_percentile_col = count_frac_total_col.replace('count_frac_total', 'ops_percentile')
         ops_slope_col = count_frac_total_col.replace('count_frac_total', 'ops_slope')
-        ops_slope = df[time_frac_total_col] / df[count_frac_total_col]
+        ops_slope = new_metrics[time_proc_frac_total_col] / new_metrics[count_frac_total_col]
         ops_slope = ops_slope.replace([np.inf, -np.inf], pd.NA)
-        df[ops_percentile_col] = ops_slope.rank(pct=True)
-        df[ops_slope_col] = ops_slope
-        new_metrics.append(ops_percentile_col)
-        new_metrics.append(ops_slope_col)
+        new_metrics[ops_percentile_col] = ops_slope.rank(pct=True)
+        new_metrics[ops_slope_col] = ops_slope
 
-    df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')
+    if new_metrics:
+        new_metrics_df = pd.DataFrame(new_metrics, index=df.index)
+        new_metrics_df = new_metrics_df.replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        overlapping_cols = [col for col in new_metrics_df.columns if col in df.columns]
+        if overlapping_cols:
+            df = df.drop(columns=overlapping_cols)
+        df = pd.concat([df, new_metrics_df], axis=1)
 
     return df.sort_index(axis=1)
 
@@ -137,105 +173,163 @@ def set_cross_layer_metrics(
     is_view_process_based: bool,
     time_boundary_layer: str,
 ) -> pd.DataFrame:
-    time_metric = 'time_sum' if is_view_process_based else 'time_max'
-    compute_time_metric = f"compute_{time_metric}"
-    time_boundary_metric = f"{time_boundary_layer}_{time_metric}"
+    time_proc_metric = 'time_sum' if is_view_process_based else 'time_proc_max'
+    time_call_metric = 'time_sum'
+    compute_time_proc_metric = f"compute_{time_proc_metric}"
+    compute_time_call_metric = f"compute_{time_call_metric}"
+    time_proc_boundary_metric = f"{time_boundary_layer}_{time_proc_metric}"
+    time_call_boundary_metric = f"{time_boundary_layer}_{time_call_metric}"
 
     # Collect new columns and assign them in batch to avoid fragmentation warnings
     x_layer_metrics: Dict[str, pd.Series] = {}
 
     # Set relational time metrics for layers
     for layer in layers:
-        layer_time = df[f"{layer}_{time_metric}"]
+        layer_time_proc = df[f"{layer}_{time_proc_metric}"]
+        layer_time_call = df[f"{layer}_{time_call_metric}"]
 
-        time_frac_boundary_col = f"{layer}_time_frac_{time_boundary_layer}"
-        x_layer_metrics[time_frac_boundary_col] = layer_time / df[time_boundary_metric]
+        # Proc: frac_boundary
+        time_proc_frac_boundary_col = f"{layer}_time_proc_frac_{time_boundary_layer}"
+        x_layer_metrics[time_proc_frac_boundary_col] = layer_time_proc / df[time_proc_boundary_metric]
+        # Call: frac_boundary
+        time_call_frac_boundary_col = f"{layer}_time_call_frac_{time_boundary_layer}"
+        x_layer_metrics[time_call_frac_boundary_col] = layer_time_call / df[time_call_boundary_metric]
 
         child_layers = [child for child, parent in layer_deps.items() if parent == layer]
         if not child_layers:
             continue
 
-        o_time_col = f"o_{layer}_{time_metric}"
-        o_time_frac_boundary_col = f"o_{layer}_time_frac_{time_boundary_layer}"
-        o_time_frac_self_col = f"o_{layer}_time_frac_self"
-        o_time_frac_total_col = o_time_col.replace(time_metric, 'time_frac_total')
+        # Proc: overhead
+        o_time_proc_col = f"o_{layer}_{time_proc_metric}"
+        o_time_proc_frac_boundary_col = f"o_{layer}_time_proc_frac_{time_boundary_layer}"
+        o_time_proc_frac_self_col = f"o_{layer}_time_proc_frac_self"
+        o_time_proc_frac_total_col = o_time_proc_col.replace(time_proc_metric, 'time_proc_frac_total')
 
-        child_time_sum = sum(df[f"{child}_{time_metric}"].fillna(0) for child in child_layers)
-        o_time = np.maximum(layer_time - child_time_sum, 0)
-        o_time_sum = o_time.sum()
+        child_time_proc_sum = sum(df[f"{child}_{time_proc_metric}"].fillna(0) for child in child_layers)
+        o_time_proc = np.maximum(layer_time_proc - child_time_proc_sum, 0)
+        o_time_proc_total = o_time_proc.sum()
 
-        o_time_series = pd.array(o_time, dtype='Float64')
-        x_layer_metrics[o_time_col] = o_time_series
-        x_layer_metrics[o_time_frac_boundary_col] = o_time_series / df[time_boundary_metric]
-        x_layer_metrics[o_time_frac_self_col] = o_time_series / layer_time
-        x_layer_metrics[o_time_frac_total_col] = pd.NA
-        if o_time_sum > 0:
-            x_layer_metrics[o_time_frac_total_col] = o_time_series / o_time_sum
+        o_time_proc_series = pd.array(o_time_proc, dtype='Float64')
+        x_layer_metrics[o_time_proc_col] = o_time_proc_series
+        x_layer_metrics[o_time_proc_frac_boundary_col] = o_time_proc_series / df[time_proc_boundary_metric]
+        x_layer_metrics[o_time_proc_frac_self_col] = o_time_proc_series / layer_time_proc
+        x_layer_metrics[o_time_proc_frac_total_col] = pd.NA
+        if o_time_proc_total > 0:
+            x_layer_metrics[o_time_proc_frac_total_col] = o_time_proc_series / o_time_proc_total
 
-        layer_has_time = layer_time.sum() > 0
+        # Call: overhead
+        o_time_call_col = f"o_{layer}_{time_call_metric}"
+        o_time_call_frac_boundary_col = f"o_{layer}_time_call_frac_{time_boundary_layer}"
+        o_time_call_frac_self_col = f"o_{layer}_time_call_frac_self"
+        o_time_call_frac_total_col = f"o_{layer}_time_call_frac_total"
+
+        child_time_call_sum = sum(df[f"{child}_{time_call_metric}"].fillna(0) for child in child_layers)
+        o_time_call = np.maximum(layer_time_call - child_time_call_sum, 0)
+        o_time_call_total = o_time_call.sum()
+
+        o_time_call_series = pd.array(o_time_call, dtype='Float64')
+        x_layer_metrics[o_time_call_col] = o_time_call_series
+        x_layer_metrics[o_time_call_frac_boundary_col] = o_time_call_series / df[time_call_boundary_metric]
+        x_layer_metrics[o_time_call_frac_self_col] = o_time_call_series / layer_time_call
+        x_layer_metrics[o_time_call_frac_total_col] = pd.NA
+        if o_time_call_total > 0:
+            x_layer_metrics[o_time_call_frac_total_col] = o_time_call_series / o_time_call_total
+
+        # Proc + Call: frac_parent
+        layer_has_time_proc = layer_time_proc.sum() > 0
+        layer_has_time_call = layer_time_call.sum() > 0
         for child_layer in child_layers:
-            time_frac_parent_col = f"{child_layer}_time_frac_parent"
-            x_layer_metrics[time_frac_parent_col] = pd.NA
-            if layer_has_time:
-                x_layer_metrics[time_frac_parent_col] = df[f"{child_layer}_{time_metric}"] / layer_time
+            time_proc_frac_parent_col = f"{child_layer}_time_proc_frac_parent"
+            x_layer_metrics[time_proc_frac_parent_col] = pd.NA
+            if layer_has_time_proc:
+                x_layer_metrics[time_proc_frac_parent_col] = df[f"{child_layer}_{time_proc_metric}"] / layer_time_proc
+
+            time_call_frac_parent_col = f"{child_layer}_time_call_frac_parent"
+            x_layer_metrics[time_call_frac_parent_col] = pd.NA
+            if layer_has_time_call:
+                x_layer_metrics[time_call_frac_parent_col] = df[f"{child_layer}_{time_call_metric}"] / layer_time_call
 
     # Set relational time metrics for derived metrics
     for layer in derived_metrics:
         for dm in derived_metrics[layer]:
             dm_col = f"{layer}_{dm}"
-            dm_time_col = f"{dm_col}_{time_metric}"
+            dm_time_proc_col = f"{dm_col}_{time_proc_metric}"
+            dm_time_call_col = f"{dm_col}_{time_call_metric}"
 
-            if dm_time_col not in df.columns:
-                continue
+            # Proc
+            if dm_time_proc_col in df.columns:
+                dm_time_proc = df[dm_time_proc_col]
+                dm_time_proc_total = dm_time_proc.sum()
 
-            dm_time_frac_boundary_col = f"{dm_col}_time_frac_{time_boundary_layer}"
-            dm_time_frac_parent_col = f"{dm_col}_time_frac_parent"
-            dm_time_frac_total_col = f"{dm_col}_time_frac_total"
+                x_layer_metrics[f"{dm_col}_time_proc_frac_{time_boundary_layer}"] = dm_time_proc / df[time_proc_boundary_metric]
+                x_layer_metrics[f"{dm_col}_time_proc_frac_parent"] = dm_time_proc / df[f"{layer}_{time_proc_metric}"]
+                x_layer_metrics[f"{dm_col}_time_proc_frac_total"] = pd.NA
+                if dm_time_proc_total > 0:
+                    x_layer_metrics[f"{dm_col}_time_proc_frac_total"] = dm_time_proc / dm_time_proc_total
 
-            dm_time = df[dm_time_col]
-            dm_time_sum = dm_time.sum()
+            # Call
+            if dm_time_call_col in df.columns:
+                dm_time_call = df[dm_time_call_col]
+                dm_time_call_total = dm_time_call.sum()
 
-            x_layer_metrics[dm_time_frac_boundary_col] = dm_time / df[time_boundary_metric]
-            x_layer_metrics[dm_time_frac_parent_col] = dm_time / df[f"{layer}_{time_metric}"]
-            x_layer_metrics[dm_time_frac_total_col] = pd.NA
-
-            if dm_time_sum > 0:
-                x_layer_metrics[dm_time_frac_total_col] = dm_time / dm_time_sum
+                x_layer_metrics[f"{dm_col}_time_call_frac_{time_boundary_layer}"] = dm_time_call / df[time_call_boundary_metric]
+                x_layer_metrics[f"{dm_col}_time_call_frac_parent"] = dm_time_call / df[f"{layer}_{time_call_metric}"]
+                x_layer_metrics[f"{dm_col}_time_call_frac_total"] = pd.NA
+                if dm_time_call_total > 0:
+                    x_layer_metrics[f"{dm_col}_time_call_frac_total"] = dm_time_call / dm_time_call_total
 
     # Set unoverlapped times if there is compute time
-    if compute_time_metric in df.columns:
-        compute_time = df[compute_time_metric].fillna(0).astype('Float64')
+    if compute_time_proc_metric in df.columns:
+        compute_time_proc = df[compute_time_proc_metric].fillna(0).astype('Float64')
+        compute_time_call = df[compute_time_call_metric].fillna(0).astype('Float64')
         # Set unoverlapped time metrics
         for async_layer in async_layers:
-            time_col = f"{async_layer}_{time_metric}"
+            # Proc: unoverlapped
+            time_proc_col = f"{async_layer}_{time_proc_metric}"
+            u_time_proc_col = f"u_{time_proc_col}"
 
-            u_time_col = f"u_{time_col}"
-            u_time_frac_boundary_col = f"u_{async_layer}_time_frac_{time_boundary_layer}"
-            u_time_frac_self_col = f"u_{async_layer}_time_frac_self"
-            u_time_frac_total_col = f"u_{async_layer}_time_frac_total"
+            layer_time_proc = df[time_proc_col]
+            u_time_proc = (layer_time_proc - compute_time_proc).clip(lower=0).astype('Float64')
+            u_time_proc_total = u_time_proc.sum()
 
-            layer_time = df[time_col]
-            u_time = (layer_time - compute_time).clip(lower=0).astype('Float64')
-            u_time_sum = u_time.sum()
-
-            u_time_series = pd.array(u_time, dtype='Float64')
-            x_layer_metrics[u_time_col] = u_time_series
-            x_layer_metrics[u_time_frac_self_col] = u_time_series / layer_time
-            x_layer_metrics[u_time_frac_boundary_col] = u_time_series / df[time_boundary_metric]
-            x_layer_metrics[u_time_frac_total_col] = pd.NA
-            if u_time_sum > 0:
-                x_layer_metrics[u_time_frac_total_col] = u_time_series / u_time_sum
+            u_time_proc_series = pd.array(u_time_proc, dtype='Float64')
+            x_layer_metrics[u_time_proc_col] = u_time_proc_series
+            x_layer_metrics[f"u_{async_layer}_time_proc_frac_self"] = u_time_proc_series / layer_time_proc
+            x_layer_metrics[f"u_{async_layer}_time_proc_frac_{time_boundary_layer}"] = u_time_proc_series / df[time_proc_boundary_metric]
+            x_layer_metrics[f"u_{async_layer}_time_proc_frac_total"] = pd.NA
+            if u_time_proc_total > 0:
+                x_layer_metrics[f"u_{async_layer}_time_proc_frac_total"] = u_time_proc_series / u_time_proc_total
 
             parent_layer = layer_deps.get(async_layer)
             if parent_layer:
-                u_time_frac_parent_col = f"u_{async_layer}_time_frac_parent"
-                x_layer_metrics[u_time_frac_parent_col] = u_time_series / df[f"{parent_layer}_{time_metric}"]
+                x_layer_metrics[f"u_{async_layer}_time_proc_frac_parent"] = u_time_proc_series / df[f"{parent_layer}_{time_proc_metric}"]
+
+            # Call: unoverlapped
+            time_call_col = f"{async_layer}_{time_call_metric}"
+            u_time_call_col = f"u_{time_call_col}"
+
+            layer_time_call = df[time_call_col]
+            u_time_call = (layer_time_call - compute_time_call).clip(lower=0).astype('Float64')
+            u_time_call_total = u_time_call.sum()
+
+            u_time_call_series = pd.array(u_time_call, dtype='Float64')
+            x_layer_metrics[u_time_call_col] = u_time_call_series
+            x_layer_metrics[f"u_{async_layer}_time_call_frac_self"] = u_time_call_series / layer_time_call
+            x_layer_metrics[f"u_{async_layer}_time_call_frac_{time_boundary_layer}"] = u_time_call_series / df[time_call_boundary_metric]
+            x_layer_metrics[f"u_{async_layer}_time_call_frac_total"] = pd.NA
+            if u_time_call_total > 0:
+                x_layer_metrics[f"u_{async_layer}_time_call_frac_total"] = u_time_call_series / u_time_call_total
+
+            if parent_layer:
+                x_layer_metrics[f"u_{async_layer}_time_call_frac_parent"] = u_time_call_series / df[f"{parent_layer}_{time_call_metric}"]
 
     if x_layer_metrics:
-        df = df.copy()
-        df = df.assign(**x_layer_metrics)
-        x_layer_cols = list(x_layer_metrics.keys())
-        df[x_layer_cols] = df[x_layer_cols].replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        x_layer_metrics_df = pd.DataFrame(x_layer_metrics, index=df.index)
+        x_layer_metrics_df = x_layer_metrics_df.replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        overlapping_cols = [col for col in x_layer_metrics_df.columns if col in df.columns]
+        if overlapping_cols:
+            df = df.drop(columns=overlapping_cols)
+        df = pd.concat([df.copy(), x_layer_metrics_df], axis=1)
 
     return df.sort_index(axis=1)
 

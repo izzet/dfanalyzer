@@ -162,6 +162,27 @@ def test_unique_set_flatten_grouped_three_stage_via_dask():
     assert set(res.loc["w"]) == {2, 3, 4}
 
 
+def test_unique_set_flatten_handles_strings_via_dask():
+    df = pd.DataFrame(
+        [
+            {"g": "a", "p": "x", "col": "foo"},
+            {"g": "a", "p": "x", "col": "bar"},
+            {"g": "a", "p": "y", "col": "bar"},
+            {"g": "b", "p": "y", "col": "baz"},
+        ]
+    )
+    ddf = dd.from_pandas(df, npartitions=2)
+    res = (
+        ddf.groupby(["g", "p"])
+        .agg({"col": unique_set()})
+        .groupby(["p"])
+        .agg({"col": unique_set_flatten()})
+        .compute()["col"]
+    )
+    assert set(res.loc["x"]) == {"foo", "bar"}
+    assert set(res.loc["y"]) == {"bar", "baz"}
+
+
 def test_unique_set_handles_missing_values_via_dask():
     df = pd.DataFrame(
         [

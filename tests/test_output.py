@@ -10,7 +10,7 @@ from dftracer.analyzer.streaming.mofka_io import open_consumer
 from dftracer.analyzer.streaming.zmq_io import open_consumer as open_zmq_consumer
 from dftracer.analyzer.types import (
     AnalysisFact,
-    AnalyzerResultType,
+    AnalysisResult,
     FactProvenance,
     FactScope,
     FactSeverity,
@@ -30,10 +30,11 @@ def _sample_result():
         },
         index=pd.Index([7], name="epoch"),
     )
-    result = AnalyzerResultType(
+    result = AnalysisResult(
         _hlms={},
         _main_views={},
         _metric_boundaries={},
+        additional_metrics={},
         checkpoint_dir=".",
         flat_views={("epoch",): flat_view},
         layers=["epoch"],
@@ -41,6 +42,8 @@ def _sample_result():
             job_time=10,
             time_granularity=1,
             time_resolution=1,
+            trace_event_count=1,
+            profile_event_count=0,
             total_event_count=1,
             unique_file_count=1,
             unique_host_count=1,
