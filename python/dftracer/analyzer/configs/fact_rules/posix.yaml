@@ -1,0 +1,94 @@
+schema_version: analysisfact-rules.v1
+
+# POSIX-only fact rules based on WisIO heuristics (Yildirim et al.).
+# These rules operate on flat POSIX metrics without cross-layer context.
+# Used as a baseline to demonstrate that single-layer analysis is
+# insufficient for diagnosing DL training I/O bottlenecks.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: per_row
+  confidence: "0.80"
+
+rules:
+  # WisIO Rule 1: Small reads
+  # "Over 50% of I/O time is spent on small (<1 MiB) read operations"
+  - id: posix.small_read_dominance.v1
+    priority: 89
+    source_view: epoch
+    fact_type: small_read_dominance
+    required_metrics:
+      - posix_read_time_frac_parent
+      - posix_read_size_mean
+    when: "posix_read_time_frac_parent > 0.50 and posix_read_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((posix_read_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - posix_read_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * posix_read_time_frac_parent)"
+    opportunity_tags:
+      - small_io_reduction
+
+  # WisIO Rule 2: Small writes
+  # "Over 50% of I/O time is spent on small (<1 MiB) write operations"
+  - id: posix.small_write_dominance.v1
+    priority: 88
+    source_view: epoch
+    fact_type: small_write_dominance
+    required_metrics:
+      - posix_write_time_frac_parent
+      - posix_write_size_mean
+    when: "posix_write_time_frac_parent > 0.50 and posix_write_size_mean < 1048576"
+    severity_score: "clip01(0.5 * ((posix_write_time_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - posix_write_size_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * posix_write_time_frac_parent)"
+    opportunity_tags:
+      - small_io_reduction
+
+  # WisIO Rule 3: Excessive metadata access
+  # "Over 50% of I/O time is spent on metadata operations"
+  - id: posix.excessive_metadata_access.v1
+    priority: 87
+    source_view: epoch
+    fact_type: excessive_metadata_access
+    required_metrics:
+      - posix_metadata_time_frac_parent
+      - posix_open_time_frac_parent
+      - posix_close_time_frac_parent
+      - posix_seek_time_frac_parent
+      - posix_stat_time_frac_parent
+    when: "posix_metadata_time_frac_parent > 0.50"
+    severity_score: "clip01((posix_metadata_time_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * posix_metadata_time_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  # WisIO Rule 4: Operation imbalance
+  # "Read or write operations exceeds the other by 10%"
+  - id: posix.operation_imbalance.v1
+    priority: 86
+    source_view: epoch
+    fact_type: operation_imbalance
+    required_metrics:
+      - posix_read_count_sum
+      - posix_write_count_sum
+    derived_metrics:
+      posix_operation_imbalance_ratio: "abs(fillna0(posix_read_count_sum) - fillna0(posix_write_count_sum)) / max(min(fillna0(posix_read_count_sum), fillna0(posix_write_count_sum)), 1e-9)"
+    when: "posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  # WisIO Rule 5: Size imbalance
+  # "Read or write size exceeds the other by 10%"
+  - id: posix.size_imbalance.v1
+    priority: 85
+    source_view: epoch
+    fact_type: size_imbalance
+    required_metrics:
+      - posix_read_size_sum
+      - posix_write_size_sum
+    derived_metrics:
+      posix_size_imbalance_ratio: "abs(fillna0(posix_read_size_sum) - fillna0(posix_write_size_sum)) / max(min(fillna0(posix_read_size_sum), fillna0(posix_write_size_sum)), 1e-9)"
+    when: "posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
