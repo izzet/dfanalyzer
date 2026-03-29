@@ -1,6 +1,6 @@
 import pytest
 
-from dftracer.analyzer.streaming.window_buffer import WindowBoundaryTracker, WindowBuffer
+from dftracer.analyzer.streaming.window_buffer import WindowTracker, WindowBuffer
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -126,7 +126,7 @@ def test_epoch_buffer_custom_names():
 
 
 def test_window_boundary_tracker_queues_future_boundaries_from_fast_rank():
-    tracker = WindowBoundaryTracker(num_ranks=2)
+    tracker = WindowTracker(num_ranks=2)
 
     assert tracker.observe_start_boundary(pid=1) == 1
     assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=100) == []
@@ -149,7 +149,7 @@ def test_window_boundary_tracker_queues_future_boundaries_from_fast_rank():
 
 
 def test_window_boundary_tracker_exposes_current_and_next_window_labels():
-    tracker = WindowBoundaryTracker(num_ranks=2)
+    tracker = WindowTracker(num_ranks=2)
 
     assert tracker.current_window(7) == 1
     assert tracker.next_window(7) == 1
@@ -161,7 +161,7 @@ def test_window_boundary_tracker_exposes_current_and_next_window_labels():
 
 
 def test_window_boundary_tracker_uses_start_markers_for_active_window_assignment():
-    tracker = WindowBoundaryTracker(num_ranks=1)
+    tracker = WindowTracker(num_ranks=1)
 
     assert tracker.current_window(3) == 1
     assert tracker.observe_start_boundary(pid=3) == 1
@@ -174,7 +174,7 @@ def test_window_boundary_tracker_uses_start_markers_for_active_window_assignment
 
 
 def test_window_boundary_tracker_advances_with_end_only_boundaries():
-    tracker = WindowBoundaryTracker(num_ranks=2)
+    tracker = WindowTracker(num_ranks=2)
 
     assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=100) == []
     assert tracker.observe_end_boundary(pid=2, boundary_ts_ns=120)[0].window_index == 1
