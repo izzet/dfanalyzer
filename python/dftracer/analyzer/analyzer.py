@@ -2264,7 +2264,7 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            layer_derived_metrics = self.preset.derived_metrics[layer]
+            layer_derived_metrics = self.preset.derived_metrics.get(layer.lower(), {})
             layer_size_derived_metrics = (self.preset.size_derived_metrics or {}).get(layer.lower(), [])
             if is_dask:
                 hlm = hlm.map_partitions(

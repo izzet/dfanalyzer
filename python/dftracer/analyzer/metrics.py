@@ -251,7 +251,7 @@ def set_cross_layer_metrics(
 
     # Set relational time metrics for derived metrics
     for layer in derived_metrics:
-        for dm in derived_metrics[layer]:
+        for dm in derived_metrics.get(layer.lower(), {}):
             dm_col = f"{layer}_{dm}"
             dm_time_proc_col = f"{dm_col}_{time_proc_metric}"
             dm_time_call_col = f"{dm_col}_{time_call_metric}"
