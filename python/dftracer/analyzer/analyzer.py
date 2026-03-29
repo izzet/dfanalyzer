@@ -80,7 +80,7 @@ from .utils.json_encoders import NpEncoder
 from .utils.log_utils import console_block, log_block
 from .utils.pandas_agg import unique_set_flatten_pd, unique_set_pd
 from .utils.pandas_utils import flatten_column_names, to_nullable_numeric
-from .streaming.window_buffer import WindowBoundaryTracker, WindowBuffer
+from .streaming.window_buffer import WindowTracker, WindowBuffer
 
 
 CHECKPOINT_FLAT_VIEW = "_flat_view"
@@ -533,7 +533,7 @@ class Analyzer(abc.ABC):
 
         # Window-based analysis: the Window class handles cadence gating.
         # The analyzer processes every window.start / window.stop pair.
-        window_tracker = WindowBoundaryTracker(
+        window_tracker = WindowTracker(
             num_ranks=num_ranks,
             require_explicit_start=True,
         )

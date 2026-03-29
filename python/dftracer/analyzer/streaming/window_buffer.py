@@ -104,7 +104,7 @@ class _PendingWindowBoundary:
     start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
 
 
-class WindowBoundaryTracker:
+class WindowTracker:
     """
     Track control boundaries by per-rank window sequence.
 
@@ -226,3 +226,7 @@ class WindowBoundaryTracker:
             self.pending_by_window.pop(self.next_window_to_emit, None)
             self.next_window_to_emit += 1
         return completed
+
+
+# Backward compatibility alias
+WindowBoundaryTracker = WindowTracker
