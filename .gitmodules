@@ -1,0 +1,3 @@
+[submodule "dfdiagnoser"]
+	path = dfdiagnoser
+	url = https://github.com/izzet/dfdiagnoser.git
