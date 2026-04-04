@@ -13,6 +13,7 @@ from dftracer.utils import Indexer, Reader
 from dask.distributed import wait
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .analysis_utils import set_size_bins
 from .analyzer import Analyzer
 from .constants import (
     COL_ACC_PAT,
@@ -169,14 +170,15 @@ SYSTEM_OUTPUT_COLUMNS = {
     "host_hash": "string",
     COL_TIME_RANGE: "Int64",
     "sys_cpu_iowait_pct": "float64",
+    "sys_cpu_iowait_pct_core_max": "float64",
+    "sys_cpu_iowait_pct_core_p95": "float64",
     "sys_cpu_user_pct": "float64",
     "sys_cpu_system_pct": "float64",
     "sys_cpu_idle_pct": "float64",
-    "sys_core_iowait_pct_max": "float64",
-    "sys_core_iowait_pct_p95": "float64",
-    "sys_mem_dirty": "float64",
-    "sys_mem_cached": "float64",
-    "sys_mem_available": "float64",
+    "sys_mem_dirty_pct": "float64",
+    "sys_mem_cached_pct": "float64",
+    "sys_mem_available_pct": "float64",
+    "sys_mem_available_kb": "float64",
 }
 
 
@@ -537,8 +539,10 @@ class DFTracerAnalyzer(Analyzer):
                     profiles = self._standardize_profiles(profiles, time_origin=time_origin).persist()
                 if has_system:
                     system_metrics = self._standardize_system(system_events, time_origin=time_origin).persist()
+                    logger.info("system_events.found", has_system=True)
                 else:
                     system_metrics = None
+                    logger.info("system_events.found", has_system=False)
             with log_block("wait_all"):
                 if isinstance(traces, dd.DataFrame):
                     wait_list = [traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata]
@@ -618,7 +622,7 @@ class DFTracerAnalyzer(Analyzer):
 
         return traces
 
-    def normalize_stream_event(
+    def normalize_trace_event(
         self,
         event: dict,
         extra_columns: Optional[Dict[str, str]] = None,
@@ -645,15 +649,80 @@ class DFTracerAnalyzer(Analyzer):
         events: List[dict],
         view_types: List[ViewType],
         extra_columns: Optional[Dict[str, str]] = None,
-    ) -> pd.DataFrame:
+    ):
         columns = self._get_columns(extra_columns)
-        traces = pd.DataFrame(events, columns=columns)
-        traces, _profiles, _system_events = self._handle_metadata(traces)
-        traces = self._fix_time(traces)
+        df = pd.DataFrame(events, columns=columns)
+        traces, profile_events, system_events = self._handle_metadata(df)
+
+        # Compute shared time_origin (same as batch read_trace) so that
+        # traces, profiles, and system_metrics share aligned time_range values.
+        ts_candidates = []
+        if not traces.empty and "ts" in traces.columns:
+            ts_candidates.append(traces["ts"].min())
+        if not profile_events.empty and "ts" in profile_events.columns:
+            ts_candidates.append(profile_events["ts"].min())
+        if not system_events.empty and "ts" in system_events.columns:
+            ts_candidates.append(system_events["ts"].min())
+        ts_candidates = [ts for ts in ts_candidates if pd.notna(ts)]
+        time_origin = int(min(ts_candidates)) if ts_candidates else 0
+
+        # Snap time_origin to profile grid (same as batch read_trace)
+        if not profile_events.empty:
+            profile_grid_width = int(self.profile_time_granularity * self.time_resolution)
+            if profile_grid_width > 0:
+                time_origin = (time_origin // profile_grid_width) * profile_grid_width
+
+        # Standardize traces
+        traces = self._fix_time(traces, time_origin=time_origin)
         traces = self._rename_columns(traces)
-        traces = traces.assign(time_range=1)
+        traces = set_size_bins(traces)
         traces = self.postread_trace(traces=traces, view_types=view_types)
-        return traces
+
+        # Standardize profiles (same pipeline as batch _standardize_profiles,
+        # but calling each step directly on pandas instead of map_partitions).
+        profiles = None
+        if not profile_events.empty:
+            p = self._set_proc_names(profile_events)
+            p = self._standardize_profile_partition(
+                p,
+                profile_time_granularity=self.profile_time_granularity,
+                time_origin=time_origin,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+            )
+            if not p.empty:
+                p = self._fix_file_posix_category(p)
+                p = self._sanitize_size_offset(p)
+                # Coalesce: collapse duplicate counter rows per canonical bucket
+                coalesce_agg = {
+                    COL_COUNT: "sum", COL_TIME: "sum", COL_SIZE: "sum",
+                    "time_min": "min", "time_max": "max",
+                    "size_min": "min", "size_max": "max",
+                    "offset_min": "min", "offset_max": "max",
+                }
+                p = (
+                    p.groupby(PROFILE_IDENTITY_COLUMNS, dropna=False)
+                    .agg(coalesce_agg)
+                    .reset_index()
+                )
+                p[COL_COUNT] = p[COL_COUNT].astype("Int64")
+                p[COL_TIME] = p[COL_TIME].astype("float64")
+                p[COL_SIZE] = p[COL_SIZE].replace(0, pd.NA).astype("Int64")
+                profiles = p[list(PROFILE_OUTPUT_COLUMNS)]
+
+        # Standardize system metrics (same static method the batch path uses)
+        system_metrics = None
+        if not system_events.empty:
+            system_metrics = self._standardize_system_partition(
+                system_events,
+                time_origin=time_origin,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+            )
+            if system_metrics.empty:
+                system_metrics = None
+
+        return traces, profiles, system_metrics
 
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
@@ -818,6 +887,7 @@ class DFTracerAnalyzer(Analyzer):
         group_keys = ["host_hash", COL_TIME_RANGE]
 
         # Aggregate CPU (name == "cpu"): mean of samples per bucket
+        # Source values are 0-100; normalize to 0-1 fractions.
         agg_cpu = df[df["name"] == "cpu"]
         cpu_agg = pd.DataFrame()
         if not agg_cpu.empty:
@@ -830,28 +900,58 @@ class DFTracerAnalyzer(Analyzer):
                     agg_dict[out] = (m, "mean")
             if agg_dict:
                 cpu_agg = agg_cpu.groupby(group_keys).agg(**agg_dict).reset_index()
+                for col in ["sys_cpu_iowait_pct", "sys_cpu_user_pct",
+                            "sys_cpu_system_pct", "sys_cpu_idle_pct"]:
+                    if col in cpu_agg.columns:
+                        cpu_agg[col] = cpu_agg[col] / 100.0
 
         # Per-core cross-core stats (name starts with "cpu-")
+        # Source values are 0-100; normalize to 0-1 fractions.
         per_core = df[df["name"].str.startswith("cpu-")]
         core_agg = pd.DataFrame()
         if not per_core.empty and "iowait_pct" in per_core.columns:
             core_agg = per_core.groupby(group_keys).agg(
-                sys_core_iowait_pct_max=("iowait_pct", "max"),
-                sys_core_iowait_pct_p95=("iowait_pct", lambda x: x.quantile(0.95)),
+                sys_cpu_iowait_pct_core_max=("iowait_pct", "max"),
+                sys_cpu_iowait_pct_core_p95=("iowait_pct", lambda x: x.quantile(0.95)),
             ).reset_index()
+            for col in ["sys_cpu_iowait_pct_core_max", "sys_cpu_iowait_pct_core_p95"]:
+                if col in core_agg.columns:
+                    core_agg[col] = core_agg[col] / 100.0
 
         # Memory (name == "memory"): mean of samples per bucket
+        # MemAvailable is raw KB — convert to fraction of MemTotal.
+        # Cached/Dirty are % of MemAvailable (0-100) — normalize to 0-1.
         mem = df[df["name"] == "memory"]
         mem_agg = pd.DataFrame()
         if not mem.empty:
             mem_dict = {}
-            for m, out in [("Dirty", "sys_mem_dirty"),
-                           ("Cached", "sys_mem_cached"),
-                           ("MemAvailable", "sys_mem_available")]:
+            for m, out in [("Dirty", "sys_mem_dirty_pct"),
+                           ("Cached", "sys_mem_cached_pct"),
+                           ("MemAvailable", "sys_mem_available_kb")]:
                 if m in mem.columns:
                     mem_dict[out] = (m, "mean")
             if mem_dict:
                 mem_agg = mem.groupby(group_keys).agg(**mem_dict).reset_index()
+                # Normalize Dirty/Cached from 0-100 to 0-1
+                for col in ["sys_mem_dirty_pct", "sys_mem_cached_pct"]:
+                    if col in mem_agg.columns:
+                        mem_agg[col] = mem_agg[col] / 100.0
+                # Derive sys_mem_available_pct from KB value
+                if "sys_mem_available_kb" in mem_agg.columns:
+                    try:
+                        with open("/proc/meminfo") as _f:
+                            for _line in _f:
+                                if _line.startswith("MemTotal:"):
+                                    mem_total_kb = int(_line.split()[1])
+                                    break
+                            else:
+                                mem_total_kb = None
+                    except OSError:
+                        mem_total_kb = None
+                    if mem_total_kb and mem_total_kb > 0:
+                        mem_agg["sys_mem_available_pct"] = mem_agg["sys_mem_available_kb"] / mem_total_kb
+                    else:
+                        mem_agg["sys_mem_available_pct"] = pd.NA
 
         # Merge all on (host_hash, time_range)
         dfs = [d for d in [cpu_agg, core_agg, mem_agg] if not d.empty]
@@ -911,7 +1011,7 @@ class DFTracerAnalyzer(Analyzer):
     def _handle_metadata(self, raw_traces: dd.DataFrame) -> Tuple[dd.DataFrame, dd.DataFrame, dd.DataFrame]:
         is_dask = isinstance(raw_traces, dd.DataFrame)
         traces = raw_traces.query(f"type == {TYPE_EVENT}")
-        profiles = raw_traces.query(f"type == {TYPE_PROFILE}")
+        profile_events = raw_traces.query(f"type == {TYPE_PROFILE}")
         system_events = raw_traces.query(f"type == {TYPE_SYSTEM}")
         file_hashes = raw_traces.query(f"type == {TYPE_FILE_HASH}")[["name", "hash"]].groupby("hash").first()
         host_hashes = raw_traces.query(f"type == {TYPE_HOST_HASH}")[["name", "hash"]].groupby("hash").first()
@@ -926,12 +1026,14 @@ class DFTracerAnalyzer(Analyzer):
             string_hashes = string_hashes.persist()
             metadata = metadata.persist()
         traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
-        profiles = self._attach_metadata(profiles, file_hashes=file_hashes, host_hashes=host_hashes)
+        profile_events = self._attach_metadata(profile_events, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes
         self._host_hashes = host_hashes
         self._string_hashes = string_hashes
         self._metadata = metadata
-        return traces, profiles, system_events
+        self._profile_events = profile_events
+        self._system_events = system_events
+        return traces, profile_events, system_events
 
     @staticmethod
     def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):

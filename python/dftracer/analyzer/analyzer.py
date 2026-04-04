@@ -93,7 +93,6 @@ HLM_AGG = {
     "count": "sum",
     "size": "sum",
 }
-HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 PARTITION_SIZE = "128MB"
 VIEW_PERMUTATIONS = False
 
@@ -455,7 +454,7 @@ class Analyzer(abc.ABC):
                 normalized_extra_columns.pop("step", None)
                 normalized_extra_columns.pop("window", None)
 
-            normalized_event = self.normalize_stream_event(
+            normalized_event = self.normalize_trace_event(
                 event=event,
                 extra_columns=normalized_extra_columns,
                 extra_columns_fn=extra_columns_fn,
@@ -468,7 +467,7 @@ class Analyzer(abc.ABC):
             if not window_events:
                 continue
 
-            traces = self.handle_stream_events(
+            traces, profiles, system_metrics = self.handle_stream_events(
                 events=window_events,
                 view_types=proc_view_types,
                 extra_columns=extra_columns,
@@ -479,6 +478,8 @@ class Analyzer(abc.ABC):
                 logical_view_types=logical_view_types,
                 raw_stats={},
                 metric_boundaries=metric_boundaries,
+                profiles=profiles,
+                system_metrics=system_metrics,
             )
             logger.debug(f"{stream_name}.analysis_complete", flat_views=len(result.flat_views))
             output_handler(result)
@@ -557,7 +558,7 @@ class Analyzer(abc.ABC):
             trace_event: dict,
         ) -> Tuple[Optional[dict], Optional[int], Optional[int]]:
             """Normalize a single trace event dict and return (event, ts, pid)."""
-            normalized_event = self.normalize_stream_event(
+            normalized_event = self.normalize_trace_event(
                 event=trace_event,
                 extra_columns=normalized_extra_columns,
                 extra_columns_fn=extra_columns_fn,
@@ -909,7 +910,7 @@ class Analyzer(abc.ABC):
                         top_names=dict(name_sample.most_common(10)),
                     )
 
-                    traces = self.handle_stream_events(
+                    traces, profiles, system_metrics = self.handle_stream_events(
                         events=pulled_events,
                         view_types=proc_view_types,
                         extra_columns=extra_columns,
@@ -921,6 +922,8 @@ class Analyzer(abc.ABC):
                             logical_view_types=logical_view_types,
                             raw_stats={},
                             metric_boundaries=metric_boundaries,
+                            profiles=profiles,
+                            system_metrics=system_metrics,
                         )
                     except KeyError as exc:
                         trace_columns = list(traces.columns) if hasattr(traces, "columns") else []
@@ -1102,7 +1105,7 @@ class Analyzer(abc.ABC):
     ):
         return trace_stream
 
-    def normalize_stream_event(
+    def normalize_trace_event(
         self,
         event: dict,
         extra_columns: Optional[Dict[str, str]] = None,
@@ -1115,9 +1118,10 @@ class Analyzer(abc.ABC):
         events: List[dict],
         view_types: List[ViewType],
         extra_columns: Optional[Dict[str, str]] = None,
-    ) -> pd.DataFrame:
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Split and standardize stream events into (traces, profiles, system_metrics)."""
         traces = pd.DataFrame(events)
-        return self.postread_trace(traces=traces, view_types=view_types)
+        return self.postread_trace(traces=traces, view_types=view_types), None, None
 
     def compute_job_time(self, traces: dd.DataFrame) -> float:
         """Computes the total job execution time from the traces.
@@ -1189,40 +1193,48 @@ class Analyzer(abc.ABC):
             ),
         )
 
-    def compute_hybrid_hlm(
-        self,
-        traces: dd.DataFrame,
-        profiles: dd.DataFrame,
-        view_types: List[ViewType],
-        partition_size: str = PARTITION_SIZE,
-        checkpoint_name: Optional[str] = None,
-    ) -> dd.DataFrame:
-        checkpoint_name = checkpoint_name or self.get_hlm_checkpoint_name(view_types)
-        return self.restore_view(
-            name=checkpoint_name,
-            fallback=lambda: self._compute_hybrid_hlm(
-                partition_size=partition_size,
-                profiles=profiles,
-                traces=traces,
-                view_types=view_types,
-            ),
-        )
-
     def reconcile_hlm(
         self,
-        trace_hlm: dd.DataFrame,
+        trace_hlm: dd.DataFrame,        
         profile_hlm: dd.DataFrame,
         view_types: List[ViewType],
         partition_size: str = PARTITION_SIZE,
         layer: Optional[Layer] = None,
     ) -> dd.DataFrame:
-        return self._reconcile_hlm(
-            layer=layer,
-            partition_size=partition_size,
-            profile_hlm=profile_hlm,
-            trace_hlm=trace_hlm,
-            view_types=view_types,
+        hlm_groupby = list(dict.fromkeys(view_types + list(self.preset.hlm_fields)))
+        trace_hlm = trace_hlm.reset_index()
+        profile_hlm = profile_hlm.reset_index()
+        for col in hlm_groupby:
+            if col in trace_hlm.columns and col in profile_hlm.columns:
+                profile_dtype = profile_hlm._meta[col].dtype
+                if trace_hlm._meta[col].dtype != profile_dtype:
+                    trace_hlm[col] = trace_hlm[col].astype(profile_dtype)
+        trace_keys = trace_hlm[hlm_groupby].drop_duplicates().assign(_trace_present=1)
+        profile_hlm = profile_hlm.merge(trace_keys, how="left", on=hlm_groupby).persist()
+        overlap_count = int(profile_hlm["_trace_present"].fillna(0).sum().compute())
+        if overlap_count > 0:
+            logger.warning("Hybrid reconcile found overlapping HLM keys", layer=layer, overlap_count=overlap_count)
+        else:
+            logger.info("Hybrid reconcile found no overlapping HLM keys", layer=layer, overlap_count=overlap_count)
+        profile_only = profile_hlm[profile_hlm["_trace_present"].isna()].drop(columns=["_trace_present"])
+        combined_hlm = dd.concat([trace_hlm, profile_only], interleave_partitions=True)
+        bin_cols = [col for col in combined_hlm.columns if "_bin_" in col]
+        view_types_diff = list(set(VIEW_TYPES).difference(view_types))
+        hlm_agg = dict(HLM_AGG)
+        hlm_agg.update({col: "sum" for col in bin_cols})
+        for col in view_types_diff:
+            if col in combined_hlm.columns:
+                hlm_agg[col] = unique_set_flatten()
+        hlm = (
+            combined_hlm.groupby(hlm_groupby)
+            .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
+            .persist()
+            .repartition(partition_size=partition_size)
+            .replace(0, pd.NA)
         )
+        if bin_cols:
+            hlm[bin_cols] = hlm[bin_cols].astype("Int32")
+        return hlm.persist()
 
     def compute_main_view(
         self,
@@ -1776,10 +1788,10 @@ class Analyzer(abc.ABC):
         metric_boundaries: ViewMetricBoundaries,
         raw_stats: RawStats,
         logical_view_types: bool,
-        trace_hlm: Optional[dd.DataFrame] = None,
-        profile_hlm: Optional[dd.DataFrame] = None,
-        layer_main_views: Optional[Dict[Layer, DataFrameType]] = None,
+        trace_hlm: Optional[DataFrameType] = None,
+        profile_hlm: Optional[DataFrameType] = None,
         system_metrics: Optional[pd.DataFrame] = None,
+        layer_main_views: Optional[Dict[Layer, DataFrameType]] = None,
         is_dask: bool = True,
     ) -> AnalysisResult:
         # Compute layers & views
@@ -1960,6 +1972,8 @@ class Analyzer(abc.ABC):
         logical_view_types: bool,
         raw_stats: RawStats,
         metric_boundaries: ViewMetricBoundaries,
+        profiles: Optional[DataFrameType] = None,
+        system_metrics: Optional[pd.DataFrame] = None,
     ):
         is_dask = isinstance(traces, dd.DataFrame)
         hlm_checkpoint_name = self.get_hlm_checkpoint_name(view_types=proc_view_types)
@@ -1972,6 +1986,13 @@ class Analyzer(abc.ABC):
                     traces=traces,
                     view_types=proc_view_types,
                 )
+            profile_hlm = None
+            if profiles is not None and not profiles.empty:
+                with log_block("compute_profile_hlm"):
+                    profile_hlm = self.compute_profile_hlm(
+                        profiles=profiles,
+                        view_types=proc_view_types,
+                    )
 
             if is_dask:
                 with log_block("persist"):
@@ -1979,19 +2000,35 @@ class Analyzer(abc.ABC):
                 with log_block("wait"):
                     wait([hlm, raw_stats])
 
-                # Analyze HLM
-        result = self._analyze_hlm(
-            hlm=hlm,
-            is_dask=is_dask,
-            logical_view_types=logical_view_types,
-            metric_boundaries=metric_boundaries,
-            proc_view_types=proc_view_types,
-            raw_stats=raw_stats,
-        )
+        # Analyze HLM — when profiles exist, pass hlm as trace_hlm so
+        # _analyze_hlm enters the reconcile path (matching the batch path).
+        if profile_hlm is not None:
+            result = self._analyze_hlm(
+                hlm=None,
+                trace_hlm=hlm,
+                is_dask=is_dask,
+                logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries,
+                proc_view_types=proc_view_types,
+                raw_stats=raw_stats,
+                profile_hlm=profile_hlm,
+                system_metrics=system_metrics,
+            )
+        else:
+            result = self._analyze_hlm(
+                hlm=hlm,
+                is_dask=is_dask,
+                logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries,
+                proc_view_types=proc_view_types,
+                raw_stats=raw_stats,
+                system_metrics=system_metrics,
+            )
 
         # Attach correct traces & view types
         result._read_result = ReadTraceResult(traces=traces)
         result.view_types = proc_view_types
+        result._pre_layer_hlm = hlm.compute() if isinstance(hlm, dd.DataFrame) else hlm
 
         return result
 
@@ -2002,7 +2039,7 @@ class Analyzer(abc.ABC):
         partition_size: str,
     ) -> DataFrameType:
         # Add layer columns
-        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
+        hlm_groupby = list(dict.fromkeys(view_types + list(self.preset.hlm_fields)))
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
@@ -2181,73 +2218,6 @@ class Analyzer(abc.ABC):
         expanded.reset_index(drop=True, inplace=True)
         return expanded[output_columns]
 
-    def _compute_hybrid_hlm(
-        self,
-        traces: dd.DataFrame,
-        profiles: dd.DataFrame,
-        view_types: List[ViewType],
-        partition_size: str,
-    ) -> dd.DataFrame:
-        trace_hlm = self._compute_high_level_metrics(
-            partition_size=partition_size,
-            traces=traces,
-            view_types=view_types,
-        )
-        profile_hlm = self.compute_profile_hlm(
-            partition_size=partition_size,
-            profiles=profiles,
-            view_types=view_types,
-        )
-        return self._reconcile_hlm(
-            partition_size=partition_size,
-            profile_hlm=profile_hlm,
-            trace_hlm=trace_hlm,
-            view_types=view_types,
-        )
-
-    def _reconcile_hlm(
-        self,
-        trace_hlm: dd.DataFrame,
-        profile_hlm: dd.DataFrame,
-        view_types: List[ViewType],
-        partition_size: str,
-        layer: Optional[Layer] = None,
-    ) -> dd.DataFrame:
-        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
-        trace_hlm = trace_hlm.reset_index()
-        profile_hlm = profile_hlm.reset_index()
-        for col in hlm_groupby:
-            if col in trace_hlm.columns and col in profile_hlm.columns:
-                profile_dtype = profile_hlm._meta[col].dtype
-                if trace_hlm._meta[col].dtype != profile_dtype:
-                    trace_hlm[col] = trace_hlm[col].astype(profile_dtype)
-        trace_keys = trace_hlm[hlm_groupby].drop_duplicates().assign(_trace_present=1)
-        profile_hlm = profile_hlm.merge(trace_keys, how="left", on=hlm_groupby).persist()
-        overlap_count = int(profile_hlm["_trace_present"].fillna(0).sum().compute())
-        if overlap_count > 0:
-            logger.warning("Hybrid reconcile found overlapping HLM keys", layer=layer, overlap_count=overlap_count)
-        else:
-            logger.info("Hybrid reconcile found no overlapping HLM keys", layer=layer, overlap_count=overlap_count)
-        profile_only = profile_hlm[profile_hlm["_trace_present"].isna()].drop(columns=["_trace_present"])
-        combined_hlm = dd.concat([trace_hlm, profile_only], interleave_partitions=True)
-        bin_cols = [col for col in combined_hlm.columns if "_bin_" in col]
-        view_types_diff = list(set(VIEW_TYPES).difference(view_types))
-        hlm_agg = dict(HLM_AGG)
-        hlm_agg.update({col: "sum" for col in bin_cols})
-        for col in view_types_diff:
-            if col in combined_hlm.columns:
-                hlm_agg[col] = unique_set_flatten()
-        hlm = (
-            combined_hlm.groupby(hlm_groupby)
-            .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
-            .persist()
-            .repartition(partition_size=partition_size)
-            .replace(0, pd.NA)
-        )
-        if bin_cols:
-            hlm[bin_cols] = hlm[bin_cols].astype("Int32")
-        return hlm.persist()
-
     def _compute_main_view(
         self,
         layer: Layer,
@@ -2289,7 +2259,7 @@ class Analyzer(abc.ABC):
                         main_view_agg[col] = unique_set_flatten()
                     else:
                         main_view_agg[col] = unique_set_flatten_pd
-                elif col not in HLM_EXTRA_COLS:
+                elif col not in self.preset.hlm_fields:
                     if col.endswith("_call_min"):
                         main_view_agg[col] = "min"
                     elif col.endswith("_call_max"):
@@ -2371,6 +2341,11 @@ class Analyzer(abc.ABC):
                             view_agg[col].append(quantile_stats(0.25, 0.75))
                         else:
                             raise NotImplementedError("Quantile statistics not implemented for non-Dask DataFrames.")
+                elif pd.api.types.is_string_dtype(records[col].dtype) or pd.api.types.is_object_dtype(records[col].dtype):
+                    if is_dask:
+                        view_agg[col] = [unique_set_flatten()]
+                    else:
+                        view_agg[col] = [unique_set_flatten_pd]
                 else:
                     raise TypeError(
                         f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
@@ -2464,12 +2439,32 @@ class Analyzer(abc.ABC):
                 flat_view,
                 view_key=view_key,
             )
-        if system_metrics is not None and not system_metrics.empty and COL_TIME_RANGE in view_key:
-            with log_block("join_system_metrics", view_key=view_key):
-                sys_cols = [c for c in system_metrics.columns if c.startswith("sys_")]
-                if sys_cols:
-                    sys_lookup = system_metrics.set_index(COL_TIME_RANGE)[sys_cols]
-                    flat_view = flat_view.join(sys_lookup, how="left")
+        if system_metrics is not None and not system_metrics.empty:
+            sys_cols = [c for c in system_metrics.columns if c.startswith("sys_")]
+            if sys_cols:
+                if COL_TIME_RANGE in view_key:
+                    with log_block("join_system_metrics", view_key=view_key):
+                        sys_lookup = system_metrics.set_index(COL_TIME_RANGE)[sys_cols]
+                        flat_view = flat_view.join(sys_lookup, how="left")
+                else:
+                    with log_block("agg_system_metrics", view_key=view_key):
+                        agg = {}
+                        for c in sys_cols:
+                            if "max" in c or "dirty" in c:
+                                agg[c] = system_metrics[c].max()
+                            else:
+                                agg[c] = system_metrics[c].mean()
+                        for c, v in agg.items():
+                            flat_view[c] = v
+                        logger.debug(
+                            "system_metrics.joined",
+                            view_key=view_key,
+                            num_sys_rows=len(system_metrics),
+                            sys_columns=sys_cols,
+                            values={c: round(float(v), 2) if pd.notna(v) else None for c, v in agg.items()},
+                        )
+        elif system_metrics is None:
+            logger.debug("system_metrics.absent", view_key=view_key)
         return flat_view.sort_index(axis=1)
 
     @staticmethod
