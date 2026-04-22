@@ -1094,7 +1094,7 @@ int main(int argc, char **argv)
     {
         if (fs::is_directory(entry))
         {
-            std::string dir_string{entry.path().u8string()};
+            std::string dir_string{entry.path().string()};
             const size_t last_slash_idx = dir_string.rfind('/');
             std::string directory_name;
             if (std::string::npos != last_slash_idx)

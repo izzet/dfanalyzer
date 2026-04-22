@@ -3,7 +3,7 @@ project(
     ['c', 'cpp'],
     meson_version: '>= 1.5.0',
     version: run_command(['scripts/versioning/scm_version.py', 'version'], check: true).stdout().strip(),
-    default_options: ['buildtype=debugoptimized', 'cpp_std=c++17', 'warning_level=3'],
+    default_options: ['buildtype=debugoptimized', 'cpp_std=c++20', 'warning_level=3'],
 )
 
 #### VERSIONING FILE ####

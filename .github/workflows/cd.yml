@@ -48,7 +48,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade auditwheel build "meson>=1.5.0,<1.10.0" meson-python patchelf setuptools wheel
+          pip install --upgrade auditwheel build "meson>=1.5.0,!=1.10.0" meson-python patchelf setuptools wheel
       - name: Build DFAnalyzer
         run: |
           python3 -m build -Csetup-args="--prefix=$HOME/.local" -Csetup-args="-Denable_tools=true" .
