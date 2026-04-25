@@ -43,10 +43,10 @@ rules:
 
   # WisIO Rule 3: Excessive metadata access
   # "Over 50% of I/O time is spent on metadata operations"
-  - id: posix.excessive_metadata_access.v1
+  - id: posix.metadata_dominance.v1
     priority: 87
     source_view: epoch
-    fact_type: excessive_metadata_access
+    fact_type: metadata_dominance
     required_metrics:
       - posix_metadata_time_frac_parent
       - posix_open_time_frac_parent

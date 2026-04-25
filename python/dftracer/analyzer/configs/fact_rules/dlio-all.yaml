@@ -46,10 +46,10 @@ rules:
     opportunity_tags:
       - reader_parallelism
 
-  - id: dlio.reader_posix_pressure.v1
+  - id: dlio.read_pressure.v1
     priority: 97
     source_view: epoch
-    fact_type: reader_posix_pressure
+    fact_type: read_pressure
     required_metrics:
       - reader_posix_time_proc_max
       - compute_time_proc_max
@@ -132,10 +132,10 @@ rules:
     opportunity_tags:
       - small_io_reduction
 
-  - id: dlio.reader_posix.excessive_metadata_access.v1
+  - id: dlio.reader_posix.metadata_dominance.v1
     priority: 87
     source_view: epoch
-    fact_type: excessive_metadata_access
+    fact_type: metadata_dominance
     scope_layer: reader_posix
     required_metrics:
       - reader_posix_metadata_time_proc_frac_parent

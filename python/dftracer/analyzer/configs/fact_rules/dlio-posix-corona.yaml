@@ -114,10 +114,10 @@ rules:
     opportunity_tags:
       - small_io_reduction
 
-  - id: posix_corona.reader_posix.excessive_metadata_access.v1
+  - id: posix_corona.reader_posix.metadata_dominance.v1
     priority: 87
     source_view: epoch
-    fact_type: excessive_metadata_access
+    fact_type: metadata_dominance
     scope_layer: reader_posix
     required_metrics:
       - reader_posix_metadata_time_proc_frac_parent
