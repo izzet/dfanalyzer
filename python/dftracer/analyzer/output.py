@@ -6,6 +6,9 @@ import inflect
 import json
 import numpy as np
 import pandas as pd
+import structlog
+
+logger = structlog.get_logger(__name__)
 from hydra.core.hydra_config import HydraConfig
 from pathlib import Path
 from rich.console import Console
@@ -547,13 +550,35 @@ class ZMQOutput:
 
 
 class MofkaOutput:
-    def __init__(self, group_file: str, topic_name: str):
+    def __init__(self, group_file: str, topic_name: str, source_node: str = "",
+                 global_group_file: str = "", global_hlm_topic: str = ""):
         from .streaming.mofka_io import open_producer
 
         self.group_file = group_file
         self.topic_name = topic_name
+        self._source_node = source_node
 
         self._driver, self._producer = open_producer(group_file, topic_name)
+
+        self._global_producer = None
+        if global_group_file and global_hlm_topic:
+            import structlog
+            _logger = structlog.get_logger()
+            try:
+                import mochi.mofka.client as mofka
+                _logger.info("mofka.global_driver.create", group_file=global_group_file)
+                self._global_driver = mofka.MofkaDriver(
+                    group_file=global_group_file, use_progress_thread=True,
+                )
+                topic = self._global_driver.open_topic(global_hlm_topic)
+                self._global_producer = topic.producer(
+                    batch_size=mofka.AdaptiveBatchSize,
+                    thread_pool=self._global_driver.default_thread_pool,
+                    ordering=mofka.Ordering.Strict,
+                )
+                _logger.info("mofka.global_producer.ready", topic=global_hlm_topic)
+            except Exception:
+                _logger.warning("mofka.global_producer.failed", exc_info=True)
 
     def handle_result(self, result: AnalysisResult):
         if result.analysis_facts:
@@ -576,7 +601,60 @@ class MofkaOutput:
             )
         self._producer.flush()
 
+        if self._global_producer and result._pre_layer_hlm is not None:
+            self._publish_hlm(result)
+
+    def _publish_hlm(self, result: AnalysisResult):
+        import socket as _socket
+
+        hlm = result._pre_layer_hlm
+        if hasattr(hlm, "compute"):
+            hlm = hlm.compute()
+
+        # Capture index names before reset so the global analyzer can restore them.
+        hlm_index_names = list(hlm.index.names) if hlm.index.names[0] is not None else []
+        metadata = dict(
+            artifact_type="hlm",
+            source_node=self._source_node or _socket.gethostname(),
+            window_index=result.window_index,
+            hlm_rows=len(hlm),
+            hlm_columns=list(hlm.columns),
+            hlm_index_names=hlm_index_names,
+        )
+        # Drop columns with frozenset values — Arrow/parquet can't serialize them.
+        # These are VIEW_TYPES columns not in the groupby (aggregated via unique_set_flatten).
+        drop_cols = [
+            c for c in hlm.columns
+            if hlm[c].dtype == "object" and len(hlm) > 0
+            and isinstance(hlm[c].iloc[0], (frozenset, set))
+        ]
+        if drop_cols:
+            hlm = hlm.drop(columns=drop_cols)
+        # Move index columns (func_name, etc.) to regular columns so they
+        # survive the parquet round-trip to the global analyzer.
+        hlm = hlm.reset_index()
+        _hlm_bytes = int(hlm.memory_usage(deep=True).sum())
+        _hlm_parquet = hlm.to_parquet()
+        logger.debug(
+            "global.hlm.publish",
+            window_index=result.window_index,
+            hlm_rows=len(hlm),
+            hlm_bytes=_hlm_bytes,
+            hlm_mb=round(_hlm_bytes / 1024 / 1024, 2),
+            parquet_bytes=len(_hlm_parquet),
+            parquet_kb=round(len(_hlm_parquet) / 1024, 1),
+            dropped_cols=drop_cols,
+            index_names=hlm_index_names,
+        )
+        self._global_producer.push(
+            metadata=metadata,
+            data=_hlm_parquet,
+        )
+        self._global_producer.flush()
+
     def _send_fact_envelope(self, result: AnalysisResult):
+        import socket as _socket
+
         envelope: FactEnvelope = result.to_fact_envelope()
         metadata = dict(
             artifact_type="analysis_facts",
@@ -584,6 +662,7 @@ class MofkaOutput:
             fact_count=len(envelope.facts),
             view_type="analysis_facts",
             view_types=result.view_types,
+            source_node=self._source_node or _socket.gethostname(),
         )
         self._producer.push(
             metadata=metadata,

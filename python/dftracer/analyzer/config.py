@@ -255,6 +255,58 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
 
 
 @dc.dataclass
+class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
+    """Preset for StorMer (weather transformer) workload.
+
+    Inherits the standard dft_ai layer definitions from the DLIO AI-logging
+    preset.  Key differences from DLIO:
+    - No per-step pipeline events — compute/fetch hang directly off epoch.
+    - fetch_data includes fetch.block (the real I/O wait with prefetch workers)
+      in addition to fetch.iter, so the analyzer correctly measures I/O time
+      even when DataLoader prefetch hides it from the main process.
+    """
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'app': 'cat == "ai_root" & func_name == "ai_root"',
+            'training': 'cat == "pipeline" & func_name == "train"',
+            'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
+            'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
+            'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
+            'compute': 'cat == "compute" & func_name == "compute"',
+            'compute_forward': 'cat == "compute" & func_name == "forward"',
+            'compute_backward': 'cat == "compute" & func_name == "backward"',
+            'comm': 'cat == "comm"',
+            'comm_all_reduce': 'cat == "comm" & func_name == "all_reduce"',
+            'data_loader': 'cat == "data" & func_name.isin(["data.init", "item"])',
+            'data_loader_fork': 'cat == "posix" & func_name == "fork"',
+            'reader': 'cat == "data" & func_name.isin(["preprocess"])',
+            'posix': 'cat.str.contains("posix|stdio")',
+            'reader_posix': 'cat.str.contains("posix|stdio") & cat.str.contains("_reader")',
+        }
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'app': None,
+            'training': 'app',
+            'epoch': 'training',
+            'fetch_iter': 'epoch',
+            'fetch_block': 'epoch',
+            'compute': 'fetch_block',
+            'compute_forward': 'compute',
+            'compute_backward': 'compute',
+            'comm': 'compute_backward',
+            'comm_all_reduce': 'comm',
+            'data_loader': 'fetch_iter',
+            'data_loader_fork': 'fetch_iter',
+            'reader': 'data_loader',
+            'posix': None,
+            'reader_posix': 'reader',
+        }
+    )
+    name: str = "stormer"
+
+
+@dc.dataclass
 class AnalyzerConfig:
     checkpoint: Optional[bool] = False
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
@@ -431,6 +483,7 @@ class MofkaOutputConfig(OutputConfig):
     _target_: str = "dftracer.analyzer.output.MofkaOutput"
     group_file: str = MISSING
     topic_name: str = MISSING
+    source_node: str = ""
 
 
 @dc.dataclass
@@ -506,6 +559,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
+    cs.store(group="analyzer/preset", name="stormer", node=AnalyzerPresetConfigStormer)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)

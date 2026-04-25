@@ -760,6 +760,7 @@ class Analyzer(abc.ABC):
                 )
 
                 for completed_window in completed_windows:
+                    _window_wall_start = time.perf_counter()
                     logger.info(
                         "mofka.window.block",
                         window=completed_window.window_index,
@@ -809,14 +810,10 @@ class Analyzer(abc.ABC):
                                 continue
 
                             remaining_ms = int(
-                                max(
-                                    0.0,
-                                    min(
-                                        float(trace_drain_timeout_ms),
-                                        (drain_deadline - time.monotonic()) * 1000.0,
-                                    ),
-                                )
+                                max(0.0, (drain_deadline - time.monotonic()) * 1000.0)
                             )
+                            if trace_drain_timeout_ms > 0:
+                                remaining_ms = min(remaining_ms, trace_drain_timeout_ms)
                             if remaining_ms <= 0:
                                 break
                             trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
@@ -900,9 +897,11 @@ class Analyzer(abc.ABC):
                     # Log event category breakdown for debugging
                     cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
                     name_sample = Counter(e.get("name", "?") for e in pulled_events)
+                    _drain_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
                     logger.info(
                         "mofka.window.drain_summary",
                         window=completed_window.window_index,
+                        drain_elapsed_ms=_drain_elapsed_ms,
                         event_count=len(pulled_events),
                         target_counts=target_counts,
                         seen_counts={pid: trace_events_seen_by_pid.get(pid, 0) for pid in sorted(target_counts)},
@@ -915,6 +914,14 @@ class Analyzer(abc.ABC):
                         view_types=proc_view_types,
                         extra_columns=extra_columns,
                     )
+                    _traces_bytes = int(traces.memory_usage(deep=True).sum()) if hasattr(traces, "memory_usage") else -1
+                    logger.debug(
+                        "mofka.window.traces_memory",
+                        window=completed_window.window_index,
+                        traces_rows=len(traces),
+                        traces_bytes=_traces_bytes,
+                        traces_mb=round(_traces_bytes / 1024 / 1024, 1),
+                    )
                     try:
                         result = self._analyze_trace(
                             traces=traces,
@@ -925,6 +932,7 @@ class Analyzer(abc.ABC):
                             profiles=profiles,
                             system_metrics=system_metrics,
                         )
+                        result.window_index = completed_window.window_index
                     except KeyError as exc:
                         trace_columns = list(traces.columns) if hasattr(traces, "columns") else []
                         logger.warning(
@@ -936,15 +944,27 @@ class Analyzer(abc.ABC):
                             target_counts=target_counts,
                         )
                         continue
+                    _analysis_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
                     logger.info(
                         "mofka.window.analysis_complete",
                         window=completed_window.window_index,
+                        analysis_elapsed_ms=_analysis_elapsed_ms,
+                        drain_elapsed_ms=_drain_elapsed_ms,
                         event_count=len(pulled_events),
                         num_ranks=num_ranks,
                         flat_views=len(result.flat_views),
                         analysis_facts=len(result.analysis_facts),
                     )
+                    _publish_start = time.perf_counter()
                     output_handler(result)
+                    _publish_elapsed_ms = round((time.perf_counter() - _publish_start) * 1000, 1)
+                    _e2e_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
+                    logger.info(
+                        "mofka.window.publish_complete",
+                        window=completed_window.window_index,
+                        publish_elapsed_ms=_publish_elapsed_ms,
+                        e2e_elapsed_ms=_e2e_elapsed_ms,
+                    )
 
         finally:
             logger.info("mofka.control_stream.stop", reason="sigterm")
@@ -1002,6 +1022,145 @@ class Analyzer(abc.ABC):
             output_handler=output_handler,
             num_ranks=num_ranks,
         )
+
+    def analyze_mofka_global(
+        self,
+        group_file: str,
+        input_topic: str,
+        view_types: List[ViewType],
+        num_nodes: int,
+        metric_boundaries: ViewMetricBoundaries = {},
+        logical_view_types: bool = False,
+        output_handler: Optional[Callable[["AnalysisResult"], None]] = None,
+        idle_timeout_sec: int = 300,
+        pull_timeout_ms: int = 500,
+        consumer_name: Optional[str] = None,
+    ) -> None:
+        """Global analyzer: consumes HLMs from per-node analyzers, concatenates, and analyzes.
+
+        Each per-node analyzer publishes its HLM (parquet) to the input_topic.
+        This method buffers HLMs by window_index, waits for all num_nodes to
+        report, concatenates them, and runs _analyze_hlm with the given
+        view_types (typically [host_hash] for cross-node analysis).
+        """
+        import io as _io
+
+        from .streaming.mofka_io import open_consumer
+
+        install_shutdown_handler()
+
+        driver, consumer = open_consumer(
+            group_file, input_topic, consumer_name, use_progress_thread=True,
+        )
+
+        # Buffer: window_index -> {source_node: hlm_df}
+        window_buffer: Dict[int, Dict[str, pd.DataFrame]] = {}
+
+        future = consumer.pull()
+
+        logger.info(
+            "global.analyzer.start",
+            input_topic=input_topic,
+            num_nodes=num_nodes,
+            view_types=view_types,
+        )
+
+        try:
+            while not _shutdown_requested:
+                event = future.wait(timeout_ms=pull_timeout_ms)
+                if event is None:
+                    continue
+
+                metadata = event.metadata
+                data = event.data
+                if isinstance(data, list):
+                    data = b"".join(data)
+
+                window_index = metadata.get("window_index", -1)
+                source_node = metadata.get("source_node", "unknown")
+
+                hlm_df = pd.read_parquet(_io.BytesIO(data))
+                # Restore the index from the sender's metadata.
+                hlm_index_names = metadata.get("hlm_index_names", [])
+                if hlm_index_names:
+                    valid_idx = [c for c in hlm_index_names if c in hlm_df.columns]
+                    if valid_idx:
+                        hlm_df = hlm_df.set_index(valid_idx)
+                        if "host_hash" in hlm_df.index.names:
+                            annotated = hlm_df.reset_index()
+                            annotated["host_hash"] = source_node
+                            hlm_df = annotated.set_index(valid_idx)
+
+                logger.info(
+                    "global.hlm.received",
+                    window_index=window_index,
+                    source_node=source_node,
+                    hlm_rows=len(hlm_df),
+                    hlm_index=hlm_index_names,
+                )
+
+                event.acknowledge()
+                future = consumer.pull()
+
+                if window_index not in window_buffer:
+                    window_buffer[window_index] = {}
+                window_buffer[window_index][source_node] = hlm_df
+
+                if len(window_buffer[window_index]) >= num_nodes:
+                    nodes_hlms = window_buffer.pop(window_index)
+                    merged_hlm = pd.concat(list(nodes_hlms.values()))
+
+                    logger.info(
+                        "global.window.complete",
+                        window_index=window_index,
+                        nodes=sorted(nodes_hlms.keys()),
+                        merged_rows=len(merged_hlm),
+                        columns=list(merged_hlm.columns),
+                    )
+
+                    # Dump merged HLM to file for debugging
+                    try:
+                        hlm_path = os.path.join(
+                            self.checkpoint_dir or ".",
+                            f"global_hlm_window_{window_index}.parquet",
+                        )
+                        merged_hlm.to_parquet(hlm_path)
+                        logger.debug("global.hlm.saved", path=hlm_path)
+                    except Exception as exc:
+                        logger.warning("global.hlm.save_failed", error=str(exc))
+
+                    try:
+                        result = self._analyze_hlm(
+                            hlm=merged_hlm.reset_index(),
+                            proc_view_types=view_types,
+                            metric_boundaries=metric_boundaries,
+                            raw_stats={},
+                            logical_view_types=logical_view_types,
+                            is_dask=False,
+                        )
+                        result.view_types = view_types
+                        result.window_index = window_index
+
+                        logger.info(
+                            "global.window.analysis_complete",
+                            window_index=window_index,
+                            flat_views=len(result.flat_views),
+                            analysis_facts=len(result.analysis_facts),
+                        )
+
+                        if output_handler:
+                            output_handler(result)
+
+                    except Exception as exc:
+                        logger.warning(
+                            "global.window.analysis_failed",
+                            window_index=window_index,
+                            error=str(exc),
+                            exc_info=True,
+                        )
+        finally:
+            logger.info("global.analyzer.shutdown",
+                        pending_windows=list(window_buffer.keys()))
 
     def read_stats(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None) -> RawStats:
         """Computes and restores raw statistics from the trace data.
@@ -1937,10 +2096,45 @@ class Analyzer(abc.ABC):
             with log_block("wait_for_checkpoints"):
                 wait(self.checkpoint_tasks)
 
+        # Debug-log full flat view data and key HLM epoch metrics
+        for vk, vdf in flat_views.items():
+            logger.debug(
+                "flat_view.publish",
+                view_key=list(vk),
+                columns=list(vdf.columns),
+                num_rows=len(vdf),
+                data=vdf.reset_index().to_dict(orient="records"),
+            )
+            # Log key epoch-level HLM metrics when available
+            if vk[-1] == "epoch":
+                hlm_sample = {}
+                for col_name in ("compute_time_proc_max", "fetch_iter_time_proc_max", "reader_posix_time_proc_max"):
+                    for c in vdf.columns:
+                        if c.endswith(col_name):
+                            try:
+                                hlm_sample[c] = float(vdf[c].iloc[0]) if len(vdf) > 0 else None
+                            except Exception:
+                                pass
+                if hlm_sample:
+                    logger.debug("hlm.epoch_metrics", **hlm_sample)
+
         with log_block("evaluate_fact_rules"):
             analysis_facts = self._evaluate_analysis_facts(
                 flat_views=flat_views,
                 raw_stats=raw_stats,
+            )
+
+        # Debug-log all analysis facts before publishing
+        if analysis_facts:
+            all_facts_list = []
+            for vk, facts_list in analysis_facts.items():
+                for f in facts_list:
+                    fact_dict = dc.asdict(f) if dc.is_dataclass(f) else f
+                    all_facts_list.append(fact_dict)
+            logger.debug(
+                "analysis_facts.publish",
+                fact_count=len(all_facts_list),
+                facts=all_facts_list,
             )
 
         output_flat_views, output_analysis_facts = self._materialize_output_artifacts(
