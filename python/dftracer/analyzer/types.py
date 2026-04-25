@@ -128,6 +128,7 @@ class FactScope:
     layer: Optional[str] = None
     entity: Optional[str] = None
     rank_set: Optional[str] = None
+    node: Optional[str] = None
 
 
 @dc.dataclass
@@ -154,6 +155,7 @@ class AnalysisFact:
     severity: Optional[FactSeverity] = None
     confidence: Optional[float] = None
     opportunity_tags: List[str] = dc.field(default_factory=list)
+    suppresses_tags: List[str] = dc.field(default_factory=list)
     provenance: Optional[FactProvenance] = None
     schema_version: str = "analysisfact.v1"
     fact_id: Optional[str] = None
@@ -302,6 +304,8 @@ class AnalysisResult:
     _metric_boundaries: ViewMetricBoundaries
     analysis_facts: Dict[ViewKey, List[AnalysisFact]] = dc.field(default_factory=dict)
     _read_result: Optional[ReadTraceResult] = None
+    window_index: Optional[int] = None
+    _pre_layer_hlm: Optional[pd.DataFrame] = dc.field(default=None, repr=False)
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
         return self._hlms[layer]

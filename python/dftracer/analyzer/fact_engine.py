@@ -297,7 +297,7 @@ class FactEngine:
             projected_columns = [column for column in rule.projected_columns() if column in rule_df.columns]
             missing_required = [column for column in rule.required_metrics if column not in projected_columns]
             if missing_required:
-                logger.debug("facts.rule.skip_missing_required", rule_id=rule.id, missing=missing_required)
+                logger.debug("facts.rule.skip", rule_id=rule.id, reason="missing_metrics", missing=missing_required)
                 continue
 
             working_df = rule_df.loc[:, projected_columns].copy()
@@ -308,6 +308,22 @@ class FactEngine:
             except Exception:
                 logger.warning("facts.rule.derived_metric_error", rule_id=rule.id, exc_info=True)
                 continue
+
+            # Log derived metric values for debugging rule evaluation
+            if rule.derived_metrics:
+                try:
+                    derived_sample = {
+                        m: _to_scalar(working_df[m].iloc[0]) if m in working_df.columns else None
+                        for m in rule.derived_metrics
+                    }
+                except Exception:
+                    derived_sample = {}
+                logger.debug(
+                    "facts.rule.evaluate",
+                    rule_id=rule.id,
+                    derived_metrics=derived_sample,
+                    when_result="pending",
+                )
 
             unresolved_identifiers = [
                 name
@@ -325,9 +341,18 @@ class FactEngine:
             condition_series = _eval_expr(working_df, rule.when)
             condition_mask = condition_series.fillna(False).astype(bool)
             if not condition_mask.any():
+                try:
+                    derived_vals = {
+                        m: _to_scalar(working_df[m].iloc[0]) if m in working_df.columns else None
+                        for m in rule.derived_metrics
+                    }
+                except Exception:
+                    derived_vals = {}
                 logger.debug(
-                    "facts.rule.condition_not_met",
+                    "facts.rule.evaluate",
                     rule_id=rule.id,
+                    derived_metrics=derived_vals,
+                    when_result=False,
                     when=rule.when,
                     rows=len(working_df),
                 )
@@ -382,6 +407,13 @@ class FactEngine:
                             t0_ns = int(time_bucket * interval_us * 1_000)
                             t1_ns = int((time_bucket + 1) * interval_us * 1_000)
 
+                scope_entity = "window" if rule.emit_mode == "window" else str(row_index)
+                scope_node = None
+                if view_type in {"source_node", "host_hash"}:
+                    scope_node = str(row_index)
+                    if rule.emit_mode != "window":
+                        scope_entity = view_type
+
                 fact = AnalysisFact(
                     fact_type=rule.fact_type,
                     window=FactWindow(
@@ -395,13 +427,15 @@ class FactEngine:
                     ),
                     scope=FactScope(
                         layer=rule.scope_layer,
-                        entity="window" if rule.emit_mode == "window" else str(row_index),
+                        entity=scope_entity,
                         rank_set="all",
+                        node=scope_node,
                     ),
                     evidence={"metrics": evidence_metrics},
                     severity=FactSeverity(score=severity_score, label=_severity_label(severity_score)),
                     confidence=confidence,
                     opportunity_tags=rule.opportunity_tags.copy(),
+                    suppresses_tags=rule.suppresses_tags.copy() if rule.suppresses_tags else [],
                     provenance=FactProvenance(
                         rule_id=rule.id,
                         rule_version=rule.rule_version,
@@ -409,5 +443,13 @@ class FactEngine:
                     ),
                 )
                 fact.finalize_id()
+                logger.debug(
+                    "facts.rule.fired",
+                    rule_id=rule.id,
+                    fact_type=fact.fact_type,
+                    severity_score=severity_score,
+                    opportunity_tags=fact.opportunity_tags,
+                    key_metrics=evidence_metrics,
+                )
                 facts.append(fact)
         return facts

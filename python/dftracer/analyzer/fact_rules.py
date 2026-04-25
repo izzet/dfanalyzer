@@ -25,6 +25,7 @@ class FactRule:
     severity_score: str
     confidence: Optional[str]
     opportunity_tags: List[str]
+    suppresses_tags: List[str] = dc.field(default_factory=list)
     emit_mode: str = "per_row"
     rule_version: str = "1.0.0"
     allow_mixed: bool = False
@@ -96,6 +97,8 @@ def build_fact_rule(
             )
         )
 
+    suppresses_tags = list(raw_rule.get("suppresses_tags", []))
+
     return FactRule(
         id=rule_id,
         priority=int(raw_rule.get("priority", 0)),
@@ -108,6 +111,7 @@ def build_fact_rule(
         severity_score=str(severity_score),
         confidence=str(confidence) if confidence is not None else None,
         opportunity_tags=opportunity_tags,
+        suppresses_tags=suppresses_tags,
         emit_mode=emit_mode,
         rule_version=str(raw_rule.get("rule_version", defaults.get("rule_version", "1.0.0"))),
         allow_mixed=allow_mixed_effective,
