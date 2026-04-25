@@ -41,3 +41,49 @@ rules:
     confidence: "clip01(0.75 + 0.15 * min(reader_open_ratio - 1.0, 1.0))"
     opportunity_tags:
       - reader_parallelism
+
+  # R10: Fetch-fraction outlier — detects nodes whose fetch fraction is
+  # elevated relative to the cluster, indicating localized I/O pressure
+  # that warrants a targeted per-node plan rather than a job-wide change.
+  # Fires per node (per_row on host_hash view); the spread check ensures
+  # we only flag nodes when there is meaningful cross-node divergence.
+  - id: dlio.global.fetch_outlier.v1
+    priority: 160
+    source_view: host_hash
+    emit_mode: per_row
+    fact_type: fetch_outlier
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(active_time, 1e-9)"
+      fetch_frac_tail_spread: "max(fetch_frac) - min(fetch_frac)"
+    when: "fetch_frac_tail_spread >= 0.10 and fetch_frac >= 0.10"
+    severity_score: "clip01((fetch_frac - 0.10) / 0.40)"
+    confidence: "clip01(0.80 + 0.15 * fetch_frac_tail_spread)"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
+  # R11: Reader/open tail outlier — detects nodes whose reader-open or
+  # backend-read fraction is disproportionately elevated compared to the
+  # cluster minimum, indicating localized metadata or open-path stalls.
+  - id: dlio.global.reader_open_tail_outlier.v1
+    priority: 155
+    source_view: host_hash
+    emit_mode: per_row
+    fact_type: reader_open_tail_outlier
+    required_metrics:
+      - reader_open_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(reader_open_time_proc_max) + fillna0(compute_time_proc_max)"
+      reader_open_frac: "fillna0(reader_open_time_proc_max) / max(active_time, 1e-9)"
+      reader_open_tail_ratio: "reader_open_frac / max(min(reader_open_frac), 1e-9)"
+    when: "reader_open_tail_ratio > 1.25 and reader_open_frac > 0.10"
+    severity_score: "clip01((reader_open_tail_ratio - 1.0) / 1.50)"
+    confidence: "clip01(0.75 + 0.15 * min(reader_open_tail_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+      - metadata_reduction
