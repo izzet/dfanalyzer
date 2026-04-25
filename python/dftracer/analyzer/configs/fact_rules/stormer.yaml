@@ -24,10 +24,10 @@ rules:
       - dataloader_prefetch
       - reader_parallelism
 
-  - id: stormer.reader_open_pressure.v1
+  - id: stormer.open_pressure.v1
     priority: 98
     source_view: epoch
-    fact_type: reader_open_pressure
+    fact_type: open_pressure
     required_metrics:
       - reader_open_time_proc_max
       - compute_time_proc_max
