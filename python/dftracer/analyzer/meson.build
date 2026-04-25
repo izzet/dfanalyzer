@@ -24,6 +24,7 @@ py.install_sources(
 
 install_data(
     'configs/fact_rules/dlio.yaml',
+    'configs/fact_rules/stormer.yaml',
     install_dir: py.get_install_dir(subdir: 'dftracer/analyzer/configs/fact_rules'),
 )
 
