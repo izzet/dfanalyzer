@@ -15,9 +15,9 @@ def test_fact_engine_emits_per_row_and_window_facts():
             "priority": 10,
             "source_view": "epoch",
             "fact_type": "fetch_pressure",
-            "required_metrics": ["fetch_data_time_frac_parent"],
-            "when": "fetch_data_time_frac_parent >= 0.5",
-            "severity_score": "clip01(fetch_data_time_frac_parent)",
+            "required_metrics": ["fetch_iter_time_frac_parent"],
+            "when": "fetch_iter_time_frac_parent >= 0.5",
+            "severity_score": "clip01(fetch_iter_time_frac_parent)",
             "confidence": "0.9",
             "opportunity_tags": ["reader_parallelism"],
         }
@@ -43,7 +43,7 @@ def test_fact_engine_emits_per_row_and_window_facts():
     flat_views = {
         ("epoch",): pd.DataFrame(
             {
-                "fetch_data_time_frac_parent": [0.20, 0.55, 0.80],
+                "fetch_iter_time_frac_parent": [0.20, 0.55, 0.80],
             },
             index=[1, 2, 3],
         ),
@@ -117,8 +117,8 @@ def test_fact_engine_sets_time_range_and_step_window_metadata():
             "priority": 10,
             "source_view": "time_range",
             "fact_type": "fetch_interval_pressure",
-            "required_metrics": ["fetch_data_time_frac_parent"],
-            "when": "fetch_data_time_frac_parent > 0.5",
+            "required_metrics": ["fetch_iter_time_frac_parent"],
+            "when": "fetch_iter_time_frac_parent > 0.5",
             "severity_score": "0.8",
             "confidence": "0.7",
         }
@@ -139,7 +139,7 @@ def test_fact_engine_sets_time_range_and_step_window_metadata():
     flat_views = {
         ("time_range",): pd.DataFrame(
             {
-                "fetch_data_time_frac_parent": [0.2, 0.7],
+                "fetch_iter_time_frac_parent": [0.2, 0.7],
             },
             index=[0, 1],
         ),

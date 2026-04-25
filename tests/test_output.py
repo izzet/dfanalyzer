@@ -26,7 +26,7 @@ def _sample_result():
     flat_view = pd.DataFrame(
         {
             "epoch_time_sum": [10.0],
-            "fetch_data_time_frac_epoch": [0.75],
+            "fetch_iter_time_frac_epoch": [0.75],
         },
         index=pd.Index([7], name="epoch"),
     )
@@ -60,7 +60,7 @@ def _sample_fact() -> AnalysisFact:
         fact_type="fetch_interval_pressure",
         window=FactWindow(run_id="run-1", view_type="time_range", t0_ns=0, t1_ns=10_000_000_000, trigger="rule_eval"),
         scope=FactScope(entity="0", rank_set="all"),
-        evidence={"metrics": {"fetch_data_time_frac_parent": 0.72}},
+        evidence={"metrics": {"fetch_iter_time_frac_parent": 0.72}},
         severity=FactSeverity(score=0.9, label="critical"),
         confidence=0.8,
         opportunity_tags=["reader_parallelism"],

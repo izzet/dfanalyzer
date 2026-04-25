@@ -42,7 +42,7 @@ def test_analyzer_result_to_fact_envelope_contract():
         additional_metrics={},
         checkpoint_dir=".",
         flat_views={("epoch",): pd.DataFrame({"epoch_time_max": [1.0]}, index=[1])},
-        layers=["epoch", "fetch_data"],
+        layers=["epoch", "fetch_iter"],
         raw_stats=RawStats(
             job_time=10,
             time_granularity=10,
