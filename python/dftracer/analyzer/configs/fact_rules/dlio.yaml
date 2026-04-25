@@ -100,10 +100,10 @@ rules:
     opportunity_tags:
       - reader_contention
 
-  - id: dlio.pread_contention.v1
+  - id: dlio.read_contention.v1
     priority: 110
     source_view: epoch
-    fact_type: pread_contention
+    fact_type: read_contention
     required_metrics:
       - reader_posix_read_time_call_mean
       - reader_posix_read_time_call_min
@@ -116,6 +116,25 @@ rules:
       - reader_contention
     suppresses_tags:
       - reader_parallelism
+
+  - id: dlio.bw_saturation.v1
+    priority: 112
+    source_view: epoch
+    fact_type: bw_saturation
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_bw_proc_max
+    derived_metrics:
+      # Site-specific Lustre ceiling in bytes/sec; edit for target system.
+      bw_ceiling: "171e6"
+      bw_utilization: "fillna0(reader_posix_read_bw_proc_max) / max(bw_ceiling, 1e-9)"
+    when: "bw_utilization >= 0.80"
+    severity_score: "clip01((bw_utilization - 0.70) / 0.30)"
+    confidence: "clip01(0.75 + 0.20 * bw_utilization)"
+    opportunity_tags: []
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
 
   - id: dlio.reader_posix.small_read_dominance.v1
     priority: 89
