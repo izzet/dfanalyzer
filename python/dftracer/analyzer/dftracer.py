@@ -312,7 +312,7 @@ def load_objects_dict(
     extra_columns_fn: Optional[Callable[[dict], dict]],
 ):
     final_dict = {}
-    logger.debug("Loading dict", json_dict=json_dict)
+    # logger.debug("Loading dict", json_dict=json_dict)
     if json_dict is not None:
         try:
             ph = json_dict.get("ph")
@@ -399,7 +399,7 @@ def load_objects_dict(
             if extra_columns and not all(col in final_dict for col in extra_columns):
                 missing_cols = [col for col in extra_columns if col not in final_dict]
                 raise ValueError(f"Missing extra columns: {missing_cols}")
-            logger.debug("Built a dictionary for dict", final_dict=final_dict)
+            # logger.debug("Built a dictionary for dict", final_dict=final_dict)
             yield final_dict
         except ValueError as error:
             logger.error("Processing dict failed", dict=json_dict, error=error)
@@ -628,12 +628,12 @@ class DFTracerAnalyzer(Analyzer):
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
     ) -> dict:
-        logger.debug(
-            "stream.normalize_input",
-            name=event.get("name"),
-            ph=event.get("ph"),
-            args_name=event.get("args", {}).get("name"),
-        )
+        # logger.debug(
+        #     "stream.normalize_input",
+        #     name=event.get("name"),
+        #     ph=event.get("ph"),
+        #     args_name=event.get("args", {}).get("name"),
+        # )
         normalized_event = next(
             load_objects_dict(
                 event,
@@ -760,10 +760,10 @@ class DFTracerAnalyzer(Analyzer):
         time_origin = traces["ts"].min() if time_origin is None else time_origin
         traces["ts"] = traces["ts"] - time_origin
         traces["te"] = traces["ts"] + traces["dur"]
-        traces["trange"] = traces["ts"] // (self.time_granularity * self.time_resolution)
+        traces["trange"] = traces["ts"] // int(self.time_granularity * self.time_resolution)
         traces["ts"] = traces["ts"].astype("Int64")
         traces["te"] = traces["te"].astype("Int64")
-        traces["trange"] = traces["trange"].fillna(0).astype("Int32")
+        traces["trange"] = traces["trange"].fillna(0).astype("Int64")
         traces["dur"] = traces["dur"] / self.time_resolution
         logger.debug(
             "Fixed time columns",
