@@ -1,0 +1,156 @@
+schema_version: analysisfact-rules.v1
+
+# POSIX-only rules for Lustre (lustre3 on Corona).
+# Uses ONLY POSIX-level metrics — no app/framework metrics (compute_time,
+# fetch_iter_time, etc.). Targets the same knobs as app/cross-layer rules.
+#
+# IOR baseline on Corona lustre3 (O_DIRECT, single process):
+#   Sequential 1MB read:  455 MiB/s  (477 MB/s)
+#   Random 256KB read:    163 MiB/s  (171 MB/s)
+#
+# Per-process peak read BW reference: 171 MB/s (random 256KB, conservative).
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: per_row
+  confidence: "0.80"
+
+rules:
+  # -----------------------------------------------------------------------
+  # Actionable rules (drive reader_parallelism / reader_contention knobs)
+  # -----------------------------------------------------------------------
+
+  # Rule 1: Per-process read bandwidth is well below Lustre capacity.
+  # If each process is reading far below what the filesystem can deliver,
+  # adding more reader workers can better saturate available bandwidth.
+  # IOR random-256KB O_DIRECT: 163 MiB/s = 170917888 B/s.
+  # Threshold: 50% of peak = ~85 MB/s.
+  - id: posix_lustre3.reader_bw_pressure.v1
+    priority: 100
+    source_view: epoch
+    fact_type: reader_bw_pressure
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_bw_proc_mean
+    when: "reader_posix_read_bw_proc_mean < 85000000"
+    severity_score: "clip01((85000000 - fillna0(reader_posix_read_bw_proc_mean)) / 85000000)"
+    confidence: "clip01(0.70 + 0.20 * clip01((85000000 - fillna0(reader_posix_read_bw_proc_mean)) / 85000000))"
+    opportunity_tags:
+      - reader_parallelism
+
+  # Rule 2 (suppress): Metadata operations dominate reader POSIX time.
+  # When metadata fraction > 40%, adding readers risks MDS contention.
+  # Suppress reader_parallelism increases — don't make it worse.
+  - id: posix_lustre3.reader_metadata_heavy.v1
+    priority: 200
+    source_view: epoch
+    fact_type: reader_metadata_heavy
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_max
+      - reader_posix_time_proc_max
+    derived_metrics:
+      metadata_ratio: "fillna0(reader_posix_metadata_time_proc_max) / max(fillna0(reader_posix_time_proc_max), 1e-9)"
+    when: "metadata_ratio > 0.40"
+    severity_score: "clip01((metadata_ratio - 0.30) / 0.40)"
+    confidence: "clip01(0.70 + 0.20 * metadata_ratio)"
+    opportunity_tags:
+      - none
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  # Rule 3 (decrease): Metadata severely dominates — actively reduce workers
+  # to lower MDS contention. Only fires at high metadata fraction (> 65%).
+  - id: posix_lustre3.reader_metadata_contention.v1
+    priority: 190
+    source_view: epoch
+    fact_type: reader_metadata_contention
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_max
+      - reader_posix_time_proc_max
+    derived_metrics:
+      metadata_ratio: "fillna0(reader_posix_metadata_time_proc_max) / max(fillna0(reader_posix_time_proc_max), 1e-9)"
+    when: "metadata_ratio > 0.65"
+    severity_score: "clip01((metadata_ratio - 0.50) / 0.40)"
+    confidence: "clip01(0.70 + 0.25 * metadata_ratio)"
+    opportunity_tags:
+      - reader_contention
+
+  # -----------------------------------------------------------------------
+  # Characterization rules (WisIO heuristics on reader_posix sub-layer)
+  # -----------------------------------------------------------------------
+
+  - id: posix_lustre3.reader_posix.small_read_dominance.v1
+    priority: 89
+    source_view: epoch
+    fact_type: small_read_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_time_proc_frac_parent
+      - reader_posix_read_size_proc_mean
+    when: "reader_posix_read_time_proc_frac_parent > 0.50 and reader_posix_read_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_read_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: posix_lustre3.reader_posix.small_write_dominance.v1
+    priority: 88
+    source_view: epoch
+    fact_type: small_write_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_write_time_proc_frac_parent
+      - reader_posix_write_size_proc_mean
+    when: "reader_posix_write_time_proc_frac_parent > 0.50 and reader_posix_write_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_write_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_write_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: posix_lustre3.reader_posix.excessive_metadata_access.v1
+    priority: 87
+    source_view: epoch
+    fact_type: excessive_metadata_access
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_frac_parent
+    when: "reader_posix_metadata_time_proc_frac_parent > 0.50"
+    severity_score: "clip01((reader_posix_metadata_time_proc_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_proc_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  - id: posix_lustre3.reader_posix.operation_imbalance.v1
+    priority: 86
+    source_view: epoch
+    fact_type: operation_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_count_sum
+      - reader_posix_write_count_sum
+    derived_metrics:
+      reader_posix_operation_imbalance_ratio: "abs(fillna0(reader_posix_read_count_sum) - fillna0(reader_posix_write_count_sum)) / max(min(fillna0(reader_posix_read_count_sum), fillna0(reader_posix_write_count_sum)), 1e-9)"
+    when: "reader_posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: posix_lustre3.reader_posix.size_imbalance.v1
+    priority: 85
+    source_view: epoch
+    fact_type: size_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_size_sum
+      - reader_posix_write_size_sum
+    derived_metrics:
+      reader_posix_size_imbalance_ratio: "abs(fillna0(reader_posix_read_size_sum) - fillna0(reader_posix_write_size_sum)) / max(min(fillna0(reader_posix_read_size_sum), fillna0(reader_posix_write_size_sum)), 1e-9)"
+    when: "reader_posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing

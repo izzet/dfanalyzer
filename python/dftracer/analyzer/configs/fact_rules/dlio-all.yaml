@@ -1,5 +1,9 @@
 schema_version: analysisfact-rules.v1
 
+# Cross-layer (multi-domain) rules: uses BOTH app-level and POSIX-level
+# metrics. This is a copy of dlio.yaml used as the "full LiveIO" config
+# in the layers ablation experiment.
+
 defaults:
   rule_version: "1.0.0"
   emit_mode: per_row
@@ -99,23 +103,6 @@ rules:
     confidence: "clip01(0.70 + 0.20 * compute_frac)"
     opportunity_tags:
       - reader_contention
-
-  - id: dlio.pread_contention.v1
-    priority: 110
-    source_view: epoch
-    fact_type: pread_contention
-    required_metrics:
-      - reader_posix_read_time_call_mean
-      - reader_posix_read_time_call_min
-    derived_metrics:
-      pread_latency_spread: "fillna0(reader_posix_read_time_call_mean) / max(fillna0(reader_posix_read_time_call_min), 1e-9)"
-    when: "pread_latency_spread > 10"
-    severity_score: "clip01((pread_latency_spread - 5) / 40)"
-    confidence: "clip01(0.70 + 0.15 * min(pread_latency_spread / 20, 1.0))"
-    opportunity_tags:
-      - reader_contention
-    suppresses_tags:
-      - reader_parallelism
 
   - id: dlio.reader_posix.small_read_dominance.v1
     priority: 89

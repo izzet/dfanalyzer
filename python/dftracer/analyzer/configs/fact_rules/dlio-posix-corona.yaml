@@ -1,0 +1,160 @@
+schema_version: analysisfact-rules.v1
+
+# POSIX-only rules for Corona UNet3D controller studies.
+# These rules use only reader_posix_* metrics and drive the same knob tags as
+# the app-only and cross-layer controllers. The goal is not to make POSIX-only
+# "win", but to give it a fair action space while keeping the observability
+# boundary honest.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: per_row
+  confidence: "0.80"
+
+rules:
+  # -----------------------------------------------------------------------
+  # Actionable rules
+  # -----------------------------------------------------------------------
+
+  # Rule 1: Reader data I/O dominates POSIX time and per-process read
+  # bandwidth is still well below the high-bandwidth regime we observe on
+  # Corona once the pipeline is sufficiently fed. This is the strongest
+  # POSIX-only proxy for "there is still I/O-side headroom".
+  - id: posix_corona.reader_data_headroom.v1
+    priority: 100
+    source_view: epoch
+    fact_type: reader_data_headroom
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_data_time_proc_frac_parent
+      - reader_posix_metadata_time_proc_frac_parent
+      - reader_posix_read_bw_proc_mean
+      - reader_posix_time_proc_max
+    when: "reader_posix_data_time_proc_frac_parent > 0.90 and reader_posix_metadata_time_proc_frac_parent < 0.10 and reader_posix_read_bw_proc_mean < 600000000 and reader_posix_time_proc_max > 20"
+    severity_score: "clip01(0.50 * ((600000000 - fillna0(reader_posix_read_bw_proc_mean)) / 600000000) + 0.25 * ((fillna0(reader_posix_data_time_proc_frac_parent) - 0.90) / 0.10) + 0.25 * ((fillna0(reader_posix_time_proc_max) - 20.0) / 60.0))"
+    confidence: "clip01(0.72 + 0.10 * fillna0(reader_posix_data_time_proc_frac_parent) + 0.10 * ((600000000 - fillna0(reader_posix_read_bw_proc_mean)) / 600000000))"
+    opportunity_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  # Rule 2: Per-process read bandwidth is already in the saturated regime for
+  # this workload on Corona. A POSIX-only controller cannot infer whether I/O
+  # is still exposed on the critical path, so the safest reaction is to stop
+  # increasing I/O knobs once storage-side delivery is already high.
+  - id: posix_corona.reader_bw_saturated.v1
+    priority: 190
+    source_view: epoch
+    fact_type: reader_bw_saturated
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_bw_proc_mean
+    when: "reader_posix_read_bw_proc_mean > 1000000000"
+    severity_score: "clip01((fillna0(reader_posix_read_bw_proc_mean) - 1000000000) / 800000000)"
+    confidence: "clip01(0.75 + 0.15 * ((fillna0(reader_posix_read_bw_proc_mean) - 1000000000) / 800000000))"
+    opportunity_tags:
+      - none
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  # Rule 3: Metadata operations dominate POSIX time. In this regime, more
+  # readers are likely to increase metadata traffic rather than useful
+  # throughput.
+  - id: posix_corona.reader_metadata_heavy.v1
+    priority: 200
+    source_view: epoch
+    fact_type: reader_metadata_heavy
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_max
+      - reader_posix_time_proc_max
+    derived_metrics:
+      metadata_ratio: "fillna0(reader_posix_metadata_time_proc_max) / max(fillna0(reader_posix_time_proc_max), 1e-9)"
+    when: "metadata_ratio > 0.40"
+    severity_score: "clip01((metadata_ratio - 0.30) / 0.40)"
+    confidence: "clip01(0.70 + 0.20 * metadata_ratio)"
+    opportunity_tags:
+      - none
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  # Rule 4: Severe metadata dominance, used as the POSIX-only backoff path.
+  - id: posix_corona.reader_metadata_contention.v1
+    priority: 195
+    source_view: epoch
+    fact_type: reader_metadata_contention
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_max
+      - reader_posix_time_proc_max
+    derived_metrics:
+      metadata_ratio: "fillna0(reader_posix_metadata_time_proc_max) / max(fillna0(reader_posix_time_proc_max), 1e-9)"
+    when: "metadata_ratio > 0.65"
+    severity_score: "clip01((metadata_ratio - 0.50) / 0.40)"
+    confidence: "clip01(0.70 + 0.25 * metadata_ratio)"
+    opportunity_tags:
+      - reader_contention
+
+  # -----------------------------------------------------------------------
+  # Characterization rules
+  # -----------------------------------------------------------------------
+
+  - id: posix_corona.reader_posix.small_read_dominance.v1
+    priority: 89
+    source_view: epoch
+    fact_type: small_read_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_time_proc_frac_parent
+      - reader_posix_read_size_proc_mean
+    when: "reader_posix_read_time_proc_frac_parent > 0.50 and reader_posix_read_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_read_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: posix_corona.reader_posix.excessive_metadata_access.v1
+    priority: 87
+    source_view: epoch
+    fact_type: excessive_metadata_access
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_frac_parent
+    when: "reader_posix_metadata_time_proc_frac_parent > 0.50"
+    severity_score: "clip01((reader_posix_metadata_time_proc_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_proc_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  - id: posix_corona.reader_posix.operation_imbalance.v1
+    priority: 86
+    source_view: epoch
+    fact_type: operation_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_count_sum
+      - reader_posix_write_count_sum
+    derived_metrics:
+      reader_posix_operation_imbalance_ratio: "abs(fillna0(reader_posix_read_count_sum) - fillna0(reader_posix_write_count_sum)) / max(min(fillna0(reader_posix_read_count_sum), fillna0(reader_posix_write_count_sum)), 1e-9)"
+    when: "reader_posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: posix_corona.reader_posix.size_imbalance.v1
+    priority: 85
+    source_view: epoch
+    fact_type: size_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_size_sum
+      - reader_posix_write_size_sum
+    derived_metrics:
+      reader_posix_size_imbalance_ratio: "abs(fillna0(reader_posix_read_size_sum) - fillna0(reader_posix_write_size_sum)) / max(min(fillna0(reader_posix_read_size_sum), fillna0(reader_posix_write_size_sum)), 1e-9)"
+    when: "reader_posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
