@@ -597,13 +597,40 @@ class DFTracerAnalyzer(Analyzer):
             return "epoch"
         return super().get_time_boundary_layer()
 
-    def get_unique_file_count(self, traces: dd.DataFrame):
+    def get_unique_file_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        if profiles is not None and "file_hash" in profiles.columns:
+            return dd.concat(
+                [traces["file_hash"], profiles["file_hash"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["file_hash"].nunique()
 
-    def get_unique_host_count(self, traces: dd.DataFrame):
+    def get_unique_host_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        if profiles is not None and "host_hash" in profiles.columns:
+            return dd.concat(
+                [traces["host_hash"], profiles["host_hash"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["host_hash"].nunique()
 
-    def get_unique_process_count(self, traces: dd.DataFrame):
+    def get_unique_process_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        if profiles is not None and "pid" in profiles.columns:
+            return dd.concat(
+                [traces["pid"], profiles["pid"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["pid"].nunique()
 
     @staticmethod

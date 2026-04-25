@@ -370,8 +370,30 @@ class Analyzer(abc.ABC):
                 traces = self.postread_trace(traces=traces, view_types=proc_view_types)
             with log_block("set_file_format"):
                 traces = self.set_file_format(traces)
+                # Profile events (ph="C" from aggregator) share the
+                # view_types groupby, so they must also carry the
+                # derived file_format column or _compute_profile_hlm
+                # will KeyError at groupby time.
+                if profiles is not None:
+                    profiles = self.set_file_format(profiles)
+                    read_result.profiles = profiles
             with log_block("time_correlation"):
-                traces = self.apply_time_correlation(traces)
+                traces = self.apply_time_correlation(
+                    traces, extra_boundary_sources=[profiles],
+                )
+                # Also correlate profile events. Semantic span events
+                # may live in EITHER stream depending on aggregation
+                # mode: in SELECTIVE mode (cat IN POSIX/STDIO) spans
+                # stay as X events in traces; in FULL mode they become
+                # C events in profiles. apply_time_correlation tries
+                # each candidate source until it finds boundaries.
+                if profiles is not None:
+                    profiles = self.apply_time_correlation(
+                        profiles,
+                        boundary_source=traces,
+                        extra_boundary_sources=[profiles],
+                    )
+                    read_result.profiles = profiles
             with log_block("set_size_bins"):
                 traces = traces.map_partitions(set_size_bins)
             if self.time_sliced:
@@ -464,9 +486,9 @@ class Analyzer(abc.ABC):
         trace_event_count = self.get_total_event_count(traces)
         profile_event_count = self.get_profile_event_count(profiles)
         total_event_count = trace_event_count + profile_event_count
-        unique_file_count = self.get_unique_file_count(traces)
-        unique_host_count = self.get_unique_host_count(traces)
-        unique_process_count = self.get_unique_process_count(traces)
+        unique_file_count = self.get_unique_file_count(traces, profiles)
+        unique_host_count = self.get_unique_host_count(traces, profiles)
+        unique_process_count = self.get_unique_process_count(traces, profiles)
         raw_stats_data = self.restore_extra_data(
             name=self.get_stats_checkpoint_name(),
             fallback=lambda: dict(
@@ -855,43 +877,74 @@ class Analyzer(abc.ABC):
         return traces.index.count().persist()
 
     def get_profile_event_count(self, profiles: Optional[dd.DataFrame]):
+        # Profile rows from aggregated ph="C" events represent N coalesced
+        # syscalls each; COL_COUNT (mapped from dft_cnt by
+        # _standardize_profile_partition) carries that N. The total
+        # syscall count is the sum of COL_COUNT across rows, never the
+        # row count itself — falling back to row-count would silently
+        # underreport whenever aggregation is on. If COL_COUNT is
+        # missing we treat profiles as empty (an invariant violation
+        # upstream would surface as a KeyError elsewhere).
         if profiles is None:
             return 0
-        if COL_COUNT in profiles.columns:
-            return profiles[COL_COUNT].fillna(0).sum().persist()
-        return profiles.index.count().persist()
+        if COL_COUNT not in profiles.columns:
+            return 0
+        return profiles[COL_COUNT].fillna(0).sum().persist()
 
-    def get_unique_host_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique hosts accessed in the traces.
+    def get_unique_host_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        """Computes the total number of unique hosts accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique hosts accessed as an integer.
+        When ``profiles`` is provided and shares the host column, the
+        unique count is taken over the union of trace and profile rows so
+        aggregated events contribute. Without this, hosts seen only via
+        aggregated profile events would be missed.
         """
+        if profiles is not None and COL_HOST_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_HOST_NAME], profiles[COL_HOST_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_HOST_NAME].nunique()
 
-    def get_unique_file_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique files accessed in the traces.
+    def get_unique_file_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        """Computes the total number of unique files accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique files accessed as an integer.
+        When ``profiles`` is provided and shares the file column, the
+        unique count is taken over the union of trace and profile rows so
+        aggregated events contribute. Without this, files seen only via
+        aggregated profile events would be missed.
         """
+        if profiles is not None and COL_FILE_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_FILE_NAME], profiles[COL_FILE_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_FILE_NAME].nunique()
 
-    def get_unique_process_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique processes accessed in the traces.
+    def get_unique_process_count(
+        self,
+        traces: dd.DataFrame,
+        profiles: Optional[dd.DataFrame] = None,
+    ):
+        """Computes the total number of unique processes accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique processes accessed as an integer.
+        When ``profiles`` is provided and shares the proc column, the
+        unique count is taken over the union of trace and profile rows so
+        aggregated events contribute.
         """
+        if profiles is not None and COL_PROC_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_PROC_NAME], profiles[COL_PROC_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_PROC_NAME].nunique()
 
     def has_checkpoint(self, name: str):
@@ -1009,8 +1062,23 @@ class Analyzer(abc.ABC):
         )
         return traces
 
-    def apply_time_correlation(self, traces: dd.DataFrame) -> dd.DataFrame:
-        """Propagate fields from source-layer events to all events via time-window overlap."""
+    def apply_time_correlation(
+        self,
+        traces: dd.DataFrame,
+        boundary_source: Optional[dd.DataFrame] = None,
+        extra_boundary_sources: Optional[List[dd.DataFrame]] = None,
+    ) -> dd.DataFrame:
+        """Propagate fields from source-layer events to all events via time-window overlap.
+
+        Boundary extraction tries each source in order: first
+        ``boundary_source`` if supplied (else ``traces``), then each of
+        ``extra_boundary_sources``. The first non-empty source wins. This is
+        needed because with aggregation enabled, the semantic spans (step /
+        llm / tool) may end up in either the trace stream (SELECTIVE mode,
+        where they aren't aggregated and stay as X events) or the profile
+        stream (FULL mode, where they get aggregated into C events); the
+        correlator needs to find them wherever they are.
+        """
         tc = self.preset.time_correlation
         if not tc or not tc.enabled or not tc.field:
             return traces
@@ -1018,14 +1086,34 @@ class Analyzer(abc.ABC):
         fields = [f for f in fields if f in traces.columns]
         if not fields:
             return traces
-        if tc.layer and tc.layer in (self.preset.layer_defs or {}):
-            layer_query = self.preset.layer_defs[tc.layer]
-            source = traces.query(layer_query)
-        else:
-            source = traces[traces[fields[0]].notna()]
+        source_candidates = []
+        source_candidates.append(boundary_source if boundary_source is not None else traces)
+        if extra_boundary_sources:
+            source_candidates.extend(s for s in extra_boundary_sources if s is not None)
+        boundaries = None
         boundary_cols = [COL_TIME_START, COL_TIME_END] + fields
-        boundaries = source[boundary_cols].compute()
-        if boundaries.empty:
+        for cand in source_candidates:
+            if cand is None:
+                continue
+            cand_fields = [f for f in fields if f in cand.columns]
+            if not cand_fields:
+                continue
+            if tc.layer and tc.layer in (self.preset.layer_defs or {}):
+                layer_query = self.preset.layer_defs[tc.layer]
+                try:
+                    source = cand.query(layer_query)
+                except Exception:
+                    continue
+            else:
+                source = cand[cand[cand_fields[0]].notna()]
+            try:
+                candidate_boundaries = source[boundary_cols].compute()
+            except Exception:
+                continue
+            if not candidate_boundaries.empty:
+                boundaries = candidate_boundaries
+                break
+        if boundaries is None or boundaries.empty:
             return traces
         boundaries = boundaries.sort_values(COL_TIME_START).reset_index(drop=True)
         traces = traces.map_partitions(
@@ -1407,6 +1495,16 @@ class Analyzer(abc.ABC):
     ) -> dd.DataFrame:
         # Add layer columns (use preset hlm_fields instead of hardcoded HLM_EXTRA_COLS)
         hlm_groupby = list(dict.fromkeys(view_types + list(self.preset.hlm_fields)))
+        # Profile DataFrames (from ph="C" aggregated events) can lack columns
+        # that are derived during trace post-processing or that come from
+        # `args.*` fields only present on trace events (e.g. io_phase,
+        # proc_name, completion_tokens). groupby with dropna=False treats
+        # null as a valid group and sum/min/max over all-null columns
+        # yields NA, so filling absent columns with NA is a faithful no-op
+        # for aggregation.
+        missing_groupby_cols = [c for c in hlm_groupby if c not in traces.columns]
+        if missing_groupby_cols:
+            traces = traces.assign(**{c: pd.NA for c in missing_groupby_cols})
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
@@ -1433,6 +1531,11 @@ class Analyzer(abc.ABC):
         additional_agg = self._get_hlm_additional_aggregations()
         hlm_fields_set = set(hlm_groupby)
         hlm_agg.update({k: v for k, v in additional_agg.items() if k not in hlm_fields_set})
+        # Same fallback as above: also cover agg-dict columns that are
+        # absent from the profile schema.
+        missing_agg_cols = [c for c in hlm_agg if c not in traces.columns]
+        if missing_agg_cols:
+            traces = traces.assign(**{c: pd.NA for c in missing_agg_cols})
         hlm = (
             traces.groupby(hlm_groupby, dropna=False)
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
@@ -1636,7 +1739,7 @@ class Analyzer(abc.ABC):
             if col in combined_hlm.columns:
                 hlm_agg[col] = unique_set_flatten()
         hlm = (
-            combined_hlm.groupby(hlm_groupby)
+            combined_hlm.groupby(hlm_groupby, dropna=False)
             .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
             .persist()
             .repartition(partition_size=partition_size)
@@ -1840,12 +1943,25 @@ class Analyzer(abc.ABC):
                 time_interval=self.time_granularity,
                 time_metric=time_proc_metric,
             )
-            view = view.eval(f"{metric} = {eval_condition}")
+            # Derived metric formulas can reference columns that are absent
+            # when the HLM comes from profile-only events (e.g. llm_*
+            # columns that require per-event args.* fields). A missing
+            # column manifests as UndefinedVariableError from pandas eval;
+            # in that case we set the metric to NA and move on instead of
+            # aborting the whole analysis.
+            try:
+                view = view.eval(f"{metric} = {eval_condition}")
+            except pd.errors.UndefinedVariableError:
+                view[metric] = pd.NA
+                continue
             numerator_denominators = extract_numerator_and_denominators(eval_condition)
             if numerator_denominators:
                 _, denominators = numerator_denominators
                 if denominators:
                     denominator_conditions = [f"({denom}.isna() | {denom} == 0)" for denom in denominators]
                     mask_condition = " & ".join(denominator_conditions)
-                    view[metric] = view[metric].mask(view.eval(mask_condition), pd.NA)
+                    try:
+                        view[metric] = view[metric].mask(view.eval(mask_condition), pd.NA)
+                    except pd.errors.UndefinedVariableError:
+                        pass
         return view
