@@ -1,8 +1,10 @@
+import gzip
 import json
 import os
 import pathlib
 import pytest
 import random
+import shutil
 from dask.distributed import LocalCluster
 from dftracer.analyzer import init_with_hydra
 from glob import glob
@@ -169,3 +171,47 @@ def _test_e2e(
 
     # Verify that the Dask client is closed
     assert dfa.client.status == "closed", "Dask client should be closed after shutdown"
+
+
+@pytest.mark.smoke
+def test_read_trace_handles_mixed_pfw_and_pfw_gz(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """Regression: a trace dir mixing .pfw and .pfw.gz must analyze cleanly.
+
+    Pre-fix, plain .pfw filenames leaked into the indexed-gzip reader pipeline
+    (json_line_delayed) and load_indexed_gzip_files raised
+    "Failed to create reader" because no .idx file exists for them.
+    """
+    fixture = pathlib.Path("tests/data/extracted/dftracer-posix/trace-afe567973bb91bf7-preload.pfw")
+    assert fixture.exists(), f"Missing fixture: {fixture}"
+
+    mixed_dir = tmp_path / "mixed_traces"
+    mixed_dir.mkdir()
+    shutil.copy(fixture, mixed_dir / "trace_a.pfw")
+    with fixture.open("rb") as src, gzip.open(mixed_dir / "trace_b.pfw.gz", "wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+    checkpoint_dir = f"{tmp_path}/checkpoints"
+    scheduler_address = dask_cluster.scheduler_address
+    hydra_overrides = [
+        "analyzer=dftracer",
+        "analyzer/preset=posix",
+        "analyzer.checkpoint=False",
+        f"analyzer.checkpoint_dir={checkpoint_dir}",
+        "cluster=external",
+        "cluster.restart_on_connect=True",
+        f"cluster.scheduler_address={scheduler_address}",
+        f"hydra.run.dir={tmp_path}",
+        f"hydra.runtime.output_dir={tmp_path}",
+        f"trace_path={mixed_dir}",
+        "view_types=[proc_name]",
+    ]
+
+    dfa = init_with_hydra(hydra_overrides=hydra_overrides)
+    result = dfa.analyze_trace()
+    try:
+        assert len(result.flat_views) == 1, "Expected one flat view"
+    finally:
+        dfa.shutdown()
