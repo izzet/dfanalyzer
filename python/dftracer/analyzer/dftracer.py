@@ -450,6 +450,12 @@ class DFTracerAnalyzer(Analyzer):
                 json_line_delayed = []
                 total_lines = 0
                 for filename, max_bytes in sizes:
+                    # Only enqueue gzipped traces for the indexed gzip reader.
+                    # Plain .pfw files are read separately via db.read_text below;
+                    # passing them through load_indexed_gzip_files fails with
+                    # "Failed to create reader" since they have no .idx file.
+                    if not filename.endswith(".pfw.gz"):
+                        continue
                     total_lines += max_bytes
                     for _, start, end in generate_batches(filename, max_bytes):
                         json_line_delayed.append((filename, start, end))
