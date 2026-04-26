@@ -216,6 +216,24 @@ def get_io_cat(func_name: str):
     return IOCategory.OTHER.value
 
 
+def _safe_int(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def io_columns():
     columns = {
         "file_hash": "string",
@@ -235,31 +253,33 @@ def io_function(json_dict: dict):
         if "fhash" in json_dict["args"]:
             d["file_hash"] = str(json_dict["args"]["fhash"])
         if "size_sum" in json_dict["args"]:
-            d["size"] = int(json_dict["args"]["size_sum"])
+            size = _safe_int(json_dict["args"]["size_sum"])
+            if size is not None:
+                d["size"] = size
         elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
             name = json_dict["name"]
             io_cat = get_io_cat(name)
             if "ret" in json_dict["args"]:
-                size = int(json_dict["args"]["ret"])
-                if size > 0:
+                size = _safe_int(json_dict["args"]["ret"])
+                if size is not None and size > 0:
                     if io_cat in [IOCategory.READ.value, IOCategory.WRITE.value]:
                         d["size"] = size
             if "offset" in json_dict["args"]:
-                offset = int(json_dict["args"]["offset"])
-                if offset >= 0:
+                offset = _safe_int(json_dict["args"]["offset"])
+                if offset is not None and offset >= 0:
                     d["offset"] = offset
             d[COL_IO_CAT] = io_cat
         else:
             if "image_idx" in json_dict["args"]:
-                image_id = int(json_dict["args"]["image_idx"])
-                if image_id > 0:
+                image_id = _safe_int(json_dict["args"]["image_idx"])
+                if image_id is not None and image_id > 0:
                     d["image_id"] = image_id
             if "image_size" in json_dict["args"]:
                 name = json_dict["name"].lower()
                 # e.g. NPZReader.open image_size is not correct
                 if "open" not in name:
-                    size = int(json_dict["args"]["image_size"])
-                    if size > 0:
+                    size = _safe_int(json_dict["args"]["image_size"])
+                    if size is not None and size > 0:
                         d["size"] = size
     return d
 
@@ -276,7 +296,9 @@ def profile_function(json_dict: dict):
         d[COL_IO_CAT] = get_io_cat(json_dict["name"])
     for key in PROFILE_COLUMN_MAPPING:
         if key in args:
-            d[key] = int(args[key])
+            value = _safe_int(args[key])
+            if value is not None:
+                d[key] = value
     return d
 
 
@@ -288,7 +310,9 @@ def system_function(json_dict: dict):
         d["host_hash"] = str(args["hhash"])
     for key in SYSTEM_COLUMN_MAPPING:
         if key in args:
-            d[key] = float(args[key])
+            value = _safe_float(args[key])
+            if value is not None:
+                d[key] = value
     return d
 
 
@@ -327,12 +351,12 @@ def load_objects_dict(
                     and json_dict["args"]["epoch"] != "train"
                     and json_dict["args"]["epoch"] != "valid"
                 ):
-                    epoch = int(json_dict["args"]["epoch"])
-                    if epoch >= 0:
+                    epoch = _safe_int(json_dict["args"]["epoch"])
+                    if epoch is not None and epoch >= 0:
                         final_dict["epoch"] = epoch
                 if "step" in json_dict["args"]:
-                    step = int(json_dict["args"]["step"])
-                    if step >= 0:
+                    step = _safe_int(json_dict["args"]["step"])
+                    if step is not None and step >= 0:
                         final_dict["step"] = step
             if "M" == ph:
                 if final_dict["name"] == "FH":
@@ -364,9 +388,9 @@ def load_objects_dict(
                 is_system = json_dict.get("cat", "").lower() == "sys"
                 final_dict["type"] = TYPE_SYSTEM if is_system else TYPE_PROFILE
                 if "ts" in json_dict:
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
+                    ts = json_dict["ts"] if type(json_dict["ts"]) is int else _safe_int(json_dict["ts"])
+                    if ts is not None:
+                        final_dict["ts"] = ts
                 if is_system:
                     final_dict.update(system_function(json_dict))
                 else:
@@ -375,17 +399,16 @@ def load_objects_dict(
             else:
                 final_dict["type"] = TYPE_EVENT
                 if "dur" in json_dict:
-                    if type(json_dict["dur"]) is not int:
-                        json_dict["dur"] = int(json_dict["dur"])
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
-                    final_dict["dur"] = json_dict["dur"]
-                    final_dict["te"] = final_dict["ts"] + final_dict["dur"]
-                    if not time_approximate:
-                        final_dict["tinterval"] = I.to_string(
-                            I.closed(json_dict["ts"], json_dict["ts"] + json_dict["dur"])
-                        )
+                    dur = json_dict["dur"] if type(json_dict["dur"]) is int else _safe_int(json_dict["dur"])
+                    ts = json_dict["ts"] if type(json_dict.get("ts")) is int else _safe_int(json_dict.get("ts"))
+                    if dur is not None and ts is not None:
+                        final_dict["ts"] = ts
+                        final_dict["dur"] = dur
+                        final_dict["te"] = final_dict["ts"] + final_dict["dur"]
+                        if not time_approximate:
+                            final_dict["tinterval"] = I.to_string(
+                                I.closed(ts, ts + dur)
+                            )
                 final_dict.update(io_function(json_dict))
                 final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
             # check if all extra columns are present
@@ -395,7 +418,10 @@ def load_objects_dict(
             logger.debug("Built a dictionary for dict", final_dict=final_dict)
             yield final_dict
         except ValueError as error:
-            logger.error("Processing dict failed", dict=json_dict, error=error)
+            # Agent traces can contain malformed quoted command/script payloads.
+            # They are safe to skip, and per-record error logging is too costly
+            # on long runs.
+            logger.debug("Processing dict failed", dict=json_dict, error=error)
     return {}
 
 
@@ -411,7 +437,7 @@ def load_objects_str(
             json_dict = json.loads(unicode_line, strict=False)
             yield from load_objects_dict(json_dict, time_approximate, extra_columns, extra_columns_fn)
         except ValueError as error:
-            logger.error("Processing line failed", line=line, error=error)
+            logger.debug("Processing line failed", line=line, error=error)
     return {}
 
 
@@ -918,7 +944,8 @@ class DFTracerAnalyzer(Analyzer):
             "step": "Int64",
             "tinterval": "Int64" if self.time_approximate else "string",
             "trange": "Int64",
-            "level": "Int8",
+            # Agent traces can exceed 127 nested spans on long repair loops.
+            "level": "Int16",
         }
         metadata_columns = {
             "hash": "string",
