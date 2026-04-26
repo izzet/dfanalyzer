@@ -3,6 +3,7 @@ import os
 import pathlib
 import pytest
 import random
+import shutil
 from dask.distributed import LocalCluster
 from dftracer.analyzer import init_with_hydra
 from glob import glob
@@ -169,3 +170,65 @@ def _test_e2e(
 
     # Verify that the Dask client is closed
     assert dfa.client.status == "closed", "Dask client should be closed after shutdown"
+
+
+def _hydra_overrides_for_path(trace_path, tmp_path, scheduler_address):
+    return [
+        "analyzer=dftracer",
+        "analyzer/preset=posix",
+        "analyzer.checkpoint=False",
+        f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
+        "cluster=external",
+        "cluster.restart_on_connect=True",
+        f"cluster.scheduler_address={scheduler_address}",
+        f"hydra.run.dir={tmp_path}",
+        f"hydra.runtime.output_dir={tmp_path}",
+        f"trace_path={trace_path}",
+        "view_types=[proc_name]",
+    ]
+
+
+@pytest.mark.smoke
+def test_read_trace_skips_zero_byte_traces_alongside_valid(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """A trace dir mixing valid and zero-byte files must analyze cleanly,
+    with the empty files filtered out instead of crashing the run."""
+    fixture = pathlib.Path("tests/data/extracted/dftracer-posix/trace-afe567973bb91bf7-preload.pfw")
+    assert fixture.exists(), f"Missing fixture: {fixture}"
+
+    trace_dir = tmp_path / "partial_empty"
+    trace_dir.mkdir()
+    shutil.copy(fixture, trace_dir / "valid.pfw")
+    (trace_dir / "empty.pfw").write_bytes(b"")
+    (trace_dir / "empty.pfw.gz").write_bytes(b"")
+
+    overrides = _hydra_overrides_for_path(trace_dir, tmp_path, dask_cluster.scheduler_address)
+    dfa = init_with_hydra(hydra_overrides=overrides)
+    try:
+        result = dfa.analyze_trace()
+        assert len(result.flat_views) == 1
+    finally:
+        dfa.shutdown()
+
+
+@pytest.mark.smoke
+def test_read_trace_raises_clear_error_when_all_traces_are_zero_byte(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """All-empty trace dir must raise ValueError with an actionable message
+    instead of failing deep in the metrics pipeline."""
+    trace_dir = tmp_path / "all_empty"
+    trace_dir.mkdir()
+    (trace_dir / "a.pfw").write_bytes(b"")
+    (trace_dir / "b.pfw.gz").write_bytes(b"")
+
+    overrides = _hydra_overrides_for_path(trace_dir, tmp_path, dask_cluster.scheduler_address)
+    dfa = init_with_hydra(hydra_overrides=overrides)
+    try:
+        with pytest.raises(ValueError, match="zero bytes"):
+            dfa.analyze_trace()
+    finally:
+        dfa.shutdown()
