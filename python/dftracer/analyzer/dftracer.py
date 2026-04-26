@@ -432,6 +432,23 @@ class DFTracerAnalyzer(Analyzer):
             all_files = pfw_pattern + pfw_gz_pattern
             if not all_files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
+            empty = [p for p in all_files if os.path.getsize(p) == 0]
+            if empty:
+                logger.warning(
+                    "Skipping zero-byte trace files",
+                    num_empty=len(empty),
+                    files=[os.path.basename(p) for p in empty],
+                )
+                pfw_pattern = [p for p in pfw_pattern if os.path.getsize(p) > 0]
+                pfw_gz_pattern = [p for p in pfw_gz_pattern if os.path.getsize(p) > 0]
+                all_files = pfw_pattern + pfw_gz_pattern
+            if not all_files:
+                raise ValueError(
+                    f"All {len(empty)} trace files in {trace_path} are zero bytes; "
+                    "tracing may be misconfigured (DFTRACER_ENABLE not set, "
+                    "LD_PRELOAD missing, or the traced process exited before "
+                    "flushing its trace buffer)."
+                )
         logger.debug("Processing files", files=all_files)
         if len(pfw_gz_pattern) > 0:
             with log_block("create_index"):
