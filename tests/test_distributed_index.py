@@ -17,6 +17,7 @@ pytest.importorskip("pyarrow")
 import pyarrow as pa  # noqa: E402
 
 from dftracer.analyzer.dftracer import DFTracerAnalyzer  # noqa: E402
+from dftracer.utils.dfanalyzer import build_index_distributed  # noqa: E402
 from dftracer.utils import AggregationConfig, Indexer  # noqa: E402
 
 
@@ -94,7 +95,7 @@ def test_distributed_index_localcluster_matches_serial(tmp_path):
     client = Client(cluster)
     try:
         client.wait_for_workers(2, timeout=60)
-        result = DFTracerAnalyzer.build_index_distributed(
+        result = build_index_distributed(
             files=dist_files,
             index_path=index_path,
             local_staging=str(stage_dir),
@@ -162,7 +163,7 @@ def test_distributed_index_then_analyze_trace(tmp_path):
         client.wait_for_workers(2, timeout=60)
 
         # Phase 1: distributed index build (also registers _AutoThreadPlugin).
-        DFTracerAnalyzer.build_index_distributed(
+        build_index_distributed(
             files=files,
             index_path=str(dist_dir / ".dftindex"),
             local_staging=str(stage_dir),

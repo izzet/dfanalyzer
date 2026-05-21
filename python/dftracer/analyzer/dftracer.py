@@ -1,24 +1,31 @@
 import dask
-import dask.bag as db
 import dask.dataframe as dd
-import glob
-import json
 import math
 import numpy as np
 import os
 import pandas as pd
-import portion as I
 import structlog
 import pyarrow as pa
-import pyarrow.compute as pc
-from dftracer.utils import Indexer, AggregationConfig
-from dftracer.utils.dask import (
-    DFTracerUtilsDaskWorkerPlugin,
-    _assign_files_by_pid,
-    distributed_index as _distributed_index,
+from betterset import BetterSet
+from dftracer.utils import AggregationConfig, Indexer
+from dftracer.utils.dfanalyzer import (
+    build_final_meta,
+    build_partial_meta,
+    coerce_arrow_numerics_to_pandas_native,
+    coerce_profile_dtypes,
+    distributed_hlm,
+    ensure_index,
+    finalize_view_partials,
+    index_path_for,
+    ipc_to_pandas,
+    normalize_arrow_dtypes,
+    partial_arrow_view_groupby,
+    resolve_trace_inputs,
+    scan_to_ipc,
 )
+from dftracer.utils.dask import _assign_files_by_pid, register_auto_thread_plugin
 from dask.distributed import Client, get_client, wait
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer, HLM_AGG, HLM_EXTRA_COLS
 from .analysis_utils import (
@@ -42,8 +49,6 @@ from .constants import (
     COL_TIME_END,
     COL_TIME_RANGE,
     COL_TIME_START,
-    POSIX_IO_CAT_MAPPING,
-    POSIX_METADATA_FUNCTIONS,
     IOCategory,
 )
 from .types import ReadTraceResult, ViewType
@@ -51,8 +56,22 @@ from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
 
-CAT_POSIX = "POSIX"
-CAT_STDIO = "STDIO"
+# HLM groupby columns typed as Int64 (others string); metric columns typed as
+# Float64 (others Int64). Passed to the dftracer.utils HLM helpers.
+HLM_INT_INDEX_COLS = frozenset({"pid", "tid", "io_cat", "acc_pat", "time_range"})
+HLM_FLOAT_METRIC_COLS = frozenset(
+    {
+        "time",
+        "time_sq",
+        "time_min",
+        "time_max",
+        "time_call_min",
+        "time_call_max",
+        "time_start",
+        "time_end",
+    }
+)
+
 IGNORED_FILE_PATTERNS = [
     "/dev/",
     "/etc/",
@@ -191,465 +210,6 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
-def _agg_marker_path(index_path: str) -> str:
-    """Sidecar file recording the aggregation interval an index was built at."""
-    return index_path + ".meta"
-
-
-def _agg_interval_changed(index_path: str, time_interval_ms: float) -> bool:
-    """True if an index exists but was built at a different (or unknown)
-    aggregation interval.
-
-    An existing index whose marker is missing or unreadable (e.g. built by an
-    older version) is treated as stale: its interval can't be confirmed, so it
-    must be rebuilt rather than silently reused.
-    """
-    if not os.path.exists(index_path):
-        return False
-    try:
-        with open(_agg_marker_path(index_path)) as f:
-            return float(f.read().strip()) != float(time_interval_ms)
-    except (OSError, ValueError):
-        return True
-
-
-def _write_agg_marker(index_path: str, time_interval_ms: float) -> None:
-    try:
-        with open(_agg_marker_path(index_path), "w") as f:
-            f.write(repr(float(time_interval_ms)))
-    except OSError:
-        pass
-
-
-def _drop_stale_index(index_path: str, time_interval_ms: float) -> None:
-    """Remove an index built at a different aggregation interval.
-
-    The aggregation tier is interval-specific and cannot be refined in place
-    (and the C++ force_rebuild flag does not rebuild it), so a mismatched
-    index must be discarded entirely before re-indexing.
-    """
-    if _agg_interval_changed(index_path, time_interval_ms):
-        import shutil
-
-        shutil.rmtree(index_path, ignore_errors=True)
-        try:
-            os.remove(_agg_marker_path(index_path))
-        except OSError:
-            pass
-
-
-def _lower_cat(df):
-    """Lowercase the `cat` column for parity with the legacy analyzer, which
-    normalized event categories at parse time."""
-    if not df.empty and "cat" in df.columns:
-        df = df.copy()
-        df["cat"] = df["cat"].str.lower()
-    return df
-
-
-def _coerce_profile_dtypes(df, profile_window=None):
-    """Normalize C++ aggregator profile output to PROFILE_OUTPUT_COLUMNS dtypes."""
-    if df.empty:
-        return df
-    df = df.copy()
-    for col, dtype in PROFILE_OUTPUT_COLUMNS.items():
-        if col not in df.columns:
-            df[col] = pd.Series(pd.NA, index=df.index, dtype=dtype)
-        elif dtype == "string":
-            df[col] = df[col].astype("string").replace("", pd.NA)
-        else:
-            df[col] = df[col].astype(dtype)
-    if "cat" in df.columns:
-        df["cat"] = df["cat"].str.lower()
-    if profile_window is not None:
-        df[COL_TIME_END] = df[COL_TIME_START] + int(profile_window)
-    return df
-
-
-def _coerce_arrow_numerics_to_pandas_native(df):
-    """Map pd.ArrowDtype int/float columns to pandas Int64/Float64."""
-    if df.empty:
-        return df
-    for c in df.columns:
-        dt = df[c].dtype
-        if isinstance(dt, pd.ArrowDtype):
-            pa_type = dt.pyarrow_dtype
-            if pa.types.is_floating(pa_type):
-                df[c] = df[c].astype("Float64")
-            elif pa.types.is_integer(pa_type):
-                df[c] = df[c].astype("Int64")
-    return df
-
-
-def _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols):
-    """Return an empty DataFrame matching the HLM meta schema."""
-    int_groupby = {"pid", "tid", "io_cat", "acc_pat", "time_range"}
-    time_metric_cols = {
-        "time",
-        "time_sq",
-        "time_min",
-        "time_max",
-        "time_call_min",
-        "time_call_max",
-        "time_start",
-        "time_end",
-    }
-    bin_set = set(bin_cols)
-    data_cols = {}
-    for col in hlm_agg:
-        if col in hlm_groupby or col in bin_set:
-            continue
-        if col in time_metric_cols:
-            data_cols[col] = pd.Series(dtype="Float64")
-        else:
-            data_cols[col] = pd.Series(dtype="Int64")
-    meta = pd.DataFrame(data_cols)
-    idx_arrays = []
-    for col in hlm_groupby:
-        if col in int_groupby:
-            idx_arrays.append(pd.array([], dtype="Int64"))
-        else:
-            idx_arrays.append(pd.array([], dtype="string"))
-    if idx_arrays:
-        meta.index = pd.MultiIndex.from_arrays(idx_arrays, names=list(hlm_groupby))
-    return meta
-
-
-def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
-    """Per-worker partial HLM from already-resident IPC bytes.
-
-    Workers own disjoint PID sets and proc_name is always in hlm_groupby, so
-    per-worker partials have disjoint keys and need no cross-worker merge.
-    """
-    import time as _time
-
-    empty = lambda: _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols)
-
-    t0 = _time.time()
-    ipc_bytes = ipc_result[data_type] if isinstance(ipc_result, dict) else None
-    if ipc_bytes is None:
-        return empty()
-    reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-    table = reader.read_all()
-    if table.num_rows == 0:
-        return empty()
-
-    for i, field in enumerate(table.schema):
-        if pa.types.is_dictionary(field.type):
-            table = table.set_column(i, field.name, table.column(i).cast(pa.string()))
-
-    time_col = table.column("time")
-    size_col = table.column("size")
-    table = table.append_column("time_sq", pc.multiply(time_col, time_col))
-    size_filled = pc.if_else(pc.is_null(size_col), pa.scalar(0, pa.int64()), size_col)
-    table = table.append_column("size_sq", pc.multiply(size_filled, size_filled))
-    table = table.append_column("time_call_min", time_col)
-    table = table.append_column("time_call_max", time_col)
-    table = table.append_column("size_call_min", size_col)
-    table = table.append_column("size_call_max", size_col)
-
-    available_groupby = [c for c in hlm_groupby if c in table.column_names]
-    if not available_groupby:
-        return empty()
-
-    agg_specs = []
-    for col, agg_fn in hlm_agg.items():
-        if col in table.column_names and agg_fn in ("sum", "min", "max"):
-            agg_specs.append((col, agg_fn))
-
-    t1 = _time.time()
-    result = table.group_by(available_groupby).aggregate(agg_specs)
-    t2 = _time.time()
-
-    rename = {f"{col}_{agg_fn}": col for col, agg_fn in agg_specs}
-    result = result.rename_columns([rename.get(c, c) for c in result.column_names])
-
-    # Do lowercase + zero-to-null in Arrow (vectorized) before to_pandas.
-    cat_idx = result.schema.get_field_index("cat")
-    if cat_idx >= 0:
-        cat_col = result.column(cat_idx)
-        if pa.types.is_string(cat_col.type) or pa.types.is_large_string(cat_col.type):
-            result = result.set_column(cat_idx, "cat", pc.utf8_lower(cat_col))
-
-    groupby_set = set(available_groupby)
-    for i, field in enumerate(result.schema):
-        if field.name in groupby_set:
-            continue
-        t_ = field.type
-        if pa.types.is_integer(t_) or pa.types.is_floating(t_):
-            col = result.column(i)
-            zero = pa.scalar(0 if pa.types.is_integer(t_) else 0.0, t_)
-            null = pa.scalar(None, t_)
-            result = result.set_column(i, field.name, pc.if_else(pc.equal(col, zero), null, col))
-
-    # Materialize to pandas with native nullable dtypes. ArrowDtype numeric
-    # columns trip a pandas masked-arithmetic bug in downstream metrics.py
-    # (Float64 / ArrowDtype int -> IntegerArray ctor rejects float values).
-    # Keep strings Arrow-backed (common, large, zero-copy friendly) but give
-    # numerics pandas-native Int64/Float64.
-    pdf = result.to_pandas(types_mapper=pd.ArrowDtype)
-    for c in pdf.columns:
-        if c in available_groupby:
-            continue
-        dt = pdf[c].dtype
-        if isinstance(dt, pd.ArrowDtype):
-            pa_type = dt.pyarrow_dtype
-            if pa.types.is_floating(pa_type):
-                pdf[c] = pdf[c].astype("Float64")
-            elif pa.types.is_integer(pa_type):
-                pdf[c] = pdf[c].astype("Int64")
-    pdf = pdf.set_index(available_groupby)
-    t3 = _time.time()
-    logger.debug(
-        "_worker_hlm_partial",
-        data_type=data_type,
-        in_rows=table.num_rows,
-        decode_s=round(t1 - t0, 2),
-        groupby_s=round(t2 - t1, 2),
-        finalize_s=round(t3 - t2, 2),
-        out_rows=len(pdf),
-        total_s=round(t3 - t0, 2),
-    )
-    return pdf
-
-
-def _ipc_to_pandas(ipc_bytes):
-    """Decode Arrow IPC bytes to pandas with Arrow-backed string columns."""
-    reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-    table = reader.read_all()
-    for i, field in enumerate(table.schema):
-        if pa.types.is_dictionary(field.type):
-            table = table.set_column(i, field.name, table.column(i).cast(pa.string()))
-    return table.to_pandas()
-
-
-def _partial_arrow_view_groupby(
-    df,
-    view_type,
-    full_cols,
-    sum_cols,
-    min_cols,
-    max_cols,
-    set_cols_items,
-):
-    """Per-partition Arrow groupby emitting mergeable partial aggregates."""
-    from betterset import BetterSet as S
-
-    view_type_in_index = (isinstance(df.index, pd.MultiIndex) and view_type in df.index.names) or (
-        df.index.name == view_type
-    )
-    work = df.reset_index() if view_type_in_index else df
-    if work.empty:
-        # Derive dtypes from the input columns so an empty partition matches
-        # the meta declared by _build_partial_meta (which uses the same rule);
-        # otherwise Dask check_meta fails on integer/nullable inputs.
-        def _col_dtype(col, default=pd.ArrowDtype(pa.float64())):
-            if col in work.columns:
-                return work[col].dtype
-            return default
-
-        empty_cols = {}
-        for c in full_cols:
-            empty_cols[f"{c}_sum"] = pd.Series(dtype=_col_dtype(c))
-            empty_cols[f"{c}_count"] = pd.Series(dtype=pd.ArrowDtype(pa.int64()))
-            empty_cols[f"{c}_min"] = pd.Series(dtype=_col_dtype(c))
-            empty_cols[f"{c}_max"] = pd.Series(dtype=_col_dtype(c))
-            empty_cols[f"{c}_sumsq"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
-        for c in sum_cols:
-            empty_cols[f"{c}_sum"] = pd.Series(dtype=_col_dtype(c))
-        for c in min_cols:
-            empty_cols[f"{c}_min"] = pd.Series(dtype=_col_dtype(c))
-        for c in max_cols:
-            empty_cols[f"{c}_max"] = pd.Series(dtype=_col_dtype(c))
-        for c, _ in set_cols_items:
-            empty_cols[f"{c}_unique"] = pd.Series(dtype="object")
-        out = pd.DataFrame(empty_cols)
-        out.index = pd.Index(
-            [], name=view_type,
-            dtype=_col_dtype(view_type, default=pd.ArrowDtype(pa.int64())),
-        )
-        return out
-
-    arrow_keep = [view_type]
-    for lst in (full_cols, sum_cols, min_cols, max_cols):
-        for c in lst:
-            if c in work.columns and c not in arrow_keep:
-                arrow_keep.append(c)
-    tbl = pa.Table.from_pandas(work[arrow_keep], preserve_index=False)
-
-    agg_specs = []
-    for c in full_cols:
-        if c not in tbl.schema.names:
-            continue
-        col_arr = pc.cast(tbl.column(c), pa.float64())
-        tbl = tbl.append_column(f"{c}__sq", pc.multiply(col_arr, col_arr))
-        agg_specs += [
-            (c, "sum"),
-            (c, "count"),
-            (c, "min"),
-            (c, "max"),
-            (f"{c}__sq", "sum"),
-        ]
-    for c in sum_cols:
-        if c in tbl.schema.names:
-            agg_specs.append((c, "sum"))
-    for c in min_cols:
-        if c in tbl.schema.names:
-            agg_specs.append((c, "min"))
-    for c in max_cols:
-        if c in tbl.schema.names:
-            agg_specs.append((c, "max"))
-
-    if agg_specs:
-        result = tbl.group_by([view_type]).aggregate(agg_specs)
-        out = result.to_pandas(types_mapper=pd.ArrowDtype)
-        rename = {f"{c}__sq_sum": f"{c}_sumsq" for c in full_cols}
-        if rename:
-            out = out.rename(columns=rename)
-        out = out.set_index(view_type)
-    else:
-        uniq = work[view_type].drop_duplicates().reset_index(drop=True)
-        out = pd.DataFrame(index=pd.Index(uniq, name=view_type))
-
-    for col, agg in set_cols_items:
-        if col not in work.columns:
-            continue
-        sgb = work.groupby(view_type)[col]
-        chunk_fn = getattr(agg, "chunk", None)
-        partial = chunk_fn(sgb) if chunk_fn is not None else sgb.apply(S.flatten)
-        partial.name = f"{col}_unique"
-        out = out.join(partial, how="left")
-    return out
-
-
-def _finalize_view_partials(df, full_cols):
-    """Compute mean/std per view_type row from merged partials; drop helper cols."""
-    if df.empty:
-        return df
-    out = df.copy()
-    drop = []
-    for c in full_cols:
-        sum_c = f"{c}_sum"
-        count_c = f"{c}_count"
-        sq_c = f"{c}_sumsq"
-        if sum_c not in out.columns or count_c not in out.columns:
-            continue
-        s = out[sum_c].astype("float64")
-        n = out[count_c].astype("float64")
-        mean_v = s / n
-        out[f"{c}_mean"] = mean_v.astype(pd.ArrowDtype(pa.float64()))
-        if sq_c in out.columns:
-            sq = out[sq_c].astype("float64")
-            # sample variance is undefined for n <= 1 -> std is NaN, matching
-            # pandas .std(ddof=1); avoids a divide-by-zero on (n - 1).
-            with np.errstate(invalid="ignore", divide="ignore"):
-                var_v = (sq - (s * s) / n) / (n - 1)
-            var_v = var_v.where(n > 1, np.nan)
-            var_v = var_v.where(var_v.isna() | (var_v >= 0), 0)
-            out[f"{c}_std"] = np.sqrt(var_v).astype(pd.ArrowDtype(pa.float64()))
-            drop.append(sq_c)
-        drop.append(count_c)
-    if drop:
-        out = out.drop(columns=drop)
-    return out
-
-
-def _batches_to_ipc(batches_by_type):
-    """Convert {type: [capsule,...]} from the C extension into {type: IPC bytes}."""
-    result = {}
-    for data_type in ("events", "profiles", "system"):
-        batches = [pa.record_batch(b) for b in batches_by_type.get(data_type, [])]
-        if batches:
-            sink = pa.BufferOutputStream()
-            writer = pa.ipc.new_stream(sink, batches[0].schema)
-            for batch in batches:
-                writer.write_batch(batch)
-            writer.close()
-            result[data_type] = sink.getvalue().to_pybytes()
-        else:
-            result[data_type] = None
-    return result
-
-
-def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
-    """Dask worker task: full-scan the unified-DB aggregation CF for `files`."""
-    import logging
-    import socket
-    import time
-
-    logger = logging.getLogger("dftracer.worker_scan")
-    host = socket.gethostname()
-
-    t0 = time.monotonic()
-    indexer = Indexer(
-        files=files,
-        index_dir=os.path.dirname(index_path) if index_path else "",
-        require_checkpoint=False,
-        require_bloom=False,
-        require_manifest=False,
-        require_aggregation=False,
-        force_rebuild=False,
-    )
-    t_open = time.monotonic()
-    all_batches = indexer.iter_arrow_dfanalyzer_all(
-        time_granularity=time_granularity,
-        time_resolution=time_resolution,
-        query=query,
-    )
-    t_scan = time.monotonic()
-    result = _batches_to_ipc(all_batches)
-    t_ipc = time.monotonic()
-    logger.info(
-        "worker_scan host=%s n_files=%d open=%.3fs scan=%.3fs ipc_encode=%.3fs total=%.3fs",
-        host,
-        len(files),
-        t_open - t0,
-        t_scan - t_open,
-        t_ipc - t_scan,
-        t_ipc - t0,
-    )
-    return result
-
-
-def create_index(filename):
-    index_file = f"{filename}.idx"
-    if not os.path.exists(index_file):
-        indexer = Indexer(filename, index_file, checkpoint_size=32 * 1024 * 1024)
-        indexer.build()
-        logger.debug("Creating index", filename=filename)
-    return filename
-
-
-def generate_batches(filename, max_bytes):
-    batch_size = 4 * 1024 * 1024  # 4 MB
-    for start in range(0, max_bytes, batch_size):
-        # this range is intended since DFTracerJsonLinesBytesReader do
-        # line boundary algorithm internally to chop incomplete line
-        end = min(start + batch_size, max_bytes)
-        logger.debug("Created batch", filename=filename, start=start, end=end)
-        yield filename, start, end
-
-
-def get_size(filename):
-    size = 0
-    if filename.endswith(".pfw"):
-        size = os.stat(filename).st_size
-    elif filename.endswith(".pfw.gz"):
-        index_file = f"{filename}.idx"
-        indexer = Indexer(filename, index_file)
-        size = indexer.get_max_bytes()
-    logger.debug("File has size", filename=filename, size=size / 1024**3)
-    return filename, int(size)
-
-
-def get_io_cat(func_name: str):
-    if func_name in POSIX_METADATA_FUNCTIONS:
-        return IOCategory.METADATA.value
-    if func_name in POSIX_IO_CAT_MAPPING:
-        return POSIX_IO_CAT_MAPPING[func_name].value
-    return IOCategory.OTHER.value
-
-
 def io_columns():
     columns = {
         "file_hash": "string",
@@ -660,232 +220,6 @@ def io_columns():
         "offset": "Int64",
     }
     return columns
-
-
-def io_function(json_dict: dict):
-    d = {}
-    d[COL_IO_CAT] = IOCategory.OTHER.value
-    if "args" in json_dict:
-        if "fhash" in json_dict["args"]:
-            d["file_hash"] = str(json_dict["args"]["fhash"])
-        if "size_sum" in json_dict["args"]:
-            d["size"] = int(json_dict["args"]["size_sum"])
-        elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
-            name = json_dict["name"]
-            io_cat = get_io_cat(name)
-            if "ret" in json_dict["args"]:
-                size = int(json_dict["args"]["ret"])
-                if size > 0:
-                    if io_cat in [IOCategory.READ.value, IOCategory.WRITE.value]:
-                        d["size"] = size
-            if "offset" in json_dict["args"]:
-                offset = int(json_dict["args"]["offset"])
-                if offset >= 0:
-                    d["offset"] = offset
-            d[COL_IO_CAT] = io_cat
-        else:
-            if "image_idx" in json_dict["args"]:
-                image_id = int(json_dict["args"]["image_idx"])
-                if image_id > 0:
-                    d["image_id"] = image_id
-            if "image_size" in json_dict["args"]:
-                name = json_dict["name"].lower()
-                # e.g. NPZReader.open image_size is not correct
-                if "open" not in name:
-                    size = int(json_dict["args"]["image_size"])
-                    if size > 0:
-                        d["size"] = size
-    return d
-
-
-def profile_function(json_dict: dict):
-    args = json_dict.get("args", {})
-    d = {}
-    d[COL_IO_CAT] = IOCategory.OTHER.value
-    if "fhash" in args:
-        d["file_hash"] = str(args["fhash"])
-    if "hhash" in args:
-        d["host_hash"] = str(args["hhash"])
-    if json_dict.get("cat") in [CAT_POSIX, CAT_STDIO]:
-        d[COL_IO_CAT] = get_io_cat(json_dict["name"])
-    for key in PROFILE_COLUMN_MAPPING:
-        if key in args:
-            d[key] = int(args[key])
-    return d
-
-
-def system_function(json_dict: dict):
-    """Extract CPU/memory metric args from a cat='sys' ph='C' event."""
-    args = json_dict.get("args", {})
-    d = {}
-    if "hhash" in args:
-        d["host_hash"] = str(args["hhash"])
-    for key in SYSTEM_COLUMN_MAPPING:
-        if key in args:
-            d[key] = float(args[key])
-    return d
-
-
-def load_objects_dict(
-    json_dict: dict,
-    time_approximate: bool,
-    extra_columns: Optional[Dict[str, str]],
-    extra_columns_fn: Optional[Callable[[dict], dict]],
-):
-    final_dict = {}
-    logger.debug("Loading dict", json_dict=json_dict)
-    if json_dict is not None:
-        try:
-            ph = json_dict.get("ph")
-            if "name" in json_dict:
-                final_dict["name"] = json_dict["name"]
-            if "cat" in json_dict:
-                final_dict["cat"] = json_dict["cat"].lower()
-            if "pid" in json_dict:
-                final_dict["pid"] = json_dict["pid"]
-            if "tid" in json_dict:
-                final_dict["tid"] = json_dict["tid"]
-            if "args" in json_dict:
-                if "hhash" in json_dict["args"]:
-                    final_dict["host_hash"] = str(json_dict["args"]["hhash"])
-                if (
-                    "epoch" in json_dict["args"]
-                    and json_dict["args"]["epoch"] != "train"
-                    and json_dict["args"]["epoch"] != "valid"
-                ):
-                    epoch = int(json_dict["args"]["epoch"])
-                    if epoch >= 0:
-                        final_dict["epoch"] = epoch
-                if "step" in json_dict["args"]:
-                    step = int(json_dict["args"]["step"])
-                    if step >= 0:
-                        final_dict["step"] = step
-            if "M" == ph:
-                if final_dict["name"] == "FH":
-                    final_dict["type"] = TYPE_FILE_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "HH":
-                    final_dict["type"] = TYPE_HOST_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "SH":
-                    final_dict["type"] = TYPE_STRING_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "PR":
-                    final_dict["type"] = TYPE_PROC_METADATA
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                else:
-                    final_dict["type"] = TYPE_METADATA
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["value"] = str(json_dict["args"]["value"])
-            elif "C" == ph:
-                is_system = json_dict.get("cat", "").lower() == "sys"
-                final_dict["type"] = TYPE_SYSTEM if is_system else TYPE_PROFILE
-                if "ts" in json_dict:
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
-                if is_system:
-                    final_dict.update(system_function(json_dict))
-                else:
-                    final_dict.update(profile_function(json_dict))
-                    final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-            else:
-                final_dict["type"] = TYPE_EVENT
-                if "dur" in json_dict:
-                    if type(json_dict["dur"]) is not int:
-                        json_dict["dur"] = int(json_dict["dur"])
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
-                    final_dict["dur"] = json_dict["dur"]
-                    final_dict["te"] = final_dict["ts"] + final_dict["dur"]
-                    if not time_approximate:
-                        final_dict["tinterval"] = I.to_string(
-                            I.closed(json_dict["ts"], json_dict["ts"] + json_dict["dur"])
-                        )
-                final_dict.update(io_function(json_dict))
-                final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-            # check if all extra columns are present
-            if extra_columns and not all(col in final_dict for col in extra_columns):
-                missing_cols = [col for col in extra_columns if col not in final_dict]
-                raise ValueError(f"Missing extra columns: {missing_cols}")
-            logger.debug("Built a dictionary for dict", final_dict=final_dict)
-            yield final_dict
-        except ValueError as error:
-            logger.error("Processing dict failed", dict=json_dict, error=error)
-    return {}
-
-
-def load_objects_str(
-    line: str,
-    time_approximate: bool,
-    extra_columns: Optional[Dict[str, str]],
-    extra_columns_fn: Optional[Callable[[dict], dict]],
-):
-    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
-        try:
-            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
-            json_dict = json.loads(unicode_line, strict=False)
-            yield from load_objects_dict(json_dict, time_approximate, extra_columns, extra_columns_fn)
-        except ValueError as error:
-            logger.error("Processing line failed", line=line, error=error)
-    return {}
-
-
-def _resolve_trace_inputs(
-    trace_path: str,
-    trace_groups: Optional[List[str]],
-) -> Tuple[str, Optional[List[str]]]:
-    """Resolve a trace path into (directory, files) for the Indexer.
-
-    If trace_path is a directory containing manifest.json (dftracer_organize
-    output) AND trace_groups is set, glob only the subdirs for the requested
-    groups. Otherwise, preserve the legacy behavior (directory, or glob list).
-    """
-    if not os.path.isdir(trace_path):
-        matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
-        files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
-        return "", files
-
-    manifest_path = os.path.join(trace_path, "manifest.json")
-    has_manifest = os.path.isfile(manifest_path)
-
-    if not has_manifest:
-        if trace_groups:
-            raise FileNotFoundError(
-                f"trace_groups={trace_groups} requested but no manifest.json at "
-                f"{manifest_path}. Run dftracer_organize to produce it, or unset "
-                "trace_groups."
-            )
-        return trace_path, None
-
-    with open(manifest_path, "r") as f:
-        manifest = json.load(f)
-    group_map = manifest.get("groups") or {}
-
-    selected = trace_groups if trace_groups else sorted(group_map.keys())
-    missing = [g for g in selected if g not in group_map]
-    if missing:
-        raise KeyError(
-            f"trace_groups {missing} not found in manifest at {manifest_path}; "
-            f"available groups: {sorted(group_map.keys())}"
-        )
-
-    files: List[str] = []
-    for g in selected:
-        subdir = os.path.join(trace_path, group_map[g])
-        files.extend(glob.glob(os.path.join(subdir, "*.pfw.gz")))
-        files.extend(glob.glob(os.path.join(subdir, "*.pfw")))
-    return "", files
 
 
 class DFTracerAnalyzer(Analyzer):
@@ -902,221 +236,8 @@ class DFTracerAnalyzer(Analyzer):
 
     def analyze_trace(self, trace_path, *args, **kwargs):
         """Transparent indexing: ensure the dftracer index exists, then analyze."""
-        self._ensure_index(trace_path)
+        ensure_index(trace_path, self.trace_groups, self.time_granularity * 1000.0)
         return super().analyze_trace(trace_path, *args, **kwargs)
-
-    @staticmethod
-    def _index_path_for(trace_path: str) -> str:
-        """Convention: the dftracer index lives next to the traces.
-
-        For a directory trace_path, that's ``<trace_path>/.dftindex``. For a
-        single .pfw file or a glob, it's ``<dirname>/.dftindex`` of the file
-        (or first match).
-        """
-        if os.path.isdir(trace_path):
-            return os.path.join(trace_path, ".dftindex")
-        if "*" in trace_path:
-            matches = sorted(glob.glob(trace_path))
-            if matches:
-                return os.path.join(os.path.dirname(matches[0]), ".dftindex")
-        return os.path.join(os.path.dirname(trace_path) or ".", ".dftindex")
-
-    @staticmethod
-    def _resolve_local_staging(client: "Client") -> str:
-        """Derive node-local SST scratch from each Dask worker's own scratch.
-
-        Workers share the path *string* (e.g. ``/scratch/$USER``) but each
-        resolves it to its own node-local storage; falls back to ``/tmp`` when
-        nothing is reported.
-        """
-        workers = client.scheduler_info().get("workers", {}) or {}
-        if workers:
-            worker_local_dir = next(iter(workers.values())).get("local_directory") or "/tmp"
-        else:
-            worker_local_dir = "/tmp"
-        return os.path.join(worker_local_dir, "dftracer-sst-staging")
-
-    def _ensure_index(self, trace_path: str) -> None:
-        """Build (or refresh) the dftracer index for trace_path via Dask.
-
-        Idempotent: dftracer-utils skips files whose tiers already exist, so
-        repeat calls on the same trace_path are cheap no-ops.
-        """
-        client = get_client()
-        directory, files = _resolve_trace_inputs(trace_path, self.trace_groups)
-        if not directory and not files:
-            return
-        index_path = self._index_path_for(trace_path)
-        shared_staging = os.path.dirname(index_path)
-        self.build_index_distributed(
-            directory=directory,
-            files=files,
-            index_path=index_path,
-            local_staging=self._resolve_local_staging(client),
-            shared_staging=shared_staging,
-            client=client,
-            aggregation=AggregationConfig(
-                time_interval_ms=self.time_granularity * 1000.0,
-            ),
-        )
-
-    @staticmethod
-    def build_index_distributed(
-        directory: str = "",
-        files: Optional[List[str]] = None,
-        index_path: str = "",
-        local_staging: str = "",
-        shared_staging: str = "",
-        client: Optional["Client"] = None,
-        aggregation: Optional["AggregationConfig"] = None,
-    ) -> dict:
-        """Build the dftracer index across a Dask cluster.
-
-        DFTracer-specific: the whole SST-based pipeline assumes .pfw/.pfw.gz
-        inputs. Other analyzers (Darshan, Recorder) use their own tooling.
-
-        Steps:
-            1. Parallel directory scan + LPT bin-pack files across workers.
-            2. Coordinator pre-registers files and assigns file_id ranges.
-            3. Each Dask worker builds per-CF SSTs under `local_staging`,
-               then moves them to `shared_staging` for coordinator ingest.
-            4. If `aggregation` is given, each worker also attaches an
-               SST-backed AggregationVisitor per file. Per-file aggregation
-               SSTs (mixed Put+Merge operands) are produced bounded by
-               AggregationVisitor::FLUSH_THRESHOLD. Cross-worker overlapping
-               `(pid, time_bucket, ...)` keys are combined by the rocksdb
-               merge_operator at read/compaction time.
-            5. Coordinator runs bulk_ingest (one-at-a-time for content-
-               addressed CFs + AGGREGATION + SYSTEM_METRICS) and
-               rebuild_root_summaries.
-
-        After this returns, `DFTracerAnalyzer.read_trace()` will find the
-        index already built (including aggregation when requested) and
-        skip the serial ensure_indexed phase entirely.
-
-        Args:
-            directory: Trace directory to scan. Mutually exclusive with
-                `files`.
-            files: Explicit file list.
-            index_path: Target .dftindex on shared FS.
-            local_staging: Per-worker SST build dir (prefer node-local,
-                e.g. /l/ssd/dftracer_sst). Required.
-            shared_staging: Shared-FS dir the coordinator reads SSTs from.
-                Defaults to local_staging when unset (single-FS mode).
-            client: Dask Client. If None, a cluster-local Client is looked
-                up; if that fails too, tasks run inline serially. The
-                DFTracer worker plugin is registered idempotently on the
-                client so per-worker C++ Runtime threads match
-                hw_concurrency / n_workers_on_node.
-            aggregation: If given, workers fill AGGREGATION +
-                SYSTEM_METRICS CFs in parallel via SST-backed
-                AggregationVisitors.
-
-        Returns:
-            dict with `total_files`, `per_worker` (sizes), `index_path`,
-            `artifact_batches`, and (if aggregation) `aggregation_files`.
-        """
-        if client is None:
-            try:
-                client = get_client()
-            except ValueError:
-                client = None
-
-        if client is not None:
-            DFTracerAnalyzer._register_dask_plugin()
-
-        return _distributed_index(
-            directory=directory,
-            files=files,
-            index_path=index_path,
-            local_staging=local_staging,
-            shared_staging=shared_staging,
-            client=client,
-            aggregation_config=aggregation,
-        )
-
-    _plugin_registered_schedulers: "set[str]" = set()
-
-    @staticmethod
-    def _register_dask_plugin():
-        """Register the DFTracer Dask worker plugin if a distributed client is active.
-
-        Computes C++ Runtime threads as hardware_concurrency / n_workers_on_node
-        so the Runtime uses all available cores without oversubscription.
-
-        Idempotent: re-registering the same plugin on the same scheduler
-        would trigger a teardown+setup round-trip on every worker, which
-        deadlocks if the previous Runtime still has in-flight coroutines.
-        Skip if already registered for this scheduler address.
-        """
-        if DFTracerUtilsDaskWorkerPlugin is None:
-            return
-        try:
-            import time as _time
-
-            client = get_client()
-            sched_addr = getattr(client.scheduler, "address", None) or ""
-            if sched_addr in DFTracerAnalyzer._plugin_registered_schedulers:
-                return
-            from collections import Counter
-
-            def _addr_to_host(addr: str) -> str:
-                return addr.split("://")[-1].rsplit(":", 1)[0]
-
-            nthreads = client.nthreads()
-            for _ in range(10):
-                nthreads_next = client.nthreads()
-                if len(nthreads_next) >= len(nthreads):
-                    nthreads = nthreads_next
-                if len(nthreads) > 0:
-                    break
-                _time.sleep(0.5)
-            host_counts = Counter(_addr_to_host(a) for a in nthreads.keys())
-
-            import logging as _stdlog
-
-            _stdlog.getLogger("dftracer.dask_plugin").info(
-                "coord register_plugin: host_counts=%s total_workers=%d worker_addr_sample=%s",
-                dict(host_counts),
-                sum(host_counts.values()),
-                list(nthreads.keys())[:8],
-            )
-
-            class _AutoThreadPlugin(DFTracerUtilsDaskWorkerPlugin):
-                def __init__(self, host_worker_counts):
-                    super().__init__(threads=0)
-                    self._host_worker_counts = host_worker_counts
-
-                def setup(self, worker):
-                    total_cpus = (
-                        len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-                    )
-                    my_host = worker.address.split("://")[-1].rsplit(":", 1)[0]
-                    n_local = self._host_worker_counts.get(my_host, 1)
-                    self.threads = max(1, total_cpus // n_local)
-                    import logging as _logging
-
-                    # Log the actual dict contents we received so we can see
-                    # coord-vs-worker key mismatches unambiguously in the log.
-                    _logging.getLogger("distributed.worker").info(
-                        "DFTracer Runtime: host=%s cpus=%d workers_on_host=%d cpp_threads=%d dict_keys=%s",
-                        my_host,
-                        total_cpus,
-                        n_local,
-                        self.threads,
-                        list(self._host_worker_counts.keys()),
-                    )
-                    super().setup(worker)
-
-            client.register_plugin(_AutoThreadPlugin(dict(host_counts)))
-            DFTracerAnalyzer._plugin_registered_schedulers.add(sched_addr)
-            logger.info(
-                "Registered DFTracerUtilsDaskWorkerPlugin",
-                host_worker_counts=dict(host_counts),
-                total_workers=sum(host_counts.values()),
-            )
-        except (ValueError, ImportError):
-            pass
 
     def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None):
         """Read trace using C++ aggregation pipeline.
@@ -1138,13 +259,12 @@ class DFTracerAnalyzer(Analyzer):
             # Configure aggregation to match analyzer time granularity
             time_interval_ms = self.time_granularity * 1000.0  # seconds to ms
 
-            directory, files = _resolve_trace_inputs(trace_path, self.trace_groups)
+            directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
 
-            index_path = self._index_path_for(trace_path)
-            _drop_stale_index(index_path, time_interval_ms)
+            index_path = index_path_for(trace_path)
             indexer = Indexer(
                 directory=directory,
                 files=files if files else None,
@@ -1161,7 +281,6 @@ class DFTracerAnalyzer(Analyzer):
 
         with log_block("cpp_ensure_indexed"):
             status = indexer.ensure_indexed()
-            _write_agg_marker(index_path, time_interval_ms)
             logger.info(
                 "C++ indexing complete",
                 total_files=status.total_files,
@@ -1198,8 +317,6 @@ class DFTracerAnalyzer(Analyzer):
             if event_batches:
                 events_table = pa.Table.from_batches(event_batches)
                 events_pd = events_table.to_pandas()
-                if "cat" in events_pd.columns:
-                    events_pd["cat"] = events_pd["cat"].str.lower()
                 traces = dd.from_pandas(
                     events_pd,
                     npartitions=max(1, len(event_batches) // 10),
@@ -1213,7 +330,9 @@ class DFTracerAnalyzer(Analyzer):
             if profile_batches:
                 profiles_table = pa.Table.from_batches(profile_batches)
                 profile_window = int(self.profile_time_granularity * self.time_resolution)
-                profiles_pd = _coerce_profile_dtypes(profiles_table.to_pandas(), profile_window=profile_window)
+                profiles_pd = coerce_profile_dtypes(
+                    profiles_table.to_pandas(), PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
+                )
                 profiles = dd.from_pandas(
                     profiles_pd,
                     npartitions=max(1, len(profile_batches) // 10),
@@ -1268,16 +387,15 @@ class DFTracerAnalyzer(Analyzer):
         """
         with log_block("distributed_setup"):
             time_interval_ms = self.time_granularity * 1000.0
-            self._register_dask_plugin()
+            register_auto_thread_plugin()
 
-            directory, files = _resolve_trace_inputs(trace_path, self.trace_groups)
+            directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
 
         with log_block("cpp_indexer"):
-            index_path = self._index_path_for(trace_path)
-            _drop_stale_index(index_path, time_interval_ms)
+            index_path = index_path_for(trace_path)
             indexer = Indexer(
                 directory=directory,
                 files=files,
@@ -1292,7 +410,6 @@ class DFTracerAnalyzer(Analyzer):
                 force_rebuild=False,
             )
             status = indexer.ensure_indexed()
-            _write_agg_marker(index_path, time_interval_ms)
 
             if status.total_files == 0:
                 self._file_hashes = pd.DataFrame(columns=["name"])
@@ -1348,7 +465,7 @@ class DFTracerAnalyzer(Analyzer):
                     query = f"({pid_conditions})"
                 worker_addr = worker_list[worker_id % len(worker_list)] if worker_list else None
                 future = dask_client.submit(
-                    _worker_scan_to_ipc,
+                    scan_to_ipc,
                     wfiles,
                     index_path,
                     self.time_granularity,
@@ -1398,7 +515,7 @@ class DFTracerAnalyzer(Analyzer):
                 ipc_bytes = ipc_future[key]
                 if ipc_bytes is None:
                     return meta.iloc[:0].copy()
-                return _ipc_to_pandas(ipc_bytes)
+                return ipc_to_pandas(ipc_bytes)
 
             event_delayed = [
                 dask.delayed(_extract_and_decode)(dask.delayed(f), "events", events_meta) for f in event_futures
@@ -1408,7 +525,6 @@ class DFTracerAnalyzer(Analyzer):
                 if event_delayed
                 else dd.from_pandas(events_meta, npartitions=1)
             )
-            traces = traces.map_partitions(_lower_cat)
 
             def _has_data(result_dict, key):
                 return result_dict[key] is not None
@@ -1422,7 +538,9 @@ class DFTracerAnalyzer(Analyzer):
                 ]
                 profiles = dd.from_delayed(profile_delayed, meta=events_meta)
                 profile_window = int(self.profile_time_granularity * self.time_resolution)
-                profiles = profiles.map_partitions(_coerce_profile_dtypes, profile_window=profile_window)
+                profiles = profiles.map_partitions(
+                    coerce_profile_dtypes, PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
+                )
             else:
                 profiles = None
 
@@ -1432,7 +550,7 @@ class DFTracerAnalyzer(Analyzer):
                 system_frames = dask_client.gather(
                     [
                         dask_client.submit(
-                            lambda d: _ipc_to_pandas(d["system"]) if d.get("system") else None, f, pure=False
+                            lambda d: ipc_to_pandas(d["system"]) if d.get("system") else None, f, pure=False
                         )
                         for f in event_futures
                     ]
@@ -1461,60 +579,28 @@ class DFTracerAnalyzer(Analyzer):
             system_metrics=system_metrics,
         )
 
-    def _distributed_hlm(self, data_type, view_types, traces):
-        if not hasattr(self, "_worker_ipc_futures") or not self._worker_ipc_futures:
-            return None
-
-        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
-        bin_cols = [col for col in traces.columns if "_bin_" in col]
-
-        hlm_agg = dict(HLM_AGG)
-        hlm_agg.update({col: "sum" for col in bin_cols})
-        hlm_agg["time_sq"] = "sum"
-        hlm_agg["size_sq"] = "sum"
-        hlm_agg["time_call_min"] = "min"
-        hlm_agg["time_call_max"] = "max"
-        hlm_agg["size_call_min"] = "min"
-        hlm_agg["size_call_max"] = "max"
-
-        # Pin HLM tasks to the worker that already holds the IPC bytes.
-        worker_addrs = [a for (a, _, _) in getattr(self, "_worker_scan_args", [])]
-        if len(worker_addrs) < len(self._worker_ipc_futures):
-            worker_addrs += [None] * (len(self._worker_ipc_futures) - len(worker_addrs))
-
-        partial_futures = []
-        for addr, ipc_future in zip(worker_addrs, self._worker_ipc_futures):
-            fut = self._dask_client.submit(
-                _worker_hlm_partial,
-                ipc_future,
-                data_type,
-                list(hlm_groupby),
-                dict(hlm_agg),
-                list(bin_cols),
-                workers=[addr] if addr else None,
-                pure=False,
-            )
-            partial_futures.append(fut)
-
-        # Partitions stay on their worker; persist() ships no big pandas.
-        partial_delayed = [dask.delayed(f) for f in partial_futures]
-        meta = self._build_hlm_meta(hlm_groupby, hlm_agg, bin_cols)
-        ddf = dd.from_delayed(partial_delayed, meta=meta)
-        return ddf
-
-    @staticmethod
-    def _build_hlm_meta(hlm_groupby, hlm_agg, bin_cols):
-        """Meta for the Dask DataFrame from _worker_hlm_partial."""
-        return _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols)
+    def _hlm(self, data_type, view_types, traces):
+        return distributed_hlm(
+            data_type,
+            view_types,
+            traces,
+            getattr(self, "_worker_ipc_futures", None),
+            getattr(self, "_worker_scan_args", []),
+            getattr(self, "_dask_client", None),
+            HLM_AGG,
+            HLM_EXTRA_COLS,
+            HLM_INT_INDEX_COLS,
+            HLM_FLOAT_METRIC_COLS,
+        )
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
-        result = self._distributed_hlm("events", view_types, traces)
+        result = self._hlm("events", view_types, traces)
         if result is not None:
             return result
         return super()._compute_high_level_metrics(traces, view_types, partition_size)
 
     def _compute_profile_hlm(self, profiles, view_types, partition_size):
-        result = self._distributed_hlm("profiles", view_types, profiles)
+        result = self._hlm("profiles", view_types, profiles)
         if result is not None:
             return result
         if profiles is None:
@@ -1592,17 +678,16 @@ class DFTracerAnalyzer(Analyzer):
         std_cols = list(full_cols)
         records = records.map_partitions(fix_std_cols, std_cols=std_cols)
 
-        partial_meta = self._build_partial_meta(
-            records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
-        )
+        partial_meta = build_partial_meta(records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items)
         partials = records.map_partitions(
-            _partial_arrow_view_groupby,
+            partial_arrow_view_groupby,
             view_type,
             full_cols,
             sum_cols,
             min_cols,
             max_cols,
             set_cols_items,
+            BetterSet.flatten,
             meta=partial_meta,
         )
 
@@ -1624,139 +709,25 @@ class DFTracerAnalyzer(Analyzer):
 
         merged = partials.groupby(view_type).agg(merge_aggs)
 
-        final_meta = self._build_final_meta(merged, full_cols)
-        final = merged.map_partitions(_finalize_view_partials, full_cols, meta=final_meta)
+        final_meta = build_final_meta(merged, full_cols)
+        final = merged.map_partitions(finalize_view_partials, full_cols, meta=final_meta)
         final = final.rename(columns=build_view_rename_map(final.columns))
         final = final.replace(0, pd.NA)
         final = (
             final.map_partitions(derive_call_stats)
             .map_partitions(set_unique_counts, layer=layer)
             .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
-            .map_partitions(_coerce_arrow_numerics_to_pandas_native)
+            .map_partitions(coerce_arrow_numerics_to_pandas_native)
             .persist()
         )
         return final
-
-    @staticmethod
-    def _build_partial_meta(records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items):
-        in_meta = records._meta
-
-        def _dtype_of(col, default=pd.ArrowDtype(pa.float64())):
-            if col in in_meta.columns:
-                return in_meta[col].dtype
-            if isinstance(in_meta.index, pd.MultiIndex) and col in in_meta.index.names:
-                return in_meta.index.get_level_values(col).dtype
-            return default
-
-        # Column order must exactly match what Arrow's group_by+aggregate
-        # emits. For full_cols agg_specs were appended as
-        # [(c, sum), (c, count), (c, min), (c, max), (c__sq, sum)] and
-        # c__sq_sum is renamed to c_sumsq after to_pandas.
-        cols = {}
-        for c in full_cols:
-            cols[f"{c}_sum"] = _dtype_of(c)
-            cols[f"{c}_count"] = pd.ArrowDtype(pa.int64())
-            cols[f"{c}_min"] = _dtype_of(c)
-            cols[f"{c}_max"] = _dtype_of(c)
-            cols[f"{c}_sumsq"] = pd.ArrowDtype(pa.float64())
-        for c in sum_cols:
-            cols[f"{c}_sum"] = _dtype_of(c)
-        for c in min_cols:
-            cols[f"{c}_min"] = _dtype_of(c)
-        for c in max_cols:
-            cols[f"{c}_max"] = _dtype_of(c)
-        for c, _ in set_cols_items:
-            cols[f"{c}_unique"] = "object"
-
-        meta = pd.DataFrame({name: pd.Series(dtype=dt) for name, dt in cols.items()})
-        idx_dtype = _dtype_of(view_type, default=pd.ArrowDtype(pa.int64()))
-        meta.index = pd.Index([], name=view_type, dtype=idx_dtype)
-        return meta
-
-    @staticmethod
-    def _build_final_meta(merged, full_cols):
-        # The merge step drops count/sumsq and adds mean/std per full_col.
-        cols = {}
-        for c in merged.columns:
-            if c.endswith("_count") and c[: -len("_count")] in full_cols:
-                continue
-            if c.endswith("_sumsq") and c[: -len("_sumsq")] in full_cols:
-                continue
-            cols[c] = merged._meta[c].dtype
-        for c in full_cols:
-            cols[f"{c}_mean"] = pd.ArrowDtype(pa.float64())
-            cols[f"{c}_std"] = pd.ArrowDtype(pa.float64())
-        meta = pd.DataFrame({name: pd.Series(dtype=dt) for name, dt in cols.items()})
-        meta.index = pd.Index([], name=merged._meta.index.name, dtype=merged._meta.index.dtype)
-        return meta
-
-    @staticmethod
-    def _arrow_view_groupby(pdf: pd.DataFrame, view_type: str, view_agg: dict) -> pd.DataFrame:
-        """Groupby+aggregate pandas DataFrame using pyarrow for standard aggs.
-
-        Falls back to pandas only for ``unique_set`` / ``unique_set_flatten``
-        (custom Python aggregations Arrow can't express). Output column names
-        match the base class pipeline after ``flatten_column_names``:
-        ``col_sum``, ``col_min``, ``col_max``, ``col_mean``, ``col_std``.
-        """
-        from betterset import BetterSet as S
-
-        arrow_aggs = []
-        set_cols = {}
-        for col, aggs in view_agg.items():
-            if col not in pdf.columns:
-                continue
-            for a in aggs:
-                if isinstance(a, str):
-                    arrow_fn = "stddev" if a == "std" else a
-                    arrow_aggs.append((col, arrow_fn))
-                else:
-                    set_cols[col] = a
-
-        keep_cols = [view_type] + [c for c, _ in arrow_aggs]
-        keep_cols = list(dict.fromkeys(keep_cols))
-        arrow_pdf = pdf[keep_cols]
-
-        tbl = pa.Table.from_pandas(arrow_pdf, preserve_index=False)
-        result = tbl.group_by([view_type]).aggregate(arrow_aggs)
-        out = result.to_pandas(types_mapper=pd.ArrowDtype)
-
-        rename = {}
-        for c in out.columns:
-            if c.endswith("_stddev"):
-                rename[c] = c[: -len("_stddev")] + "_std"
-        if rename:
-            out = out.rename(columns=rename)
-
-        if set_cols:
-            # Apply the dd.Aggregation's chunk fn to the SeriesGroupBy as
-            # Dask itself would. Yields a Series indexed by group key.
-            for col, agg in set_cols.items():
-                if col not in pdf.columns:
-                    continue
-                sgb = pdf.groupby(view_type)[col]
-                chunk = getattr(agg, "chunk", None)
-                series = chunk(sgb) if chunk is not None else sgb.apply(S.flatten)
-                series = series.reset_index().rename(columns={col: f"{col}_unique"})
-                out = out.merge(series, on=view_type, how="left")
-
-        out = out.set_index(view_type)
-        return out
-
-    @staticmethod
-    def _normalize_arrow_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-        for col in df.select_dtypes(include=["category"]).columns:
-            df[col] = df[col].astype("object")
-        if "cat" in df.columns:
-            df["cat"] = df["cat"].str.lower()
-        return df
 
     def postread_trace(
         self,
         traces: dd.DataFrame,
         view_types: List[ViewType],
     ) -> dd.DataFrame:
-        traces = traces.map_partitions(self._normalize_arrow_dtypes)
+        traces = traces.map_partitions(normalize_arrow_dtypes)
         with log_block("filter_files"):
             traces = traces[
                 traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
@@ -1834,69 +805,6 @@ class DFTracerAnalyzer(Analyzer):
 
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
-
-    @staticmethod
-    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
-        df["epoch"] = pd.NA
-
-        # Iterate over each epoch boundary to find matching events
-        for _, epoch_boundary in epoch_boundaries.iterrows():
-            pid = epoch_boundary["pid"]
-            start = epoch_boundary["time_start"]
-            end = epoch_boundary["time_end"]
-
-            # Find rows in the partition that match the pid and fall within the time interval
-            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
-
-            # Assign the epoch number to the matching rows
-            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
-
-        return df
-
-    @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
-        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
-
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        # Step 2: Map filesystem suffixes
-        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
-
-        for path, suffix in filesystem_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        return df
-
-    @staticmethod
-    def _sanitize_size_offset(df: pd.DataFrame):
-        df["size"] = df["size"].replace(0, np.nan)
-        if "offset" in df.columns:
-            df["offset"] = df["offset"].replace(0, np.nan)
-        return df
-
-    @staticmethod
-    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
-        df["epoch"] = pd.NA
-
-        # Iterate over each epoch boundary to find matching events
-        for _, epoch_boundary in epoch_boundaries.iterrows():
-            pid = epoch_boundary["pid"]
-            start = epoch_boundary["time_start"]
-            end = epoch_boundary["time_end"]
-
-            # Find rows in the partition that match the pid and fall within the time interval
-            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
-
-            # Assign the epoch number to the matching rows
-            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
-
-        return df
 
     @staticmethod
     def _fix_file_posix_category(df: pd.DataFrame):
