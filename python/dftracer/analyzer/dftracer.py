@@ -146,6 +146,11 @@ def io_function(json_dict: dict):
     if "args" in json_dict:
         if "fhash" in json_dict["args"]:
             d["file_hash"] = str(json_dict["args"]["fhash"])
+        # per-op size/offset emitted directly as args (cuFile/block/sys_io custom probes)
+        if "size" in json_dict["args"]:
+            d["size"] = int(json_dict["args"]["size"])
+        if "offset" in json_dict["args"]:
+            d["offset"] = int(json_dict["args"]["offset"])
         if "size_sum" in json_dict["args"]:
             d["size"] = int(json_dict["args"]["size_sum"])
         elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
