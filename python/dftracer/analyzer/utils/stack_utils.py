@@ -16,9 +16,18 @@ def assign_hierarchy(pdf: pd.DataFrame) -> pd.DataFrame:
     root_ids: List[str] = []
     depths: List[int] = []
 
+    # group key prefix: pandas>=2.2 drops groupby keys (pid/tid) from the apply frame, so prefer the
+    # carried _grp column (set in _add_hierarchy_columns) and fall back to pid/tid when present.
+    if "_grp" in pdf.columns and len(pdf):
+        gid = str(pdf["_grp"].iloc[0])
+    elif "pid" in pdf.columns and "tid" in pdf.columns and len(pdf):
+        gid = f"{pdf['pid'].iloc[0]}-{pdf['tid'].iloc[0]}"
+    else:
+        gid = "g"
+
     stack: List[dict] = []
     for i, row in pdf.iterrows():
-        event_id = f"{row['pid']}-{row['tid']}-{i}"
+        event_id = f"{gid}-{i}"
         start = row[COL_TIME_START]
         end = row[COL_TIME_END]
 
@@ -42,6 +51,16 @@ def assign_hierarchy(pdf: pd.DataFrame) -> pd.DataFrame:
         stack.append({"end": end, "id": event_id, "root": root, "depth": depth})
 
     pdf = pdf.copy()
+    # pandas>=2.2 drops the groupby keys from the apply frame; restore pid/tid from _grp so the
+    # output matches the provided meta.
+    if "pid" not in pdf.columns and "-" in gid:
+        _pid, _, _tid = gid.partition("-")
+        try:
+            pdf["pid"] = int(_pid)
+            pdf["tid"] = int(_tid)
+        except ValueError:
+            pdf["pid"] = _pid
+            pdf["tid"] = _tid
     pdf["event_id"] = event_ids
     pdf["parent_id"] = parent_ids
     pdf["root_id"] = root_ids
@@ -83,7 +102,8 @@ def set_stack_metrics(df: pd.DataFrame, job_time: float) -> pd.DataFrame:
     parent_time_col = pick(["parent_time_first", "parent_time"])
     root_time_col = pick(["root_time_first", "root_time"])
 
-    with pd.option_context("mode.use_inf_as_na", True):
+    # 'mode.use_inf_as_na' was removed in pandas>=2; use a no-op context and clean inf->NA below.
+    with pd.option_context("display.max_rows", pd.get_option("display.max_rows")):
         parent_denom = (
             df[parent_time_col].where(df[parent_time_col] != 0, pd.NA) if parent_time_col else None
         )
@@ -106,6 +126,9 @@ def set_stack_metrics(df: pd.DataFrame, job_time: float) -> pd.DataFrame:
             df["root_time_frac_job"] = safe_divide(df[root_time_col], job_time)
         if time_col and job_time != 0:
             df["time_frac_job"] = safe_divide(df[time_col], job_time)
+    _frac = [c for c in df.columns if "frac" in c]
+    if _frac:
+        df[_frac] = df[_frac].replace([float("inf"), float("-inf")], pd.NA)
     return df
 
 

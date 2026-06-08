@@ -19,18 +19,27 @@ from .utils.stack_utils import (
 
 
 def _add_hierarchy_columns(traces: dd.DataFrame) -> dd.DataFrame:
-    meta = traces._meta.copy()
-    meta = meta.assign(
+    # pandas>=2.2 excludes groupby keys from the apply frame, so carry pid/tid via a non-key column
+    # (_grp) to keep globally-unique event ids inside assign_hierarchy.
+    traces = traces.assign(
+        _grp=traces["pid"].astype("string") + "-" + traces["tid"].astype("string")
+    )
+    base = traces._meta.copy()
+    # assign_hierarchy (under pandas>=2.2) re-emits pid/tid after _grp, so match that column order.
+    meta = base.drop(columns=["pid", "tid"]).assign(
+        pid=base["pid"],
+        tid=base["tid"],
         event_id=pd.Series(dtype="string"),
         parent_id=pd.Series(dtype="string"),
         root_id=pd.Series(dtype="string"),
         depth=pd.Series(dtype="int64"),
     )
-    return (
+    out = (
         traces.groupby(["pid", "tid"])
         .apply(assign_hierarchy, meta=meta)
         .reset_index(drop=True)
     )
+    return out.drop(columns=["_grp"])
 
 
 class DataCrumbsAnalyzer(DFTracerAnalyzer):
