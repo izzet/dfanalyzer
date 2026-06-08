@@ -40,7 +40,9 @@ def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
         double_cols.extend([col for col in df.columns if '_bin_' in col])
         double_cols.extend([col for col in df.columns if col.endswith('_count')])
     else:
-        int_cols.extend([col for col in df.columns if '_bin_' in col])
+        # bin *stats* (_mean/_std) are fractional -> double; bin *counts* -> int
+        int_cols.extend([col for col in df.columns if '_bin_' in col and not col.endswith(('_mean', '_std'))])
+        double_cols.extend([col for col in df.columns if '_bin_' in col and col.endswith(('_mean', '_std'))])
         int_cols.extend([col for col in df.columns if col.endswith('_count')])
     df[int_cols] = df[int_cols].astype('Int64')
     df[double_cols] = df[double_cols].astype('Float64')
