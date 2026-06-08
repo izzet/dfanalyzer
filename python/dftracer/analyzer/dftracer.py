@@ -136,6 +136,7 @@ def io_columns():
         "io_cat": "Int8",
         "size": "Int64",
         "offset": "Int64",
+        "corr_id": "Int64",
     }
     return columns
 
@@ -151,6 +152,9 @@ def io_function(json_dict: dict):
             d["size"] = int(json_dict["args"]["size"])
         if "offset" in json_dict["args"]:
             d["offset"] = int(json_dict["args"]["offset"])
+        # GDS-Trace cross-layer correlation id (cuFileRead <-> its nvfs_io / NVMe commands)
+        if "corr_id" in json_dict["args"]:
+            d["corr_id"] = int(json_dict["args"]["corr_id"])
         if "size_sum" in json_dict["args"]:
             d["size"] = int(json_dict["args"]["size_sum"])
         elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
