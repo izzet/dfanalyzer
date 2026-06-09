@@ -14,6 +14,7 @@ from dftracer.utils.dfanalyzer import (
     coerce_arrow_numerics_to_pandas_native,
     coerce_profile_dtypes,
     distributed_hlm,
+    distributed_time_origin,
     ensure_index,
     finalize_view_partials,
     index_path_for,
@@ -223,6 +224,13 @@ def io_columns():
 
 
 class DFTracerAnalyzer(Analyzer):
+    POSIX_CAT_RULES = [
+        ("/data", "_reader"),
+        ("/checkpoint", "_checkpoint"),
+        ("/lustre", "_lustre"),
+        ("/ssd", "_ssd"),
+    ]
+
     def __init__(
         self,
         preset,
@@ -481,6 +489,7 @@ class DFTracerAnalyzer(Analyzer):
             self._worker_scan_args = worker_scan_args
             self._index_path = index_path
             self._dask_client = dask_client
+            self._time_origin = distributed_time_origin(event_futures, dask_client)
 
         with log_block("build_dask_dataframe"):
             events_meta = pd.DataFrame(
@@ -579,6 +588,19 @@ class DFTracerAnalyzer(Analyzer):
             system_metrics=system_metrics,
         )
 
+    def _postread_hlm_config(self, data_type):
+        """Postread transformations the distributed HLM must replicate."""
+        config: Dict[str, object] = {"posix_cat_rules": [list(rule) for rule in self.POSIX_CAT_RULES]}
+        if data_type == "events":
+            config["ignored_file_patterns"] = list(IGNORED_FILE_PATTERNS)
+            config["ignored_func_names"] = list(IGNORED_FUNC_NAMES)
+            config["ignored_func_patterns"] = list(IGNORED_FUNC_PATTERNS)
+            origin = getattr(self, "_time_origin", None)
+            if origin is not None:
+                config["time_origin"] = int(origin)
+                config["bucket_width_us"] = int(self.time_granularity * self.time_resolution)
+        return config
+
     def _hlm(self, data_type, view_types, traces):
         return distributed_hlm(
             data_type,
@@ -591,6 +613,7 @@ class DFTracerAnalyzer(Analyzer):
             HLM_EXTRA_COLS,
             HLM_INT_INDEX_COLS,
             HLM_FLOAT_METRIC_COLS,
+            self._postread_hlm_config(data_type),
         )
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
@@ -728,10 +751,13 @@ class DFTracerAnalyzer(Analyzer):
         view_types: List[ViewType],
     ) -> dd.DataFrame:
         traces = traces.map_partitions(normalize_arrow_dtypes)
-        with log_block("filter_files"):
-            traces = traces[
-                traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
-            ]
+        with log_block("filter_rows"):
+            traces = traces.map_partitions(
+                self._apply_ignore_filters,
+                IGNORED_FILE_PATTERNS,
+                IGNORED_FUNC_NAMES,
+                IGNORED_FUNC_PATTERNS,
+            )
 
         # Set epochs
         with log_block("assign_epochs"):
@@ -743,11 +769,6 @@ class DFTracerAnalyzer(Analyzer):
                 epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
                 epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
                 traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
-
-        # Ignore redundant function calls
-        with log_block("filter_functions"):
-            traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
-            traces = traces[~traces[COL_FUNC_NAME].str.contains("|".join(IGNORED_FUNC_PATTERNS))]
 
         with log_block("wait"):
             _ = wait(traces)
@@ -797,8 +818,12 @@ class DFTracerAnalyzer(Analyzer):
             return "epoch"
         return super().get_time_boundary_layer()
 
+    def get_total_event_count(self, traces: dd.DataFrame) -> int:
+        return traces[COL_COUNT].sum().persist()
+
     def get_unique_file_count(self, traces: dd.DataFrame):
-        return traces["file_hash"].nunique()
+        file_hash = traces["file_hash"]
+        return file_hash[file_hash != ""].nunique()
 
     def get_unique_host_count(self, traces: dd.DataFrame):
         return traces["host_hash"].nunique()
@@ -807,23 +832,26 @@ class DFTracerAnalyzer(Analyzer):
         return traces["pid"].nunique()
 
     @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
+    def _apply_ignore_filters(df, ignored_file_patterns, ignored_func_names, ignored_func_patterns):
+        """Drop ignored files/functions"""
+        if ignored_file_patterns and COL_FILE_NAME in df.columns:
+            keep = df[COL_FILE_NAME].isna() | ~df[COL_FILE_NAME].str.contains("|".join(ignored_file_patterns))
+            df = df[keep]
+        if COL_FUNC_NAME in df.columns:
+            if ignored_func_names:
+                df = df[~df[COL_FUNC_NAME].isin(ignored_func_names)]
+            if ignored_func_patterns:
+                df = df[~df[COL_FUNC_NAME].str.contains("|".join(ignored_func_patterns))]
+        return df
+
+    @classmethod
+    def _fix_file_posix_category(cls, df: pd.DataFrame):
+        # base condition is fixed on the original cat; suffixes (purpose then
+        # filesystem) are applied cumulatively per POSIX_CAT_RULES order.
         base_condition = df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna()
-
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
+        for path, suffix in cls.POSIX_CAT_RULES:
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        # Step 2: Map filesystem suffixes
-        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
-
-        for path, suffix in filesystem_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
         return df
 
     def _fix_time(self, traces: dd.DataFrame, time_origin: Optional[int] = None) -> dd.DataFrame:
