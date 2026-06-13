@@ -302,6 +302,9 @@ class DFTracerAnalyzerConfig(AnalyzerConfig):
     assign_epochs: Optional[bool] = False
     time_granularity: Optional[float] = 1
     time_resolution: Optional[float] = 1e6
+    # When trace_path points at a dftracer_organize output dir (has manifest.json),
+    # restrict loading to these groups. None or empty means "read everything".
+    trace_groups: Optional[List[str]] = None
 
 
 @dc.dataclass

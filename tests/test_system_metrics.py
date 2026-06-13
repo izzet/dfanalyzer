@@ -1,5 +1,6 @@
 """Tests for TYPE_SYSTEM event parsing and system metrics integration."""
 
+import gzip
 import json
 import logging
 import os
@@ -7,6 +8,15 @@ import pandas as pd
 import pytest
 from dask.distributed import Client, LocalCluster
 from omegaconf import OmegaConf
+
+
+def _write_trace_lines(path, lines):
+    """Write a list of trace text lines as gzipped JSONL (.pfw.gz)."""
+    with gzip.open(str(path), "wt", encoding="utf-8") as f:
+        for line in lines:
+            if line in ("[", "]"):
+                continue
+            f.write(line + "\n")
 
 from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX
 from dftracer.analyzer.constants import COL_TIME_RANGE
@@ -198,9 +208,8 @@ class TestMixedTrace:
                        "Cached": 10.0}},
         ]
 
-        trace_file = self.trace_dir / "mixed_trace.pfw"
-        lines = ["["] + [json.dumps(e) for e in events] + ["]"]
-        trace_file.write_text("\n".join(lines) + "\n")
+        trace_file = self.trace_dir / "mixed_trace.pfw.gz"
+        _write_trace_lines(trace_file, [json.dumps(e) for e in events])
 
         analyzer = _make_analyzer(tmp_path / "mixed_analysis")
         self.result = analyzer.read_trace(

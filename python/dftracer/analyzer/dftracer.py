@@ -1,19 +1,42 @@
 import dask
-import dask.bag as db
 import dask.dataframe as dd
-import glob
-import json
 import math
 import numpy as np
 import os
 import pandas as pd
-import portion as I
 import structlog
-from dftracer.utils import Indexer, Reader
-from dask.distributed import wait
-from typing import Callable, Dict, List, Optional, Tuple
+import pyarrow as pa
+from betterset import BetterSet
+from dftracer.utils import AggregationConfig, Indexer
+from dftracer.utils.dfanalyzer import (
+    build_final_meta,
+    build_partial_meta,
+    coerce_arrow_numerics_to_pandas_native,
+    coerce_profile_dtypes,
+    distributed_hlm,
+    distributed_time_origin,
+    ensure_index,
+    finalize_view_partials,
+    index_path_for,
+    ipc_to_pandas,
+    normalize_arrow_dtypes,
+    partial_arrow_view_groupby,
+    resolve_trace_inputs,
+    scan_to_ipc,
+)
+from dftracer.utils.dask import _assign_files_by_pid, register_auto_thread_plugin
+from dask.distributed import Client, get_client, wait
+from typing import Dict, List, Optional, Tuple
 
-from .analyzer import Analyzer
+from .analyzer import Analyzer, HLM_AGG, HLM_EXTRA_COLS
+from .analysis_utils import (
+    build_view_rename_map,
+    derive_call_stats,
+    fix_dtypes,
+    fix_std_cols,
+    set_unique_counts,
+)
+from .utils.dask_agg import unique_set, unique_set_flatten
 from .constants import (
     COL_ACC_PAT,
     COL_COUNT,
@@ -27,8 +50,6 @@ from .constants import (
     COL_TIME_END,
     COL_TIME_RANGE,
     COL_TIME_START,
-    POSIX_IO_CAT_MAPPING,
-    POSIX_METADATA_FUNCTIONS,
     IOCategory,
 )
 from .types import ReadTraceResult, ViewType
@@ -36,8 +57,22 @@ from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
 
-CAT_POSIX = "POSIX"
-CAT_STDIO = "STDIO"
+# HLM groupby columns typed as Int64 (others string); metric columns typed as
+# Float64 (others Int64). Passed to the dftracer.utils HLM helpers.
+HLM_INT_INDEX_COLS = frozenset({"pid", "tid", "io_cat", "acc_pat", "time_range"})
+HLM_FLOAT_METRIC_COLS = frozenset(
+    {
+        "time",
+        "time_sq",
+        "time_min",
+        "time_max",
+        "time_call_min",
+        "time_call_max",
+        "time_start",
+        "time_end",
+    }
+)
+
 IGNORED_FILE_PATTERNS = [
     "/dev/",
     "/etc/",
@@ -151,8 +186,7 @@ PROFILE_OUTPUT_COLUMNS = {
 PROFILE_MEASURE_COLUMNS = [COL_COUNT, COL_TIME, COL_SIZE]
 PROFILE_STAT_COLUMNS = ["time_min", "time_max", "size_min", "size_max", "offset_min", "offset_max"]
 PROFILE_IDENTITY_COLUMNS = [
-    col for col in PROFILE_OUTPUT_COLUMNS
-    if col not in PROFILE_MEASURE_COLUMNS and col not in PROFILE_STAT_COLUMNS
+    col for col in PROFILE_OUTPUT_COLUMNS if col not in PROFILE_MEASURE_COLUMNS and col not in PROFILE_STAT_COLUMNS
 ]
 
 # System metric columns extracted from cat="sys" ph="C" events
@@ -177,45 +211,6 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
-def create_index(filename):
-    index_file = f"{filename}.idx"
-    if not os.path.exists(index_file):
-        indexer = Indexer(filename, index_file, checkpoint_size=32 * 1024 * 1024)
-        indexer.build()
-        logger.debug("Creating index", filename=filename)
-    return filename
-
-
-def generate_batches(filename, max_bytes):
-    batch_size = 4 * 1024 * 1024  # 4 MB
-    for start in range(0, max_bytes, batch_size):
-        # this range is intended since DFTracerJsonLinesBytesReader do
-        # line boundary algorithm internally to chop incomplete line
-        end = min(start + batch_size, max_bytes)
-        logger.debug("Created batch", filename=filename, start=start, end=end)
-        yield filename, start, end
-
-
-def get_size(filename):
-    size = 0
-    if filename.endswith(".pfw"):
-        size = os.stat(filename).st_size
-    elif filename.endswith(".pfw.gz"):
-        index_file = f"{filename}.idx"
-        indexer = Indexer(filename, index_file)
-        size = indexer.get_max_bytes()
-    logger.debug("File has size", filename=filename, size=size / 1024**3)
-    return filename, int(size)
-
-
-def get_io_cat(func_name: str):
-    if func_name in POSIX_METADATA_FUNCTIONS:
-        return IOCategory.METADATA.value
-    if func_name in POSIX_IO_CAT_MAPPING:
-        return POSIX_IO_CAT_MAPPING[func_name].value
-    return IOCategory.OTHER.value
-
-
 def io_columns():
     columns = {
         "file_hash": "string",
@@ -228,338 +223,541 @@ def io_columns():
     return columns
 
 
-def io_function(json_dict: dict):
-    d = {}
-    d[COL_IO_CAT] = IOCategory.OTHER.value
-    if "args" in json_dict:
-        if "fhash" in json_dict["args"]:
-            d["file_hash"] = str(json_dict["args"]["fhash"])
-        if "size_sum" in json_dict["args"]:
-            d["size"] = int(json_dict["args"]["size_sum"])
-        elif json_dict["cat"] in [CAT_POSIX, CAT_STDIO]:
-            name = json_dict["name"]
-            io_cat = get_io_cat(name)
-            if "ret" in json_dict["args"]:
-                size = int(json_dict["args"]["ret"])
-                if size > 0:
-                    if io_cat in [IOCategory.READ.value, IOCategory.WRITE.value]:
-                        d["size"] = size
-            if "offset" in json_dict["args"]:
-                offset = int(json_dict["args"]["offset"])
-                if offset >= 0:
-                    d["offset"] = offset
-            d[COL_IO_CAT] = io_cat
-        else:
-            if "image_idx" in json_dict["args"]:
-                image_id = int(json_dict["args"]["image_idx"])
-                if image_id > 0:
-                    d["image_id"] = image_id
-            if "image_size" in json_dict["args"]:
-                name = json_dict["name"].lower()
-                # e.g. NPZReader.open image_size is not correct
-                if "open" not in name:
-                    size = int(json_dict["args"]["image_size"])
-                    if size > 0:
-                        d["size"] = size
-    return d
-
-
-def profile_function(json_dict: dict):
-    args = json_dict.get("args", {})
-    d = {}
-    d[COL_IO_CAT] = IOCategory.OTHER.value
-    if "fhash" in args:
-        d["file_hash"] = str(args["fhash"])
-    if "hhash" in args:
-        d["host_hash"] = str(args["hhash"])
-    if json_dict.get("cat") in [CAT_POSIX, CAT_STDIO]:
-        d[COL_IO_CAT] = get_io_cat(json_dict["name"])
-    for key in PROFILE_COLUMN_MAPPING:
-        if key in args:
-            d[key] = int(args[key])
-    return d
-
-
-def system_function(json_dict: dict):
-    """Extract CPU/memory metric args from a cat='sys' ph='C' event."""
-    args = json_dict.get("args", {})
-    d = {}
-    if "hhash" in args:
-        d["host_hash"] = str(args["hhash"])
-    for key in SYSTEM_COLUMN_MAPPING:
-        if key in args:
-            d[key] = float(args[key])
-    return d
-
-
-def load_indexed_gzip_files(filename, start, end):
-    index_file = f"{filename}.idx"
-    reader = Reader(filename, index_file)
-    json_lines = reader.read_line_bytes_json(start, end)
-    logger.debug("Read json lines", filename=filename, start=start, end=end, num_lines=len(json_lines))
-    return json_lines
-
-
-def load_objects_dict(
-    json_dict: dict,
-    time_approximate: bool,
-    extra_columns: Optional[Dict[str, str]],
-    extra_columns_fn: Optional[Callable[[dict], dict]],
-):
-    final_dict = {}
-    logger.debug("Loading dict", json_dict=json_dict)
-    if json_dict is not None:
-        try:
-            ph = json_dict.get("ph")
-            if "name" in json_dict:
-                final_dict["name"] = json_dict["name"]
-            if "cat" in json_dict:
-                final_dict["cat"] = json_dict["cat"].lower()
-            if "pid" in json_dict:
-                final_dict["pid"] = json_dict["pid"]
-            if "tid" in json_dict:
-                final_dict["tid"] = json_dict["tid"]
-            if "args" in json_dict:
-                if "hhash" in json_dict["args"]:
-                    final_dict["host_hash"] = str(json_dict["args"]["hhash"])
-                if (
-                    "epoch" in json_dict["args"]
-                    and json_dict["args"]["epoch"] != "train"
-                    and json_dict["args"]["epoch"] != "valid"
-                ):
-                    epoch = int(json_dict["args"]["epoch"])
-                    if epoch >= 0:
-                        final_dict["epoch"] = epoch
-                if "step" in json_dict["args"]:
-                    step = int(json_dict["args"]["step"])
-                    if step >= 0:
-                        final_dict["step"] = step
-            if "M" == ph:
-                if final_dict["name"] == "FH":
-                    final_dict["type"] = TYPE_FILE_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "HH":
-                    final_dict["type"] = TYPE_HOST_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "SH":
-                    final_dict["type"] = TYPE_STRING_HASH
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                elif final_dict["name"] == "PR":
-                    final_dict["type"] = TYPE_PROC_METADATA
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["hash"] = str(json_dict["args"]["value"])
-                else:
-                    final_dict["type"] = TYPE_METADATA
-                    if "args" in json_dict and "name" in json_dict["args"] and "value" in json_dict["args"]:
-                        final_dict["name"] = json_dict["args"]["name"]
-                        final_dict["value"] = str(json_dict["args"]["value"])
-            elif "C" == ph:
-                is_system = json_dict.get("cat", "").lower() == "sys"
-                final_dict["type"] = TYPE_SYSTEM if is_system else TYPE_PROFILE
-                if "ts" in json_dict:
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
-                if is_system:
-                    final_dict.update(system_function(json_dict))
-                else:
-                    final_dict.update(profile_function(json_dict))
-                    final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-            else:
-                final_dict["type"] = TYPE_EVENT
-                if "dur" in json_dict:
-                    if type(json_dict["dur"]) is not int:
-                        json_dict["dur"] = int(json_dict["dur"])
-                    if type(json_dict["ts"]) is not int:
-                        json_dict["ts"] = int(json_dict["ts"])
-                    final_dict["ts"] = json_dict["ts"]
-                    final_dict["dur"] = json_dict["dur"]
-                    final_dict["te"] = final_dict["ts"] + final_dict["dur"]
-                    if not time_approximate:
-                        final_dict["tinterval"] = I.to_string(
-                            I.closed(json_dict["ts"], json_dict["ts"] + json_dict["dur"])
-                        )
-                final_dict.update(io_function(json_dict))
-                final_dict.update(extra_columns_fn(json_dict) if extra_columns_fn else {})
-            # check if all extra columns are present
-            if extra_columns and not all(col in final_dict for col in extra_columns):
-                missing_cols = [col for col in extra_columns if col not in final_dict]
-                raise ValueError(f"Missing extra columns: {missing_cols}")
-            logger.debug("Built a dictionary for dict", final_dict=final_dict)
-            yield final_dict
-        except ValueError as error:
-            logger.error("Processing dict failed", dict=json_dict, error=error)
-    return {}
-
-
-def load_objects_str(
-    line: str,
-    time_approximate: bool,
-    extra_columns: Optional[Dict[str, str]],
-    extra_columns_fn: Optional[Callable[[dict], dict]],
-):
-    if line is not None and line != "" and len(line) > 0 and "[" != line[0] and "]" != line[0] and line != "\n":
-        try:
-            unicode_line = "".join([i if ord(i) < 128 else "#" for i in line])
-            json_dict = json.loads(unicode_line, strict=False)
-            yield from load_objects_dict(json_dict, time_approximate, extra_columns, extra_columns_fn)
-        except ValueError as error:
-            logger.error("Processing line failed", line=line, error=error)
-    return {}
-
-
 class DFTracerAnalyzer(Analyzer):
-    def __init__(self, preset, assign_epochs=False, **kwargs):
+    POSIX_CAT_RULES = [
+        ("/data", "_reader"),
+        ("/checkpoint", "_checkpoint"),
+        ("/lustre", "_lustre"),
+        ("/ssd", "_ssd"),
+    ]
+
+    def __init__(
+        self,
+        preset,
+        assign_epochs: bool = False,
+        trace_groups: Optional[List[str]] = None,
+        **kwargs,
+    ):
         super().__init__(preset, **kwargs)
         self.assign_epochs = assign_epochs
+        self.trace_groups = list(trace_groups) if trace_groups else None
 
-    def read_trace(self, trace_path, extra_columns, extra_columns_fn):
-        with log_block("glob_files"):
-            pfw_pattern, pfw_gz_pattern = [], []
-            if os.path.isdir(trace_path):
-                pfw_pattern = glob.glob(os.path.join(trace_path, "*.pfw"))
-                pfw_gz_pattern = glob.glob(os.path.join(trace_path, "*.pfw.gz"))
-            elif trace_path.endswith(".pfw.gz"):
-                pfw_gz_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
-            elif trace_path.endswith(".pfw"):
-                pfw_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
-            all_files = pfw_pattern + pfw_gz_pattern
-            if not all_files:
+    def analyze_trace(self, trace_path, *args, **kwargs):
+        """Transparent indexing: ensure the dftracer index exists, then analyze."""
+        ensure_index(trace_path, self.trace_groups, self.time_granularity * 1000.0)
+        return super().analyze_trace(trace_path, *args, **kwargs)
+
+    def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None):
+        """Read trace using C++ aggregation pipeline.
+
+        This is a faster alternative to read_trace() that uses the C++ Indexer
+        with fused aggregation to produce pre-aggregated data directly.
+        All transformation (hash resolution, time normalization, io_cat, proc_name)
+        is done in C++ for performance.
+
+        Args:
+            trace_path: Directory containing trace files or glob pattern.
+            extra_columns: Not used (kept for API compatibility).
+            extra_columns_fn: Not used (kept for API compatibility).
+
+        Returns:
+            ReadTraceResult with traces, profiles, and system_metrics.
+        """
+        with log_block("cpp_indexer_setup"):
+            # Configure aggregation to match analyzer time granularity
+            time_interval_ms = self.time_granularity * 1000.0  # seconds to ms
+
+            directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
+
+            if not directory and not files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
-        logger.debug("Processing files", files=all_files)
-        if len(pfw_gz_pattern) > 0:
-            with log_block("create_index"):
-                db.from_sequence(pfw_gz_pattern).map(create_index).compute()
-                logger.info("Created index for files", num_files=len(pfw_gz_pattern))
-        with log_block("sum_total_size"):
-            sizes = db.from_sequence(all_files).map(get_size).compute()
-            total_size = sum(size for _, size in sizes)
-            logger.info("Total size of all files", total_size=total_size)
-        gz_bag = None
-        pfw_bag = None
-        if len(pfw_gz_pattern) > 0:
-            with log_block("gzip_index_and_batches"):
-                logger.debug("Max bytes per file", sizes=sizes)
-                json_line_delayed = []
-                total_lines = 0
-                for filename, max_bytes in sizes:
-                    total_lines += max_bytes
-                    for _, start, end in generate_batches(filename, max_bytes):
-                        json_line_delayed.append((filename, start, end))
 
-                logger.info(
-                    "Loading batches",
-                    num_batches=len(json_line_delayed),
-                    num_files=len(pfw_gz_pattern),
-                    total_lines=total_lines,
+            index_path = index_path_for(trace_path)
+            indexer = Indexer(
+                directory=directory,
+                files=files if files else None,
+                index_dir=os.path.dirname(index_path),
+                require_checkpoint=True,
+                require_bloom=True,
+                require_manifest=True,
+                require_aggregation=AggregationConfig(
+                    time_interval_ms=time_interval_ms,
+                    compute_percentiles=False,
+                ),
+                force_rebuild=False,
+            )
+
+        with log_block("cpp_ensure_indexed"):
+            status = indexer.ensure_indexed()
+            logger.info(
+                "C++ indexing complete",
+                total_files=status.total_files,
+                ready=len(status.ready),
+                needs_work=len(status.needs_work),
+            )
+
+        with log_block("cpp_load_hash_tables"):
+            # Store hash tables for compatibility with other methods
+            file_hashes = indexer.get_hash_table("file")
+            host_hashes = indexer.get_hash_table("host")
+            self._file_hashes = pd.DataFrame(
+                {"name": list(file_hashes.values())},
+                index=pd.Index(list(file_hashes.keys()), name="hash", dtype="string"),
+            )
+            self._host_hashes = pd.DataFrame(
+                {"name": list(host_hashes.values())},
+                index=pd.Index(list(host_hashes.keys()), name="hash", dtype="string"),
+            )
+            self._string_hashes = pd.DataFrame(columns=["name"])
+            self._metadata = pd.DataFrame(columns=["name", "value"])
+
+        with log_block("cpp_iter_arrow_dfanalyzer"):
+            all_batches = indexer.iter_arrow_dfanalyzer_all(
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+            )
+            event_batches = [pa.record_batch(b) for b in all_batches.get("events", [])]
+            profile_batches = [pa.record_batch(b) for b in all_batches.get("profiles", [])]
+            system_batches = [pa.record_batch(b) for b in all_batches.get("system", [])]
+
+        with log_block("cpp_to_dask"):
+            # Convert Arrow batches to Dask DataFrames
+            if event_batches:
+                events_table = pa.Table.from_batches(event_batches)
+                events_pd = events_table.to_pandas()
+                traces = dd.from_pandas(
+                    events_pd,
+                    npartitions=max(1, len(event_batches) // 10),
                 )
-                json_line_bags = []
-                for filename, start, end in json_line_delayed:
-                    json_line_bags.append(dask.delayed(load_indexed_gzip_files)(filename, start, end))
-                json_lines = db.concat(json_line_bags)
-            with log_block("parse_gzip_json_lines"):
-                gz_bag = (
-                    json_lines.map(
-                        load_objects_dict,
-                        time_approximate=self.time_approximate,
-                        extra_columns=extra_columns,
-                        extra_columns_fn=extra_columns_fn,
-                    )
-                    .flatten()
-                    .filter(lambda x: "name" in x)
+            else:
+                traces = dd.from_pandas(
+                    pd.DataFrame(columns=list(PROFILE_OUTPUT_COLUMNS.keys())),
+                    npartitions=1,
                 )
-        main_bag = None
-        if len(pfw_pattern) > 0:
-            with log_block("parse_json_lines"):
-                pfw_bag = (
-                    db.read_text(pfw_pattern)
-                    .map(
-                        load_objects_str,
-                        time_approximate=self.time_approximate,
-                        extra_columns=extra_columns,
-                        extra_columns_fn=extra_columns_fn,
-                    )
-                    .flatten()
-                    .filter(lambda x: "name" in x)
+
+            if profile_batches:
+                profiles_table = pa.Table.from_batches(profile_batches)
+                profile_window = int(self.profile_time_granularity * self.time_resolution)
+                profiles_pd = coerce_profile_dtypes(
+                    profiles_table.to_pandas(), PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
                 )
-        if len(pfw_gz_pattern) > 0 and len(pfw_pattern) > 0:
-            main_bag = db.concat([pfw_bag, gz_bag])
-        elif len(pfw_gz_pattern) > 0:
-            main_bag = gz_bag
-        elif len(pfw_pattern) > 0:
-            main_bag = pfw_bag
-        if main_bag:
-            self._columns = self._get_columns(extra_columns)
-            with log_block("to_dataframe"):
-                raw_traces = main_bag.to_dataframe(meta=self._columns)
-            with log_block("_handle_metadata"):
-                traces, profiles, system_events = self._handle_metadata(raw_traces)
-            with log_block("compute_time_origin"):
-                trace_min, profile_min, system_min = dask.compute(
-                    traces["ts"].min(), profiles["ts"].min(), system_events["ts"].min()
+                profiles = dd.from_pandas(
+                    profiles_pd,
+                    npartitions=max(1, len(profile_batches) // 10),
                 )
-                time_origin_candidates = [
-                    ts for ts in [trace_min, profile_min, system_min] if pd.notna(ts)
-                ]
-                time_origin = min(time_origin_candidates) if time_origin_candidates else 0
-                has_profiles = pd.notna(profile_min)
-                has_system = pd.notna(system_min)
-                if has_profiles:
-                    # DFTracer counter buckets are emitted on absolute 5s boundaries,
-                    # while trace_min is arbitrary. Snap the shared origin down to the
-                    # 5s profile grid so a single 5s profile bucket cannot straddle two
-                    # analyzer bins and get assigned to only one time_range.
-                    profile_grid_width = int(self.profile_time_granularity * self.time_resolution)
-                    time_origin = (time_origin // profile_grid_width) * profile_grid_width
-            self._npartitions = math.ceil(total_size / (128 * 1024**2))
-            logger.debug(f"Number of partitions used are {self._npartitions}")
-            with log_block("repartition+persist"):
-                traces = traces.repartition(npartitions=self._npartitions).persist()
-                if has_profiles:
-                    profiles = profiles.repartition(npartitions=self._npartitions).persist()
-                else:
-                    profiles = None
-            with log_block("normalize_records+persist"):
-                traces = self._fix_time(traces, time_origin=time_origin).persist()
-                if profiles is not None:
-                    profiles = self._standardize_profiles(profiles, time_origin=time_origin).persist()
-                if has_system:
-                    system_metrics = self._standardize_system(system_events, time_origin=time_origin).persist()
-                else:
-                    system_metrics = None
-            with log_block("wait_all"):
-                wait_list = [traces, self._file_hashes, self._host_hashes, self._string_hashes, self._metadata]
-                if profiles is not None:
-                    wait_list.append(profiles)
-                if system_metrics is not None:
-                    wait_list.append(system_metrics)
-                wait(wait_list)
-        else:
-            logger.error("Unable to load traces")
-            exit(1)
+            else:
+                profiles = None
+
+            if system_batches:
+                system_table = pa.Table.from_batches(system_batches)
+                system_pd = system_table.to_pandas()
+                # time_bucket is already the bucket-start timestamp in us
+                # (compute_time_bucket floors ts to the bucket boundary), so
+                # pin ts to it for stable (ts - origin)//bucket_width indexing.
+                system_pd["ts"] = system_pd["time_bucket"].astype("int64")
+                time_origin = int(system_pd["ts"].min()) if not system_pd.empty else 0
+                system_events = dd.from_pandas(
+                    system_pd,
+                    npartitions=max(1, len(system_batches) // 10),
+                )
+                system_metrics = self._standardize_system(system_events, time_origin=time_origin)
+            else:
+                system_metrics = None
+
         return ReadTraceResult(
-            traces=self._rename_columns(traces),
+            traces=traces,
             profiles=profiles,
             profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
             system_metrics=system_metrics,
         )
+
+    def read_trace(
+        self,
+        trace_path,
+        extra_columns=None,
+        extra_columns_fn=None,
+        client: Optional[Client] = None,
+    ):
+        """Read trace using C++ aggregation pipeline.
+
+        Uses the active Dask client for distributed execution across workers.
+        Data stays on workers as Dask DataFrame partitions (no coordinator
+        materialization).
+
+        Args:
+            trace_path: Directory containing trace files or glob pattern.
+            extra_columns: Not used (kept for API compatibility).
+            extra_columns_fn: Not used (kept for API compatibility).
+            client: Dask distributed Client. If None, uses the active client.
+
+        Returns:
+            ReadTraceResult with traces, profiles, and system_metrics.
+        """
+        with log_block("distributed_setup"):
+            time_interval_ms = self.time_granularity * 1000.0
+            register_auto_thread_plugin()
+
+            directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
+
+            if not directory and not files:
+                raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
+
+        with log_block("cpp_indexer"):
+            index_path = index_path_for(trace_path)
+            indexer = Indexer(
+                directory=directory,
+                files=files,
+                index_dir=os.path.dirname(index_path),
+                require_checkpoint=True,
+                require_bloom=True,
+                require_manifest=True,
+                require_aggregation=AggregationConfig(
+                    time_interval_ms=time_interval_ms,
+                    compute_percentiles=False,
+                ),
+                force_rebuild=False,
+            )
+            status = indexer.ensure_indexed()
+
+            if status.total_files == 0:
+                self._file_hashes = pd.DataFrame(columns=["name"])
+                self._host_hashes = pd.DataFrame(columns=["name"])
+                self._string_hashes = pd.DataFrame(columns=["name"])
+                self._metadata = pd.DataFrame(columns=["name", "value"])
+                return ReadTraceResult(
+                    traces=dd.from_pandas(
+                        pd.DataFrame(columns=list(PROFILE_OUTPUT_COLUMNS.keys())),
+                        npartitions=1,
+                    ),
+                    profiles=None,
+                    profile_time_granularity=None,
+                    system_metrics=None,
+                )
+
+        with log_block("query_file_info"):
+            file_id_to_path, file_pids = indexer.query_file_info()
+            index_path = os.path.abspath(status.index_path)
+            indexer.close()
+
+        with log_block("dask_client_connect"):
+            try:
+                dask_client = client or get_client()
+            except ValueError:
+                dask_client = None
+
+            if dask_client is None:
+                return self.read_trace_local(trace_path)
+
+            worker_nthreads = dask_client.nthreads()
+            n_workers = len(worker_nthreads) or 1
+            worker_list = list(worker_nthreads.keys())
+
+        event_futures = []
+        worker_scan_args = []
+
+        with log_block("submit_workers"):
+            all_file_ids = set(file_id_to_path.keys())
+            full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
+            worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
+            for worker_id, fids in worker_file_ids.items():
+                wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
+                if not wfiles:
+                    continue
+                pids = set()
+                for fid in fids:
+                    if fid in file_pids:
+                        pids.update(file_pids[fid])
+                query = None
+                if pids:
+                    pid_conditions = " or ".join(f"pid == {pid}" for pid in sorted(pids))
+                    query = f"({pid_conditions})"
+                worker_addr = worker_list[worker_id % len(worker_list)] if worker_list else None
+                future = dask_client.submit(
+                    scan_to_ipc,
+                    wfiles,
+                    index_path,
+                    self.time_granularity,
+                    self.time_resolution,
+                    query,
+                    workers=[worker_addr] if worker_addr else None,
+                    pure=False,
+                )
+                event_futures.append(future)
+                worker_scan_args.append((worker_addr, wfiles, query))
+
+            self._worker_ipc_futures = event_futures
+            self._worker_scan_args = worker_scan_args
+            self._index_path = index_path
+            self._dask_client = dask_client
+            self._time_origin = distributed_time_origin(event_futures, dask_client)
+
+        with log_block("build_dask_dataframe"):
+            events_meta = pd.DataFrame(
+                {
+                    "cat": pd.Series(dtype="object"),
+                    COL_FUNC_NAME: pd.Series(dtype="object"),
+                    "pid": pd.Series(dtype="int64"),
+                    "tid": pd.Series(dtype="int64"),
+                    "file_hash": pd.Series(dtype="object"),
+                    "host_hash": pd.Series(dtype="object"),
+                    COL_FILE_NAME: pd.Series(dtype="object"),
+                    COL_HOST_NAME: pd.Series(dtype="object"),
+                    COL_PROC_NAME: pd.Series(dtype="object"),
+                    COL_IO_CAT: pd.Series(dtype="int64"),
+                    COL_ACC_PAT: pd.Series(dtype="int64"),
+                    COL_COUNT: pd.Series(dtype="int64"),
+                    COL_TIME: pd.Series(dtype="float64"),
+                    COL_SIZE: pd.Series(dtype="int64"),
+                    "time_min": pd.Series(dtype="float64"),
+                    "time_max": pd.Series(dtype="float64"),
+                    "size_min": pd.Series(dtype="int64"),
+                    "size_max": pd.Series(dtype="int64"),
+                    "offset_min": pd.Series(dtype="int64"),
+                    "offset_max": pd.Series(dtype="int64"),
+                    COL_TIME_RANGE: pd.Series(dtype="int64"),
+                    COL_TIME_START: pd.Series(dtype="int64"),
+                    COL_TIME_END: pd.Series(dtype="int64"),
+                }
+            )
+
+            def _extract_and_decode(ipc_future, key, meta):
+                ipc_bytes = ipc_future[key]
+                if ipc_bytes is None:
+                    return meta.iloc[:0].copy()
+                return ipc_to_pandas(ipc_bytes)
+
+            event_delayed = [
+                dask.delayed(_extract_and_decode)(dask.delayed(f), "events", events_meta) for f in event_futures
+            ]
+            traces = (
+                dd.from_delayed(event_delayed, meta=events_meta)
+                if event_delayed
+                else dd.from_pandas(events_meta, npartitions=1)
+            )
+
+            def _has_data(result_dict, key):
+                return result_dict[key] is not None
+
+            has_profiles_futures = [dask_client.submit(_has_data, f, "profiles", pure=False) for f in event_futures]
+            has_profiles = any(dask_client.gather(has_profiles_futures))
+
+            if has_profiles:
+                profile_delayed = [
+                    dask.delayed(_extract_and_decode)(dask.delayed(f), "profiles", events_meta) for f in event_futures
+                ]
+                profiles = dd.from_delayed(profile_delayed, meta=events_meta)
+                profile_window = int(self.profile_time_granularity * self.time_resolution)
+                profiles = profiles.map_partitions(
+                    coerce_profile_dtypes, PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
+                )
+            else:
+                profiles = None
+
+            has_system_futures = [dask_client.submit(_has_data, f, "system", pure=False) for f in event_futures]
+            has_system = any(dask_client.gather(has_system_futures))
+            if has_system:
+                system_frames = dask_client.gather(
+                    [
+                        dask_client.submit(
+                            lambda d: ipc_to_pandas(d["system"]) if d.get("system") else None, f, pure=False
+                        )
+                        for f in event_futures
+                    ]
+                )
+                system_frames = [f for f in system_frames if f is not None and not f.empty]
+                if system_frames:
+                    system_pd = pd.concat(system_frames, ignore_index=True)
+                    system_pd["ts"] = system_pd["time_bucket"].astype("int64")
+                    time_origin = int(system_pd["ts"].min())
+                    system_events = dd.from_pandas(system_pd, npartitions=1)
+                    system_metrics = self._standardize_system(system_events, time_origin=time_origin)
+                else:
+                    system_metrics = None
+            else:
+                system_metrics = None
+
+        self._file_hashes = pd.DataFrame(columns=["name"])
+        self._host_hashes = pd.DataFrame(columns=["name"])
+        self._string_hashes = pd.DataFrame(columns=["name"])
+        self._metadata = pd.DataFrame(columns=["name", "value"])
+
+        return ReadTraceResult(
+            traces=traces,
+            profiles=profiles,
+            profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
+            system_metrics=system_metrics,
+        )
+
+    def _postread_hlm_config(self, data_type):
+        """Postread transformations the distributed HLM must replicate."""
+        config: Dict[str, object] = {"posix_cat_rules": [list(rule) for rule in self.POSIX_CAT_RULES]}
+        if data_type == "events":
+            config["ignored_file_patterns"] = list(IGNORED_FILE_PATTERNS)
+            config["ignored_func_names"] = list(IGNORED_FUNC_NAMES)
+            config["ignored_func_patterns"] = list(IGNORED_FUNC_PATTERNS)
+            origin = getattr(self, "_time_origin", None)
+            if origin is not None:
+                config["time_origin"] = int(origin)
+                config["bucket_width_us"] = int(self.time_granularity * self.time_resolution)
+        return config
+
+    def _hlm(self, data_type, view_types, traces):
+        return distributed_hlm(
+            data_type,
+            view_types,
+            traces,
+            getattr(self, "_worker_ipc_futures", None),
+            getattr(self, "_worker_scan_args", []),
+            getattr(self, "_dask_client", None),
+            HLM_AGG,
+            HLM_EXTRA_COLS,
+            HLM_INT_INDEX_COLS,
+            HLM_FLOAT_METRIC_COLS,
+            self._postread_hlm_config(data_type),
+        )
+
+    def _compute_high_level_metrics(self, traces, view_types, partition_size):
+        result = self._hlm("events", view_types, traces)
+        if result is not None:
+            return result
+        return super()._compute_high_level_metrics(traces, view_types, partition_size)
+
+    def _compute_profile_hlm(self, profiles, view_types, partition_size):
+        result = self._hlm("profiles", view_types, profiles)
+        if result is not None:
+            return result
+        if profiles is None:
+            return None
+        return super()._compute_profile_hlm(profiles, view_types, partition_size)
+
+    def _compute_view(self, layer, records, view_key, view_type, view_types):
+        from .constants import VIEW_TYPES
+        import itertools as it
+
+        keep_object_cols = set(VIEW_TYPES) | set(view_types) | set(it.chain.from_iterable(self.logical_views.values()))
+        drop_cols = []
+        for col in records.columns:
+            dtype_str = str(records[col].dtype)
+            if dtype_str in ("string", "category"):
+                records[col] = records[col].astype("object")
+                dtype_str = "object"
+            if (
+                dtype_str == "object"
+                and col not in keep_object_cols
+                and not any(col.endswith(vt) for vt in keep_object_cols)
+            ):
+                drop_cols.append(col)
+        if drop_cols:
+            records = records.drop(columns=drop_cols, errors="ignore")
+
+        # Arrow-based view computation
+        view_types_diff = set(VIEW_TYPES).difference(view_types)
+        local_view_types = records.index._meta.names
+        local_view_types_diff = set(local_view_types).difference([view_type])
+
+        view_agg = {}
+        for col in records.columns:
+            if "_bin_" in col:
+                view_agg[col] = ["sum"]
+            elif any(map(col.endswith, view_types_diff)):
+                view_agg[col] = [unique_set_flatten()]
+            elif col in it.chain.from_iterable(self.logical_views.values()):
+                view_agg[col] = [unique_set_flatten()]
+            elif col.endswith("_sq"):
+                view_agg[col] = ["sum"]
+            elif col.endswith("_call_min"):
+                view_agg[col] = ["min"]
+            elif col.endswith("_call_max"):
+                view_agg[col] = ["max"]
+            elif pd.api.types.is_numeric_dtype(records[col].dtype):
+                view_agg[col] = ["sum", "min", "max", "mean", "std"]
+            else:
+                raise TypeError(f"Unsupported dtype '{records[col].dtype}' for column '{col}'")
+        view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+
+        # Decompose view_agg into tree-reducible partials. Each input column's
+        # aggregation list is split into per-partition chunks that later merge
+        # via Dask's tree-reduce (sum/min/max/set-union are all associative).
+        full_cols, sum_cols, min_cols, max_cols = [], [], [], []
+        set_cols_items = []
+        for col, aggs in view_agg.items():
+            if col not in records.columns:
+                continue
+            if all(isinstance(a, str) for a in aggs):
+                s = set(aggs)
+                if s == {"sum", "min", "max", "mean", "std"}:
+                    full_cols.append(col)
+                elif s == {"sum"}:
+                    sum_cols.append(col)
+                elif s == {"min"}:
+                    min_cols.append(col)
+                elif s == {"max"}:
+                    max_cols.append(col)
+                else:
+                    raise ValueError(f"unsupported agg combo for {col}: {aggs}")
+            else:
+                set_cols_items.append((col, aggs[0]))
+
+        std_cols = list(full_cols)
+        records = records.map_partitions(fix_std_cols, std_cols=std_cols)
+
+        partial_meta = build_partial_meta(records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items)
+        partials = records.map_partitions(
+            partial_arrow_view_groupby,
+            view_type,
+            full_cols,
+            sum_cols,
+            min_cols,
+            max_cols,
+            set_cols_items,
+            BetterSet.flatten,
+            meta=partial_meta,
+        )
+
+        merge_aggs = {}
+        for c in full_cols:
+            merge_aggs[f"{c}_sum"] = "sum"
+            merge_aggs[f"{c}_count"] = "sum"
+            merge_aggs[f"{c}_sumsq"] = "sum"
+            merge_aggs[f"{c}_min"] = "min"
+            merge_aggs[f"{c}_max"] = "max"
+        for c in sum_cols:
+            merge_aggs[f"{c}_sum"] = "sum"
+        for c in min_cols:
+            merge_aggs[f"{c}_min"] = "min"
+        for c in max_cols:
+            merge_aggs[f"{c}_max"] = "max"
+        for c, _ in set_cols_items:
+            merge_aggs[f"{c}_unique"] = unique_set_flatten()
+
+        merged = partials.groupby(view_type).agg(merge_aggs)
+
+        final_meta = build_final_meta(merged, full_cols)
+        final = merged.map_partitions(finalize_view_partials, full_cols, meta=final_meta)
+        final = final.rename(columns=build_view_rename_map(final.columns))
+        final = final.replace(0, pd.NA)
+        final = (
+            final.map_partitions(derive_call_stats)
+            .map_partitions(set_unique_counts, layer=layer)
+            .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
+            .map_partitions(coerce_arrow_numerics_to_pandas_native)
+            .persist()
+        )
+        return final
 
     def postread_trace(
         self,
         traces: dd.DataFrame,
         view_types: List[ViewType],
     ) -> dd.DataFrame:
-        with log_block("filter_files"):
-            traces = traces[
-                traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
-            ]
+        traces = traces.map_partitions(normalize_arrow_dtypes)
+        with log_block("filter_rows"):
+            traces = traces.map_partitions(
+                self._apply_ignore_filters,
+                IGNORED_FILE_PATTERNS,
+                IGNORED_FUNC_NAMES,
+                IGNORED_FUNC_PATTERNS,
+            )
 
         # Set epochs
         with log_block("assign_epochs"):
@@ -571,11 +769,6 @@ class DFTracerAnalyzer(Analyzer):
                 epochs_with_index["epoch"] = epochs_with_index.groupby("pid").cumcount() + 1
                 epoch_boundaries = epochs_with_index[["pid", "time_start", "time_end", "epoch"]]
                 traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
-
-        # Ignore redundant function calls
-        with log_block("filter_functions"):
-            traces = traces[~traces[COL_FUNC_NAME].isin(IGNORED_FUNC_NAMES)]
-            traces = traces[~traces[COL_FUNC_NAME].str.contains("|".join(IGNORED_FUNC_PATTERNS))]
 
         with log_block("wait"):
             _ = wait(traces)
@@ -625,8 +818,12 @@ class DFTracerAnalyzer(Analyzer):
             return "epoch"
         return super().get_time_boundary_layer()
 
+    def get_total_event_count(self, traces: dd.DataFrame) -> int:
+        return traces[COL_COUNT].sum().persist()
+
     def get_unique_file_count(self, traces: dd.DataFrame):
-        return traces["file_hash"].nunique()
+        file_hash = traces["file_hash"]
+        return file_hash[file_hash != ""].nunique()
 
     def get_unique_host_count(self, traces: dd.DataFrame):
         return traces["host_hash"].nunique()
@@ -635,86 +832,26 @@ class DFTracerAnalyzer(Analyzer):
         return traces["pid"].nunique()
 
     @staticmethod
-    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
-        df["epoch"] = pd.NA
-
-        # Iterate over each epoch boundary to find matching events
-        for _, epoch_boundary in epoch_boundaries.iterrows():
-            pid = epoch_boundary["pid"]
-            start = epoch_boundary["time_start"]
-            end = epoch_boundary["time_end"]
-
-            # Find rows in the partition that match the pid and fall within the time interval
-            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
-
-            # Assign the epoch number to the matching rows
-            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
-
+    def _apply_ignore_filters(df, ignored_file_patterns, ignored_func_names, ignored_func_patterns):
+        """Drop ignored files/functions"""
+        if ignored_file_patterns and COL_FILE_NAME in df.columns:
+            keep = df[COL_FILE_NAME].isna() | ~df[COL_FILE_NAME].str.contains("|".join(ignored_file_patterns))
+            df = df[keep]
+        if COL_FUNC_NAME in df.columns:
+            if ignored_func_names:
+                df = df[~df[COL_FUNC_NAME].isin(ignored_func_names)]
+            if ignored_func_patterns:
+                df = df[~df[COL_FUNC_NAME].str.contains("|".join(ignored_func_patterns))]
         return df
 
-    @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
-        base_condition = (df["cat"].str.contains("posix|stdio")) & (~df["file_name"].isna())
-
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        # Step 2: Map filesystem suffixes
-        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
-
-        for path, suffix in filesystem_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        return df
-
-    @staticmethod
-    def _sanitize_size_offset(df: pd.DataFrame):
-        df["size"] = df["size"].replace(0, np.nan)
-        if "offset" in df.columns:
-            df["offset"] = df["offset"].replace(0, np.nan)
-        return df
-
-    @staticmethod
-    def _set_epochs(df: pd.DataFrame, epoch_boundaries: pd.DataFrame):
-        df["epoch"] = pd.NA
-
-        # Iterate over each epoch boundary to find matching events
-        for _, epoch_boundary in epoch_boundaries.iterrows():
-            pid = epoch_boundary["pid"]
-            start = epoch_boundary["time_start"]
-            end = epoch_boundary["time_end"]
-
-            # Find rows in the partition that match the pid and fall within the time interval
-            mask = (df["pid"] == pid) & (df["time_start"] >= start) & (df["time_start"] < end)
-
-            # Assign the epoch number to the matching rows
-            df.loc[mask, "epoch"] = epoch_boundary["epoch"]
-
-        return df
-
-    @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
+    @classmethod
+    def _fix_file_posix_category(cls, df: pd.DataFrame):
+        # base condition is fixed on the original cat; suffixes (purpose then
+        # filesystem) are applied cumulatively per POSIX_CAT_RULES order.
         base_condition = df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna()
-
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
+        for path, suffix in cls.POSIX_CAT_RULES:
             mask = base_condition & df["file_name"].str.contains(path)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
-        # Step 2: Map filesystem suffixes
-        filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
-
-        for path, suffix in filesystem_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
-            df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
-
         return df
 
     def _fix_time(self, traces: dd.DataFrame, time_origin: Optional[int] = None) -> dd.DataFrame:
@@ -819,9 +956,9 @@ class DFTracerAnalyzer(Analyzer):
         profile_df["offset_max"] = df["offset_max"].where(df["offset_max"].notna(), df["offset"]).astype("Int64")
         profile_df[COL_TIME_START] = (df["ts"] - time_origin).astype("Int64")
         profile_df[COL_TIME_END] = profile_df[COL_TIME_START] + int(profile_time_granularity * time_resolution)
-        profile_df[COL_TIME_RANGE] = (
-            profile_df[COL_TIME_START] // int(time_granularity * time_resolution)
-        ).astype("Int64")
+        profile_df[COL_TIME_RANGE] = (profile_df[COL_TIME_START] // int(time_granularity * time_resolution)).astype(
+            "Int64"
+        )
         return profile_df[list(PROFILE_OUTPUT_COLUMNS)]
 
     @staticmethod
@@ -847,10 +984,12 @@ class DFTracerAnalyzer(Analyzer):
         cpu_agg = pd.DataFrame()
         if not agg_cpu.empty:
             agg_dict = {}
-            for m, out in [("iowait_pct", "sys_cpu_iowait_pct"),
-                           ("user_pct", "sys_cpu_user_pct"),
-                           ("system_pct", "sys_cpu_system_pct"),
-                           ("idle_pct", "sys_cpu_idle_pct")]:
+            for m, out in [
+                ("iowait_pct", "sys_cpu_iowait_pct"),
+                ("user_pct", "sys_cpu_user_pct"),
+                ("system_pct", "sys_cpu_system_pct"),
+                ("idle_pct", "sys_cpu_idle_pct"),
+            ]:
                 if m in agg_cpu.columns:
                     agg_dict[out] = (m, "mean")
             if agg_dict:
@@ -860,19 +999,25 @@ class DFTracerAnalyzer(Analyzer):
         per_core = df[df["name"].str.startswith("cpu-")]
         core_agg = pd.DataFrame()
         if not per_core.empty and "iowait_pct" in per_core.columns:
-            core_agg = per_core.groupby(group_keys).agg(
-                sys_core_iowait_pct_max=("iowait_pct", "max"),
-                sys_core_iowait_pct_p95=("iowait_pct", lambda x: x.quantile(0.95)),
-            ).reset_index()
+            core_agg = (
+                per_core.groupby(group_keys)
+                .agg(
+                    sys_core_iowait_pct_max=("iowait_pct", "max"),
+                    sys_core_iowait_pct_p95=("iowait_pct", lambda x: x.quantile(0.95)),
+                )
+                .reset_index()
+            )
 
         # Memory (name == "memory"): mean of samples per bucket
         mem = df[df["name"] == "memory"]
         mem_agg = pd.DataFrame()
         if not mem.empty:
             mem_dict = {}
-            for m, out in [("Dirty", "sys_mem_dirty"),
-                           ("Cached", "sys_mem_cached"),
-                           ("MemAvailable", "sys_mem_available")]:
+            for m, out in [
+                ("Dirty", "sys_mem_dirty"),
+                ("Cached", "sys_mem_cached"),
+                ("MemAvailable", "sys_mem_available"),
+            ]:
                 if m in mem.columns:
                     mem_dict[out] = (m, "mean")
             if mem_dict:
@@ -1005,9 +1150,13 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _set_proc_names(df: pd.DataFrame):
-        host_component = df[COL_HOST_NAME] if COL_HOST_NAME in df.columns else pd.Series(pd.NA, index=df.index)
+        if COL_PROC_NAME in df.columns and df[COL_PROC_NAME].notna().any():
+            return df
+        host_component = (
+            df[COL_HOST_NAME].astype(str) if COL_HOST_NAME in df.columns else pd.Series(pd.NA, index=df.index)
+        )
         if "host_hash" in df.columns:
-            host_component = host_component.fillna(df["host_hash"])
+            host_component = host_component.fillna(df["host_hash"].astype(str))
         df[COL_PROC_NAME] = (
             "app#"
             + host_component.fillna("unknown").astype(str)

@@ -1,3 +1,4 @@
+import gzip
 import json
 import pytest
 from dask.distributed import Client, LocalCluster
@@ -7,6 +8,22 @@ from dftracer.analyzer.config import AnalyzerPresetConfigDLIOAILogging, Analyzer
 from dftracer.analyzer.dftracer import DFTracerAnalyzer
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
+
+
+def _write_trace_lines(path, lines):
+    """Write trace as gzipped JSONL (.pfw.gz). Stray JSON-array brackets ('[',
+    ']') from legacy-style fixtures are skipped since the indexer expects
+    one JSON value per line."""
+    with gzip.open(str(path), "wt", encoding="utf-8") as f:
+        for line in lines:
+            if line in ("[", "]"):
+                continue
+            f.write(line + "\n")
+
+
+def _write_trace(path, events):
+    """Write a list of event dicts as a gzipped JSONL trace (.pfw.gz)."""
+    _write_trace_lines(path, [json.dumps(e) for e in events])
 
 
 TRACE_CONTENT = [
@@ -245,22 +262,22 @@ def dask_client():
 
 @pytest.fixture
 def hybrid_trace_path(tmp_path):
-    trace_path = tmp_path / "hybrid.pfw"
-    trace_path.write_text("\n".join(TRACE_CONTENT) + "\n", encoding="utf-8")
+    trace_path = tmp_path / "hybrid.pfw.gz"
+    _write_trace_lines(trace_path, TRACE_CONTENT)
     return trace_path
 
 
 @pytest.fixture
 def full_hybrid_trace_path(tmp_path):
-    trace_path = tmp_path / "full-hybrid.pfw"
-    trace_path.write_text("\n".join(FULL_TRACE_CONTENT) + "\n", encoding="utf-8")
+    trace_path = tmp_path / "full-hybrid.pfw.gz"
+    _write_trace_lines(trace_path, FULL_TRACE_CONTENT)
     return trace_path
 
 
 @pytest.fixture
 def no_host_metadata_trace_path(tmp_path):
-    trace_path = tmp_path / "no-host-hybrid.pfw"
-    trace_path.write_text("\n".join(TRACE_NO_HOST_METADATA_CONTENT) + "\n", encoding="utf-8")
+    trace_path = tmp_path / "no-host-hybrid.pfw.gz"
+    _write_trace_lines(trace_path, TRACE_NO_HOST_METADATA_CONTENT)
     return trace_path
 
 
@@ -301,9 +318,11 @@ def test_read_trace_standardizes_profiles_and_aligns_to_5s_grid(dask_client, hyb
     assert profile["count"] == 3
     assert profile["time"] == pytest.approx(0.0003)
     assert profile["size"] is None or str(profile["size"]) == "<NA>"
-    assert profile["time_start"] == 5_000_000
-    assert profile["time_end"] == 10_000_000
-    assert profile["time_range"] == 1
+    # time_range is relative to the trace origin (first populated bucket):
+    # the read event and the profile both fall in bucket 0.
+    assert profile["time_start"] == 0
+    assert profile["time_end"] == 5_000_000
+    assert profile["time_range"] == 0
     assert profile["time_start"] % 5_000_000 == 0
 
 
@@ -472,8 +491,8 @@ def test_analyze_trace_expands_profiles_with_weighted_distribution(dask_client, 
         }),
         "]",
     ]
-    trace_path = tmp_path / "weighted.pfw"
-    trace_path.write_text("\n".join(trace_content) + "\n", encoding="utf-8")
+    trace_path = tmp_path / "weighted.pfw.gz"
+    _write_trace_lines(trace_path, trace_content)
 
     analyzer = DFTracerAnalyzer(
         preset=OmegaConf.structured(AnalyzerPresetConfigPOSIX()),
@@ -542,9 +561,6 @@ def test_analyze_trace_accepts_finer_aligned_granularity(dask_client, hybrid_tra
 # Edge-case data fixtures
 # ---------------------------------------------------------------------------
 
-def _make_trace(events):
-    """Build a pfw trace string from a list of event dicts."""
-    return "\n".join(["["] + [json.dumps(e) for e in events] + ["]"]) + "\n"
 
 
 METADATA_EVENTS = [
@@ -565,8 +581,8 @@ def test_read_trace_handles_dur_field_without_dur_sum(dask_client, tmp_path):
          "ph": "C", "ts": 5000000,
          "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 1, "dur": 150}},
     ]
-    path = tmp_path / "dur-only.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "dur-only.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     profiles = analyzer.read_trace(
@@ -601,8 +617,8 @@ def test_read_trace_handles_profile_without_fhash(dask_client, tmp_path):
          "ph": "C", "ts": 5000000,
          "args": {"hhash": "h1", "dft_cnt": 5, "dur_sum": 4000000}},
     ]
-    path = tmp_path / "no-fhash.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "no-fhash.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     profiles = analyzer.read_trace(
@@ -634,8 +650,8 @@ def test_read_trace_preserves_stat_columns_from_aggregation_fields(dask_client, 
              "offset_sum": 100000, "offset_min": 0, "offset_max": 50000,
          }},
     ]
-    path = tmp_path / "full-agg.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "full-agg.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     profiles = analyzer.read_trace(
@@ -664,8 +680,8 @@ def test_read_trace_returns_none_profiles_when_no_counter_events(dask_client, tm
          "ph": "X", "ts": 5000100, "dur": 200,
          "args": {"hhash": "h1", "fhash": "f1", "ret": 4096, "offset": 0}},
     ]
-    path = tmp_path / "no-profiles.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "no-profiles.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     result = analyzer.read_trace(
@@ -697,8 +713,8 @@ def test_read_trace_handles_multiple_profile_buckets(dask_client, tmp_path):
          "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 2, "dur_sum": 800,
                   "ret_sum": 8192, "ret_min": 4096, "ret_max": 4096}},
     ]
-    path = tmp_path / "multi-bucket.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "multi-bucket.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     profiles = analyzer.read_trace(
@@ -733,8 +749,8 @@ def test_coalesce_takes_min_of_mins_and_max_of_maxes(dask_client, tmp_path):
          "args": {"hhash": "h1", "dft_cnt": 3, "dur_sum": 900000,
                   "dur_min": 100000, "dur_max": 500000}},
     ]
-    path = tmp_path / "coalesce-minmax.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "coalesce-minmax.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(
         tmp_path=tmp_path, time_granularity=5,
         preset=AnalyzerPresetConfigDLIOAILogging(),
@@ -770,8 +786,8 @@ def test_expansion_preserves_stat_columns_across_sub_buckets(dask_client, tmp_pa
              "offset_min": 0, "offset_max": 50000,
          }},
     ]
-    path = tmp_path / "expand-stats.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "expand-stats.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=1)
 
     result = analyzer.analyze_trace(
@@ -821,8 +837,8 @@ def test_analyze_trace_non_posix_profiles_map_to_correct_layers(dask_client, tmp
          "ph": "C", "ts": 5000000,
          "args": {"hhash": "h1", "dft_cnt": 3, "dur_sum": 1500000}},
     ]
-    path = tmp_path / "non-posix.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "non-posix.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(
         tmp_path=tmp_path, time_granularity=5,
         preset=AnalyzerPresetConfigDLIOAILogging(),
@@ -861,8 +877,8 @@ def test_analyze_trace_works_with_profile_only_input(dask_client, tmp_path):
          "ph": "C", "ts": 5000000,
          "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 5, "dur_sum": 1000}},
     ]
-    path = tmp_path / "profile-only.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "profile-only.pfw.gz"
+    _write_trace(path, events)
     analyzer = make_analyzer(tmp_path=tmp_path, time_granularity=5)
 
     result = analyzer.analyze_trace(
@@ -904,8 +920,8 @@ def test_custom_profile_time_granularity_from_config(dask_client, tmp_path):
          "args": {"hhash": "h1", "fhash": "f1", "dft_cnt": 2, "dur_sum": 400,
                   "ret_sum": 8192, "ret_min": 4096, "ret_max": 4096}},
     ]
-    path = tmp_path / "custom-ptg.pfw"
-    path.write_text(_make_trace(events), encoding="utf-8")
+    path = tmp_path / "custom-ptg.pfw.gz"
+    _write_trace(path, events)
     analyzer = DFTracerAnalyzer(
         preset=OmegaConf.structured(AnalyzerPresetConfigPOSIX()),
         checkpoint=False,
