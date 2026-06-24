@@ -11,6 +11,8 @@ py.install_sources(
         'constants.py',
         'darshan.py',
         'dftracer.py',
+        'fact_engine.py',
+        'fact_rules.py',
         'metrics.py',
         'output.py',
         'recorder.py',
