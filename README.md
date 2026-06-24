@@ -116,6 +116,71 @@ DFAnalyzer also provides a detailed breakdown of performance metrics for each la
 └────────────────────────┴──────────────────┴─────────────────┴─────────────┴──────────────────────┴───────────────────┘
 ```
 
+## Analysis facts (DFDiagnoser integration)
+
+Beyond the human-readable summary, DFAnalyzer can emit **analysis facts** — compact,
+machine-readable bottleneck signals (`analyzer.fact-envelope.v1`) that
+[DFDiagnoser](https://github.com/LLNL/dfdiagnoser) turns into longitudinal findings
+and [DFOptimizer](https://github.com/LLNL/dfoptimizer) turns into tuning actions. Facts
+are **opt-in** and additive: with `facts.enabled=false` (the default) the analysis
+output is unchanged.
+
+A fact is produced per view per analysis window by either builder:
+
+- **rule** (`facts.eval_mode=rule`) — YAML conditions over view metrics
+  (`facts.eval_rule_file=<rules.yaml>`), e.g. *fetch time dominates compute*.
+- **metric** (`facts.eval_mode=metric`) — WISIO-style slope detection: an entity whose
+  share of time is disproportionate to its share of operations.
+
+Each fact carries a continuous `severity` in [0,1], a two-level `scope`
+(`layer:view` aggregate or `layer:view:entity` detail), and `opportunity_tags`.
+
+### Producing facts to a bundle (offline)
+
+`output=file` writes the deliverable bundle — `facts.jsonl` (one envelope per window),
+`detail_view_*.parquet`, and `raw_stats.json` — that `dfdiagnoser input=file` consumes:
+
+```bash
+dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+    view_types=[time_range] \
+    facts.enabled=true facts.eval_mode=rule \
+    facts.eval_rule_file=python/dftracer/analyzer/configs/fact_rules/dlio.yaml \
+    output=file output.path=/tmp/bundle
+```
+
+```text
+[info ] file_output.facts   path=/tmp/bundle/facts.jsonl
+$ ls /tmp/bundle
+facts.jsonl  detail_view_proc_name.parquet  detail_view_time_range.parquet  raw_stats.json
+```
+
+### Full offline chain (analyzer → diagnoser → optimizer)
+
+```bash
+# 1. analyze -> fact bundle
+dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+    view_types=[time_range] facts.enabled=true output=file output.path=/tmp/bundle
+
+# 2. diagnose -> longitudinal findings
+dfdiagnoser input=file input.path=/tmp/bundle output=console
+
+# 3. optimize -> ActionPlans (offline replay of the findings)
+python -m dfoptimizer --transport file --findings-file findings.jsonl
+```
+
+The temporal axis for longitudinal facts is `time_range` offline (or `window` when
+streaming over ZMQ/Mofka). Spatial views (`file_name`/`proc_name`) yield one-shot facts.
+
+### Facts configuration
+
+| key | default | meaning |
+|---|---|---|
+| `facts.enabled` | `false` | master switch; off = analysis output unchanged |
+| `facts.eval_mode` | `rule` | `rule` (YAML conditions) or `metric` (slope) |
+| `facts.eval_rule_file` | `""` | rule YAML (when `eval_mode=rule`) |
+| `facts.emit_mode` | `aggregate` | `aggregate` (per-view rollup) or `detail` (per-entity) |
+| `facts.emit_flat_views` | `true` | also write the detail views into the bundle |
+
 ## Further Information
 
 For more details, to report issues, or to contribute to DFAnalyzer, please refer to the following resources:
