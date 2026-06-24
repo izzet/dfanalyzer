@@ -47,20 +47,34 @@ def main(cfg: Config) -> None:
             verbose=cfg.verbose,
         )
 
-    # Analyze trace
-    result = analyzer.analyze_trace(
-        exclude_characteristics=cfg.exclude_characteristics,
-        logical_view_types=cfg.logical_view_types,
-        metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
-        trace_path=cfg.trace_path,
-        unoverlapped_posix_only=cfg.unoverlapped_posix_only,
-        view_types=cfg.view_types,
-    )
+    output: OutputType = instantiate(cfg.output)
 
-    # Handle result
-    with console_block("Output"):
-        output: OutputType = instantiate(cfg.output)
-        output.handle_result(result=result)
+    if cfg.stream_address:
+        # Streaming (window axis): consume a live chrome-event stream over ZMQ and
+        # emit per-window facts as each window completes (output handles each result).
+        with console_block("Streaming"):
+            analyzer.analyze_zmq(
+                address=cfg.stream_address,
+                view_types=cfg.view_types,
+                output_handler=lambda result: output.handle_result(result=result),
+                logical_view_types=cfg.logical_view_types,
+                metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
+                idle_timeout_sec=cfg.stream_idle_timeout,
+            )
+        if hasattr(output, "close"):
+            output.close()
+    else:
+        # Analyze trace (batch)
+        result = analyzer.analyze_trace(
+            exclude_characteristics=cfg.exclude_characteristics,
+            logical_view_types=cfg.logical_view_types,
+            metric_boundaries=OmegaConf.to_object(cfg.metric_boundaries),
+            trace_path=cfg.trace_path,
+            unoverlapped_posix_only=cfg.unoverlapped_posix_only,
+            view_types=cfg.view_types,
+        )
+        with console_block("Output"):
+            output.handle_result(result=result)
 
     # Teardown cluster
     with console_block("Cluster teardown"):

@@ -488,6 +488,10 @@ class Config:
     verbose: Optional[bool] = False
     view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
     unoverlapped_posix_only: Optional[bool] = False
+    # Streaming (window axis): if stream_address is set, consume a live chrome-event
+    # stream over ZMQ (analyze_zmq) instead of reading trace_path.
+    stream_address: str = ""
+    stream_idle_timeout: float = 0.0
 
 
 def init_hydra_config_store() -> ConfigStore:
