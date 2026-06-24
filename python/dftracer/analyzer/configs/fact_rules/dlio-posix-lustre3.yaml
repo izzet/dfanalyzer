@@ -2,7 +2,7 @@ schema_version: analysisfact-rules.v1
 
 # POSIX-only rules for Lustre (lustre3 on Corona).
 # Uses ONLY POSIX-level metrics — no app/framework metrics (compute_time,
-# fetch_iter_time, etc.). Targets the same knobs as app/cross-layer rules.
+# fetch_data_time, etc.). Targets the same knobs as app/cross-layer rules.
 #
 # IOR baseline on Corona lustre3 (O_DIRECT, single process):
 #   Sequential 1MB read:  455 MiB/s  (477 MB/s)
