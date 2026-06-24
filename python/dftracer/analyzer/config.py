@@ -405,6 +405,12 @@ class SQLiteOutputConfig(OutputConfig):
 
 
 @dc.dataclass
+class FileOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.FileOutput"
+    path: str = ""
+
+
+@dc.dataclass
 class CustomJobConfig(JobConf):
     name: str = "dftracer.analyzer"
 
@@ -497,4 +503,5 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="output", name="json", node=JSONOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
+    cs.store(group="output", name="file", node=FileOutputConfig)
     return cs

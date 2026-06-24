@@ -6,11 +6,14 @@ import inflect
 import json
 import numpy as np
 import pandas as pd
+import structlog
 from hydra.core.hydra_config import HydraConfig
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from typing import Dict, List, Optional
+
+logger = structlog.get_logger()
 
 from .constants import COL_PROC_NAME, HUMANIZED_LAYERS, GiB, Layer, MiB
 from .types import (
@@ -484,3 +487,58 @@ class SQLiteOutput(Output):
 
     def handle_result(self, result: AnalysisResult):
         raise NotImplementedError("SQLiteOutput is not implemented yet.")
+
+
+class FileOutput(Output):
+    """output=file: write the offline deliverable bundle to ``path``.
+
+    Writes facts.jsonl (analysis facts, one envelope per call -> per window in
+    streaming), detail_view_*.parquet (the per-entity views), and raw_stats.json.
+    Consumed by ``dfdiagnoser input=file``. Distinct from the checkpoint, which
+    only caches hlm/main_view/raw_stats for recompute.
+    """
+
+    def __init__(self, path: str = "", compact: bool = False, name: str = "",
+                 root_only: bool = False, view_names: List[str] = []):
+        super().__init__(compact, name, root_only, view_names)
+        self.path = path
+        self._facts_started = False
+
+    def _resolve_dir(self) -> Path:
+        if self.path:
+            return Path(self.path)
+        try:
+            return Path(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            return Path(".")
+
+    def handle_result(self, result: AnalysisResult):
+        out_dir = self._resolve_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # facts.jsonl — one fact envelope per call (per window in streaming);
+        # truncate on the first write of this run, append thereafter.
+        if result.analysis_facts:
+            facts_path = out_dir / "facts.jsonl"
+            with facts_path.open("w" if not self._facts_started else "a", encoding="utf-8") as fh:
+                fh.write(result.to_fact_envelope().to_json())
+                fh.write("\n")
+            self._facts_started = True
+            logger.info("file_output.facts", path=str(facts_path))
+
+        # detail_view_*.parquet — the per-entity views
+        for view_key, flat_view in result.flat_views.items():
+            view_path = out_dir / f"detail_view_{'_'.join(view_key)}.parquet"
+            try:
+                flat_view.to_parquet(view_path)
+            except Exception:
+                logger.warning("file_output.detail_view_failed", view_key=list(view_key), exc_info=True)
+
+        # raw_stats.json — run context
+        try:
+            raw_stats = self._compute_raw_stats(result)
+            stats_dict = dc.asdict(raw_stats) if dc.is_dataclass(raw_stats) else dict(raw_stats)
+            with (out_dir / "raw_stats.json").open("w", encoding="utf-8") as fh:
+                json.dump(stats_dict, fh, indent=2, default=str)
+        except Exception:
+            logger.warning("file_output.raw_stats_failed", exc_info=True)
