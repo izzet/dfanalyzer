@@ -14,9 +14,22 @@ py.install_sources(
         'metrics.py',
         'output.py',
         'recorder.py',
+        'scoring.py',
         'types.py',
     ],
     subdir: 'dftracer/analyzer',
+)
+
+install_data(
+    'configs/fact_rules/dlio.yaml',
+    'configs/fact_rules/dlio-global.yaml',
+    'configs/fact_rules/stormer.yaml',
+    install_dir: py.get_install_dir(subdir: 'dftracer/analyzer/configs/fact_rules'),
+)
+
+install_data(
+    'configs/schemas/analyzer.fact-envelope.v1.schema.json',
+    install_dir: py.get_install_dir(subdir: 'dftracer/analyzer/configs/schemas'),
 )
 
 subdir('utils')

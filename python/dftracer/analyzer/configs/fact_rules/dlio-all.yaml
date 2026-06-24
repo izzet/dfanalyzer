@@ -1,0 +1,194 @@
+schema_version: analysisfact-rules.v1
+
+# Cross-layer (multi-domain) rules: uses BOTH app-level and POSIX-level
+# metrics. This is a copy of dlio.yaml used as the "full LiveIO" config
+# in the layers ablation experiment.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: detail
+  confidence: "0.80"
+
+rules:
+  - id: dlio.fetch_pressure.v1
+    priority: 100
+    source_view: epoch
+    fact_type: fetch_pressure
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+    when: "fetch_frac >= 0.20 and compute_frac < 0.85"
+    severity_score: "clip01((fetch_frac - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_frac - 0.20))"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
+  - id: dlio.open_pressure.v1
+    priority: 98
+    source_view: epoch
+    fact_type: open_pressure
+    required_metrics:
+      - reader_open_time_proc_max
+      - compute_time_proc_max
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      reader_open_ratio: "fillna0(reader_open_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
+    when: "reader_open_ratio > 1.05 and compute_frac < 0.85"
+    severity_score: "clip01((reader_open_ratio - 1.0) / 0.50)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_open_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: dlio.read_pressure.v1
+    priority: 97
+    source_view: epoch
+    fact_type: read_pressure
+    required_metrics:
+      - reader_posix_time_proc_max
+      - compute_time_proc_max
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      reader_posix_ratio: "fillna0(reader_posix_time_proc_max) / max(fillna0(compute_time_proc_max), 1e-9)"
+      reader_open_guard: "fillna0(reader_open_time_proc_max)"
+    when: "reader_posix_ratio > 1.5 and reader_open_guard == 0 and compute_frac < 0.85"
+    severity_score: "clip01((reader_posix_ratio - 1.0) / 2.0)"
+    confidence: "clip01(0.70 + 0.20 * min(reader_posix_ratio - 1.0, 1.0))"
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: dlio.compute_dominance.v1
+    priority: 200
+    source_view: epoch
+    fact_type: compute_dominance
+    required_metrics:
+      - compute_time_proc_max
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+    when: "compute_frac >= 0.90 and fetch_frac <= 0.10"
+    severity_score: "clip01((compute_frac - 0.85) / 0.20)"
+    confidence: "clip01(0.70 + 0.25 * compute_frac)"
+    opportunity_tags:
+      - none
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  - id: dlio.io_contention.v1
+    priority: 95
+    source_view: epoch
+    fact_type: io_contention
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+      - data_loader_proc_name_nunique
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(active_time, 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      workers: "fillna0(data_loader_proc_name_nunique)"
+    when: "compute_frac >= 0.70 and fetch_frac < 0.15 and workers > 2"
+    severity_score: "clip01((compute_frac - 0.60) / 0.30)"
+    confidence: "clip01(0.70 + 0.20 * compute_frac)"
+    opportunity_tags:
+      - reader_contention
+
+  - id: dlio.reader_posix.small_read_dominance.v1
+    priority: 89
+    source_view: epoch
+    fact_type: small_read_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_time_proc_frac_parent
+      - reader_posix_read_size_proc_mean
+    when: "reader_posix_read_time_proc_frac_parent > 0.50 and reader_posix_read_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_read_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_read_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_read_size_proc_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.reader_posix.small_write_dominance.v1
+    priority: 88
+    source_view: epoch
+    fact_type: small_write_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_write_time_proc_frac_parent
+      - reader_posix_write_size_proc_mean
+    when: "reader_posix_write_time_proc_frac_parent > 0.50 and reader_posix_write_size_proc_mean < 1048576"
+    severity_score: "clip01(0.5 * ((reader_posix_write_time_proc_frac_parent - 0.50) / 0.50) + 0.5 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
+    confidence: "clip01(0.75 + 0.10 * reader_posix_write_time_proc_frac_parent + 0.10 * ((1048576 - reader_posix_write_size_proc_mean) / 1048576))"
+    opportunity_tags:
+      - small_io_reduction
+
+  - id: dlio.reader_posix.metadata_dominance.v1
+    priority: 87
+    source_view: epoch
+    fact_type: metadata_dominance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_metadata_time_proc_frac_parent
+    when: "reader_posix_metadata_time_proc_frac_parent > 0.50"
+    severity_score: "clip01((reader_posix_metadata_time_proc_frac_parent - 0.50) / 0.50)"
+    confidence: "clip01(0.75 + 0.20 * reader_posix_metadata_time_proc_frac_parent)"
+    opportunity_tags:
+      - metadata_reduction
+
+  - id: dlio.reader_posix.operation_imbalance.v1
+    priority: 86
+    source_view: epoch
+    fact_type: operation_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_count_sum
+      - reader_posix_write_count_sum
+    derived_metrics:
+      reader_posix_operation_imbalance_ratio: "abs(fillna0(reader_posix_read_count_sum) - fillna0(reader_posix_write_count_sum)) / max(min(fillna0(reader_posix_read_count_sum), fillna0(reader_posix_write_count_sum)), 1e-9)"
+    when: "reader_posix_operation_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_operation_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_operation_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: dlio.reader_posix.size_imbalance.v1
+    priority: 85
+    source_view: epoch
+    fact_type: size_imbalance
+    scope_layer: reader_posix
+    required_metrics:
+      - reader_posix_read_size_sum
+      - reader_posix_write_size_sum
+    derived_metrics:
+      reader_posix_size_imbalance_ratio: "abs(fillna0(reader_posix_read_size_sum) - fillna0(reader_posix_write_size_sum)) / max(min(fillna0(reader_posix_read_size_sum), fillna0(reader_posix_write_size_sum)), 1e-9)"
+    when: "reader_posix_size_imbalance_ratio > 0.10"
+    severity_score: "clip01((reader_posix_size_imbalance_ratio - 0.10) / 0.90)"
+    confidence: "clip01(0.70 + 0.10 * reader_posix_size_imbalance_ratio)"
+    opportunity_tags:
+      - read_write_rebalancing
+
+  - id: dlio.fetch_rank_imbalance.v1
+    priority: 120
+    source_view: proc_name
+    emit_mode: aggregate
+    fact_type: fetch_rank_imbalance
+    required_metrics:
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      fetch_rank_ratio: "max(fetch_iter_time_proc_max) / max(min(fetch_iter_time_proc_max), 1e-9)"
+    when: "fetch_rank_ratio >= 1.5"
+    severity_score: "clip01((fetch_rank_ratio - 1.0) / 2.5)"
+    confidence: "clip01(0.70 + 0.20 * (fetch_rank_ratio - 1.0))"
+    opportunity_tags:
+      - rank_balance
+      - shard_repartition

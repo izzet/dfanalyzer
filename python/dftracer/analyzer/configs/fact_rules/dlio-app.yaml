@@ -1,0 +1,84 @@
+schema_version: analysisfact-rules.v1
+
+# App-only rules: uses ONLY framework/application-level metrics.
+# No POSIX-level metrics (reader_posix_*, reader_open_*).
+# Used in the layers ablation to show what app-only analysis can achieve.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: detail
+  confidence: "0.80"
+
+rules:
+  - id: app.fetch_pressure.v1
+    priority: 100
+    source_view: epoch
+    fact_type: fetch_pressure
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+    when: "fetch_frac >= 0.20 and compute_frac < 0.85"
+    severity_score: "clip01((fetch_frac - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(fetch_frac - 0.20))"
+    opportunity_tags:
+      - dataloader_prefetch
+      - reader_parallelism
+
+  - id: app.compute_dominance.v1
+    priority: 200
+    source_view: epoch
+    fact_type: compute_dominance
+    required_metrics:
+      - compute_time_proc_max
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
+    when: "compute_frac >= 0.90 and fetch_frac <= 0.10"
+    severity_score: "clip01((compute_frac - 0.85) / 0.20)"
+    confidence: "clip01(0.70 + 0.25 * compute_frac)"
+    opportunity_tags:
+      - none
+    suppresses_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+
+  - id: app.io_contention.v1
+    priority: 95
+    source_view: epoch
+    fact_type: io_contention
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+      - data_loader_proc_name_nunique
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(active_time, 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+      workers: "fillna0(data_loader_proc_name_nunique)"
+    when: "compute_frac >= 0.70 and fetch_frac < 0.15 and workers > 2"
+    severity_score: "clip01((compute_frac - 0.60) / 0.30)"
+    confidence: "clip01(0.70 + 0.20 * compute_frac)"
+    opportunity_tags:
+      - reader_contention
+
+  - id: app.fetch_rank_imbalance.v1
+    priority: 120
+    source_view: proc_name
+    emit_mode: aggregate
+    fact_type: fetch_rank_imbalance
+    required_metrics:
+      - fetch_iter_time_proc_max
+    derived_metrics:
+      fetch_rank_ratio: "max(fetch_iter_time_proc_max) / max(min(fetch_iter_time_proc_max), 1e-9)"
+    when: "fetch_rank_ratio >= 1.5"
+    severity_score: "clip01((fetch_rank_ratio - 1.0) / 2.5)"
+    confidence: "clip01(0.70 + 0.20 * (fetch_rank_ratio - 1.0))"
+    opportunity_tags:
+      - rank_balance
+      - shard_repartition
