@@ -157,10 +157,27 @@ facts.jsonl  detail_view_proc_name.parquet  detail_view_time_range.parquet  raw_
 ### Full offline chain (analyzer → diagnoser → optimizer)
 
 ```bash
+# 0. a minimal time_range rule (the shipped dlio.yaml rules target the streaming
+#    epoch axis; offline rules are workload-specific). Save as /tmp/tr.yaml:
+#
+#   schema_version: analysisfact-rules.v1
+#   defaults: {rule_version: "1.0.0", emit_mode: aggregate, confidence: "0.80"}
+#   rules:
+#     - id: tr.reader_pressure.v1
+#       priority: 100
+#       source_view: time_range
+#       fact_type: reader_pressure
+#       required_metrics: [reader_posix_time_proc_max, app_time_proc_max]
+#       derived_metrics:
+#         reader_frac: "fillna0(reader_posix_time_proc_max) / max(fillna0(app_time_proc_max), 1e-9)"
+#       when: "reader_frac >= 0.10"
+#       severity_score: "clip01(reader_frac)"
+#       opportunity_tags: [dataloader_prefetch, reader_parallelism]
+
 # 1. analyze -> fact bundle (facts on the time_range temporal axis)
 dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
     view_types=[time_range] facts.enabled=true \
-    facts.eval_rule_file=<rules.yaml> output=file output.path=/tmp/bundle
+    facts.eval_rule_file=/tmp/tr.yaml output=file output.path=/tmp/bundle
 
 # 2. diagnose -> longitudinal findings
 dfdiagnoser input=file input.path=/tmp/bundle output=console
