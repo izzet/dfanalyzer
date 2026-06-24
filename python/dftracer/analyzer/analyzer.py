@@ -405,7 +405,11 @@ class Analyzer(abc.ABC):
         from .streaming.zmq_io import open_consumer
 
         context, consumer = open_consumer(address)
-        logger.info("analyzer.zmq.start", address=address)
+        # Idle-based shutdown: when no event arrives within idle_timeout_sec, recv
+        # raises (zmq.Again) -> pull returns None -> analyze_stream stops cleanly.
+        if idle_timeout_sec and idle_timeout_sec > 0:
+            consumer.setsockopt(__import__("zmq").RCVTIMEO, int(idle_timeout_sec * 1000))
+        logger.info("analyzer.zmq.start", address=address, idle_timeout_sec=idle_timeout_sec)
         pending = []
 
         def pull_batch_event():

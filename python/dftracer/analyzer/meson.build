@@ -34,4 +34,5 @@ install_data(
     install_dir: py.get_install_dir(subdir: 'dftracer/analyzer/configs/schemas'),
 )
 
+subdir('streaming')
 subdir('utils')

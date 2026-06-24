@@ -542,3 +542,38 @@ class FileOutput(Output):
                 json.dump(stats_dict, fh, indent=2, default=str)
         except Exception:
             logger.warning("file_output.raw_stats_failed", exc_info=True)
+
+
+class ZMQOutput(Output):
+    """output=zmq: stream analysis facts (and flat views) over ZMQ as the analyzer
+    produces them -- the streaming counterpart of output=file. The fact envelope
+    (artifact_type=analysis_facts) is what DFDiagnoser input=zmq consumes."""
+
+    def __init__(self, address: str, bind: bool = False, compact: bool = False,
+                 name: str = "", root_only: bool = False, view_names: List[str] = []):
+        super().__init__(compact, name, root_only, view_names)
+        from .streaming.zmq_io import open_producer
+
+        self.address = address
+        self.bind = bool(bind)
+        self._context, self._producer = open_producer(address=address, bind=self.bind)
+
+    def handle_result(self, result: AnalysisResult):
+        if result.analysis_facts:
+            envelope = result.to_fact_envelope()
+            metadata = dict(
+                artifact_type="analysis_facts",
+                schema_version=envelope.schema_version,
+                fact_count=len(envelope.facts),
+                view_type="analysis_facts",
+                view_types=[str(v) for v in result.view_types],
+            )
+            self._producer.send_multipart(
+                [json.dumps(metadata).encode("utf-8"), envelope.to_json().encode("utf-8")]
+            )
+            logger.info("zmq_output.facts", fact_count=len(envelope.facts),
+                        window_index=result.window_index)
+
+    def close(self):
+        self._producer.close(linger=0)
+        self._context.term()

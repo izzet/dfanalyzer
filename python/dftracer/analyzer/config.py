@@ -411,6 +411,13 @@ class FileOutputConfig(OutputConfig):
 
 
 @dc.dataclass
+class ZMQOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.ZMQOutput"
+    address: str = "tcp://127.0.0.1:5556"
+    bind: bool = False
+
+
+@dc.dataclass
 class CustomJobConfig(JobConf):
     name: str = "dftracer.analyzer"
 
@@ -504,4 +511,5 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
     cs.store(group="output", name="file", node=FileOutputConfig)
+    cs.store(group="output", name="zmq", node=ZMQOutputConfig)
     return cs
