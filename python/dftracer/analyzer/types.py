@@ -313,6 +313,7 @@ class AnalysisResult:
     _hlms: Dict[Layer, dd.DataFrame]
     _main_views: Dict[Layer, dd.DataFrame]
     _metric_boundaries: ViewMetricBoundaries
+    analysis_facts: Dict[ViewKey, List[AnalysisFact]] = dc.field(default_factory=dict)
     _read_result: Optional[ReadTraceResult] = None
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
@@ -348,6 +349,88 @@ class AnalysisResult:
         if not isinstance(view_key_type, tuple):
             view_key_type = (view_key_type,)
         return self.views[layer][view_key_type]
+
+    def get_analysis_facts(self, view_key_type: Union[ViewKey, ViewType]) -> List[AnalysisFact]:
+        if not isinstance(view_key_type, tuple):
+            view_key_type = (view_key_type,)
+        return self.analysis_facts.get(view_key_type, [])
+
+    def iter_analysis_facts(self):
+        for view_key, facts in self.analysis_facts.items():
+            for fact in facts:
+                yield view_key, fact
+
+    def to_fact_envelope(self) -> FactEnvelope:
+        raw_stats_dict: Dict[str, Any] = {}
+        if isinstance(self.raw_stats, dict):
+            raw_stats_dict = dict(self.raw_stats)
+        elif dc.is_dataclass(self.raw_stats):
+            raw_stats_dict = dc.asdict(self.raw_stats)
+
+        run_id = raw_stats_dict.get("run_id")
+        fact_count_by_view: Dict[str, int] = {}
+        window_type_counts: Dict[str, int] = {}
+        facts_flat: List[AnalysisFact] = []
+
+        for view_key, fact in self.iter_analysis_facts():
+            view_key_name = "_".join(view_key)
+            fact_count_by_view[view_key_name] = fact_count_by_view.get(view_key_name, 0) + 1
+            if fact.window.view_type:
+                window_type_counts[fact.window.view_type] = window_type_counts.get(fact.window.view_type, 0) + 1
+            if run_id is None and fact.window.run_id:
+                run_id = fact.window.run_id
+            facts_flat.append(fact)
+
+        context = FactEnvelopeContext(
+            run_id=None if run_id is None else str(run_id),
+            layers=[str(layer) for layer in self.layers],
+            view_types=[str(view_type) for view_type in self.view_types],
+            time_granularity=_to_opt_float(raw_stats_dict.get("time_granularity")),
+            time_resolution=_to_opt_float(raw_stats_dict.get("time_resolution")),
+            total_event_count=_to_opt_int(raw_stats_dict.get("total_event_count")),
+            window_type_counts=window_type_counts,
+        )
+        return FactEnvelope(
+            context=context,
+            facts=facts_flat,
+            fact_count_by_view=fact_count_by_view,
+        )
+
+
+def _materialize_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "compute"):
+        try:
+            value = value.compute()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _to_opt_float(value: Any) -> Optional[float]:
+    value = _materialize_scalar(value)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _to_opt_int(value: Any) -> Optional[int]:
+    value = _materialize_scalar(value)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def humanized_metric_name(metric: Metric):
