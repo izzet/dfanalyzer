@@ -157,19 +157,26 @@ facts.jsonl  detail_view_proc_name.parquet  detail_view_time_range.parquet  raw_
 ### Full offline chain (analyzer → diagnoser → optimizer)
 
 ```bash
-# 1. analyze -> fact bundle
+# 1. analyze -> fact bundle (facts on the time_range temporal axis)
 dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
-    view_types=[time_range] facts.enabled=true output=file output.path=/tmp/bundle
+    view_types=[time_range] facts.enabled=true \
+    facts.eval_rule_file=<rules.yaml> output=file output.path=/tmp/bundle
 
 # 2. diagnose -> longitudinal findings
 dfdiagnoser input=file input.path=/tmp/bundle output=console
 
-# 3. optimize -> ActionPlans (offline replay of the findings)
-python -m dfoptimizer --transport file --findings-file findings.jsonl
+# 3. optimize -> ActionPlans (offline replay of the diagnoser's findings.jsonl)
+#    (from the dfoptimizer repo root; DFOPTIMIZER_BOOTSTRAP_DLIO=1 loads the DLIO knobs)
+DFOPTIMIZER_BOOTSTRAP_DLIO=1 python main.py --transport file --findings-file findings.jsonl
 ```
 
-The temporal axis for longitudinal facts is `time_range` offline (or `window` when
-streaming over ZMQ/Mofka). Spatial views (`file_name`/`proc_name`) yield one-shot facts.
+Verified end-to-end on `dftracer-dlio`: a `reader_pressure` rule on `time_range` ->
+76 facts -> diagnoser finding (persistence 39) -> 2 ActionPlans (`dlio.prefetch_size`
+2->3, `dlio.read_threads` 1->2).
+
+The temporal axis for longitudinal facts is **`time_range`** offline; **`epoch`/`window`**
+are produced on the **streaming** path (ZMQ/Mofka), where each event is window-tagged.
+Spatial views (`file_name`/`proc_name`) yield one-shot facts.
 
 ### Facts configuration
 
