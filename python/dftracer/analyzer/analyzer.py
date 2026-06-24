@@ -317,6 +317,127 @@ class Analyzer(abc.ABC):
         # Return result
         return result
 
+    # --- Streaming (window axis) ---------------------------------------------
+    # main's reader parses chrome events in C++, so the streaming path reuses it:
+    # buffer a window's events -> write a .pfw.gz -> analyze_trace -> stamp
+    # window_index on the facts. This matches the FactWindow longitudinal model
+    # (one analysis per window) and reuses the exact batch pipeline.
+
+    def _analyze_window_events(self, events, window_index, view_types,
+                               logical_view_types=False, metric_boundaries={}):
+        """Analyze one window's chrome events by round-tripping them through the
+        reader (write .pfw.gz -> analyze_trace), then stamp the window coordinate
+        onto the resulting facts so the diagnoser can track them longitudinally."""
+        import gzip
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix=f"dfa_window_{window_index}_")
+        try:
+            with gzip.open(os.path.join(tmpdir, "window-0.pfw.gz"), "wt") as fh:
+                for event in events:
+                    fh.write(json.dumps(event))
+                    fh.write("\n")
+            result = self.analyze_trace(
+                trace_path=tmpdir,
+                view_types=view_types,
+                logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # Stamp the streaming window coordinate onto every fact (view_type=window,
+        # window_index=N) so the diagnoser keys longitudinal tracking on the window.
+        for _view_key, facts in (result.analysis_facts or {}).items():
+            for fact in facts:
+                fact.window.view_type = "window"
+                fact.window.window_index = window_index
+        result.window_index = window_index
+        return result
+
+    def analyze_stream(self, pull_event, view_types,
+                       window_start_name="epoch.start", window_end_name="epoch.block",
+                       process_key="pid", logical_view_types=False, metric_boundaries={},
+                       output_handler=None, stream_name="stream", max_windows=None):
+        """Drive a chrome-event stream: buffer events into windows and analyze each
+        completed window. ``pull_event`` returns the next event dict (or None to stop).
+        Each completed window is analyzed and passed to ``output_handler`` (with facts
+        stamped by window_index). Returns the list of per-window results."""
+        from .streaming.window_buffer import WindowBuffer
+
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+        buffer = WindowBuffer(
+            window_start_name=window_start_name,
+            window_end_name=window_end_name,
+            process_key=process_key,
+        )
+        output_handler = output_handler or (lambda result: None)
+        results = []
+        window_index = 0
+        while True:
+            event = pull_event()
+            if event is None:
+                break
+            if not isinstance(event, dict):
+                raise ValueError(f"Invalid event type from {stream_name}: {type(event)}")
+            window_events = buffer.push(event)
+            if not window_events:
+                continue
+            logger.debug(f"{stream_name}.window_emitted", index=window_index, count=len(window_events))
+            result = self._analyze_window_events(
+                events=window_events, window_index=window_index, view_types=proc_view_types,
+                logical_view_types=logical_view_types, metric_boundaries=metric_boundaries,
+            )
+            results.append(result)
+            output_handler(result)
+            window_index += 1
+            if max_windows is not None and window_index >= max_windows:
+                break
+        return results
+
+    def analyze_zmq(self, address, view_types, output_handler=None,
+                    window_start_name="epoch.start", window_end_name="epoch.block",
+                    process_key="pid", logical_view_types=False, metric_boundaries={},
+                    idle_timeout_sec=0.0):
+        """Consume chrome-event batches over ZMQ (newline-delimited JSON) and analyze
+        each window. Reuses analyze_stream; the DLIO tracer's ZMQ writer is the source."""
+        from .streaming.zmq_io import open_consumer
+
+        context, consumer = open_consumer(address)
+        logger.info("analyzer.zmq.start", address=address)
+        pending = []
+
+        def pull_batch_event():
+            while not pending:
+                try:
+                    data = consumer.recv()
+                except Exception:
+                    return None
+                for line in data.decode("utf-8", errors="replace").split("\n"):
+                    line = line.strip()
+                    if not line or line in ("[", "]"):
+                        continue
+                    try:
+                        ev = json.loads(line.rstrip(","))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ev, dict):
+                        pending.append(ev)
+            return pending.pop(0)
+
+        try:
+            return self.analyze_stream(
+                pull_event=pull_batch_event, view_types=view_types,
+                window_start_name=window_start_name, window_end_name=window_end_name,
+                process_key=process_key, logical_view_types=logical_view_types,
+                metric_boundaries=metric_boundaries, output_handler=output_handler,
+                stream_name="zmq",
+            )
+        finally:
+            consumer.close(linger=0)
+            context.term()
+
     def read_stats(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None) -> RawStats:
         """Computes and restores raw statistics from the trace data.
 
