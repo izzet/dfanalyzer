@@ -190,8 +190,40 @@ class ConsoleOutput(Output):
             if additional_metrics_table is not None:
                 print_objects.append(additional_metrics_table)
             print_objects.append(layer_breakdown_table)
+        facts_table = self._create_facts_table(result)
+        if facts_table is not None:
+            print_objects.append(facts_table)
         console = Console(record=True)
         console.print(*print_objects)
+
+    def _create_facts_table(self, result: AnalysisResult):
+        """Summarize analysis facts (when facts.enabled) so they're visible on the
+        console -- grouped by (fact_type, view) with count, peak severity, and tags.
+        Returns None when no facts were produced."""
+        facts = [f for fl in (result.analysis_facts or {}).values() for f in fl]
+        if not facts:
+            return None
+        from collections import defaultdict
+        agg = defaultdict(lambda: {"count": 0, "sev": 0.0, "label": "", "tags": set()})
+        for f in facts:
+            a = agg[(f.fact_type, getattr(f.window, "view_type", None) or "-")]
+            a["count"] += 1
+            sev = f.severity.score if f.severity else 0.0
+            if sev >= a["sev"]:
+                a["sev"] = sev
+                a["label"] = f.severity.label if f.severity else ""
+            a["tags"].update(f.opportunity_tags or [])
+        table = Table(title=f"Analysis Facts ({len(facts)} total)")
+        table.add_column("Fact Type")
+        table.add_column("View")
+        table.add_column("Count", justify="right")
+        table.add_column("Peak Severity")
+        table.add_column("Opportunity Tags")
+        for (ft, vt), a in sorted(agg.items()):
+            table.add_row(ft, vt, str(a["count"]),
+                          f"{a['label']} ({a['sev']:.2f})" if a["label"] else f"{a['sev']:.2f}",
+                          ", ".join(sorted(a["tags"])))
+        return table
 
     def _create_layer_breakdown_table(self, summary: OutputSummary, view_key: ViewKey) -> Table:
         breakdown_table_title = "Layer Breakdown"
