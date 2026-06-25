@@ -1,0 +1,17 @@
+schema_version: analysisfact-rules.v1
+defaults: {rule_version: "1.0.0", emit_mode: aggregate, confidence: "0.80"}
+rules:
+  # CI-only smoke rule: fires on the dftracer-dlio test trace's time_range view so the
+  # fact pipeline + output=file bundle are exercised end-to-end in CI (the shipped
+  # dlio.yaml rules target the streaming epoch axis). Depends on a single dense metric
+  # (reader POSIX time, present on most time buckets) so it reliably emits facts.
+  - id: ci.reader_activity.v1
+    priority: 100
+    source_view: time_range
+    fact_type: reader_activity
+    required_metrics: [reader_posix_time_proc_max]
+    derived_metrics:
+      reader_time: "fillna0(reader_posix_time_proc_max)"
+    when: "reader_time > 0.0"
+    severity_score: "clip01(reader_time)"
+    opportunity_tags: [reader_parallelism, dataloader_prefetch]

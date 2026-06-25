@@ -405,6 +405,12 @@ class SQLiteOutputConfig(OutputConfig):
 
 
 @dc.dataclass
+class FileOutputConfig(OutputConfig):
+    _target_: str = "dftracer.analyzer.output.FileOutput"
+    path: str = ""
+
+
+@dc.dataclass
 class CustomJobConfig(JobConf):
     name: str = "dftracer.analyzer"
 
@@ -440,6 +446,17 @@ ${hydra:help.footer}
 
 
 @dc.dataclass
+class FactsConfig:
+    enabled: bool = False
+    eval_mode: str = "rule"  # how facts are built: 'rule' (YAML conditions) | 'metric' (metric-score driven)
+    eval_rule_file: str = ""  # consulted when eval_mode == 'rule'
+    emit_flat_views: bool = True
+    emit_mode: str = "aggregate"  # fact granularity: 'aggregate' (per-view rollup) | 'detail' (per-entity)
+    strict_time_semantics: bool = True
+    allow_mixed_time_aggregates: bool = False
+
+
+@dc.dataclass
 class Config:
     defaults: List[Any] = dc.field(
         default_factory=lambda: [
@@ -455,6 +472,7 @@ class Config:
     analyzer: AnalyzerConfig = MISSING
     cluster: ClusterConfig = MISSING
     debug: Optional[bool] = False
+    facts: FactsConfig = dc.field(default_factory=FactsConfig)
     exclude_characteristics: Optional[List[str]] = dc.field(default_factory=list)
     logical_view_types: Optional[bool] = False
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
@@ -485,4 +503,5 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="output", name="json", node=JSONOutputConfig)
     cs.store(group="output", name="csv", node=CSVOutputConfig)
     cs.store(group="output", name="sqlite", node=SQLiteOutputConfig)
+    cs.store(group="output", name="file", node=FileOutputConfig)
     return cs

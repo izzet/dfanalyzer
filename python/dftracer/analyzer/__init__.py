@@ -111,6 +111,7 @@ def init_with_hydra(hydra_overrides: List[str]):
             hydra_config.analyzer,
             debug=hydra_config.debug,
             verbose=hydra_config.verbose,
+            facts_config=hydra_config.facts,
         )
 
     # Setup output

@@ -59,7 +59,7 @@ logger = structlog.get_logger()
 
 # HLM groupby columns typed as Int64 (others string); metric columns typed as
 # Float64 (others Int64). Passed to the dftracer.utils HLM helpers.
-HLM_INT_INDEX_COLS = frozenset({"pid", "tid", "io_cat", "acc_pat", "time_range"})
+HLM_INT_INDEX_COLS = frozenset({"pid", "tid", "io_cat", "acc_pat", "time_range", "epoch", "step"})
 HLM_FLOAT_METRIC_COLS = frozenset(
     {
         "time",
@@ -599,6 +599,11 @@ class DFTracerAnalyzer(Analyzer):
             if origin is not None:
                 config["time_origin"] = int(origin)
                 config["bucket_width_us"] = int(self.time_granularity * self.time_resolution)
+            # epoch view: pass the preset's epoch layer query so the distributed scan
+            # can assign per-pid epochs (mirrors postread_trace's assign_epochs, which
+            # the scan bypasses). Only meaningful when assign_epochs is enabled.
+            if self.assign_epochs and "epoch" in self.preset.layer_defs:
+                config["epoch_query"] = self.preset.layer_defs["epoch"]
         return config
 
     def _hlm(self, data_type, view_types, traces):

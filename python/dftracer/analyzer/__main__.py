@@ -45,6 +45,7 @@ def main(cfg: Config) -> None:
             cfg.analyzer,
             debug=cfg.debug,
             verbose=cfg.verbose,
+            facts_config=cfg.facts,
         )
 
     # Analyze trace

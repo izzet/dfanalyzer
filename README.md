@@ -116,6 +116,95 @@ DFAnalyzer also provides a detailed breakdown of performance metrics for each la
 └────────────────────────┴──────────────────┴─────────────────┴─────────────┴──────────────────────┴───────────────────┘
 ```
 
+## Analysis facts (DFDiagnoser integration)
+
+Beyond the human-readable summary, DFAnalyzer can emit **analysis facts** — compact,
+machine-readable bottleneck signals (`analyzer.fact-envelope.v1`) that
+[DFDiagnoser](https://github.com/LLNL/dfdiagnoser) turns into longitudinal findings
+and [DFOptimizer](https://github.com/LLNL/dfoptimizer) turns into tuning actions. Facts
+are **opt-in** and additive: with `facts.enabled=false` (the default) the analysis
+output is unchanged.
+
+A fact is produced per view per analysis window by either builder:
+
+- **rule** (`facts.eval_mode=rule`) — YAML conditions over view metrics
+  (`facts.eval_rule_file=<rules.yaml>`), e.g. *fetch time dominates compute*.
+- **metric** (`facts.eval_mode=metric`) — WISIO-style slope detection: an entity whose
+  share of time is disproportionate to its share of operations.
+
+Each fact carries a continuous `severity` in [0,1], a two-level `scope`
+(`layer:view` aggregate or `layer:view:entity` detail), and `opportunity_tags`.
+
+### Producing facts to a bundle (offline)
+
+`output=file` writes the deliverable bundle — `facts.jsonl` (one envelope per window),
+`detail_view_*.parquet`, and `raw_stats.json` — that `dfdiagnoser input=file` consumes:
+
+```bash
+dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+    view_types=[time_range] \
+    facts.enabled=true facts.eval_mode=rule \
+    facts.eval_rule_file=python/dftracer/analyzer/configs/fact_rules/dlio.yaml \
+    output=file output.path=/tmp/bundle
+```
+
+```text
+[info ] file_output.facts   path=/tmp/bundle/facts.jsonl
+$ ls /tmp/bundle
+facts.jsonl  detail_view_proc_name.parquet  detail_view_time_range.parquet  raw_stats.json
+```
+
+### Full offline chain (analyzer → diagnoser → optimizer)
+
+```bash
+# 0. a minimal time_range rule (the shipped dlio.yaml rules target the streaming
+#    epoch axis; offline rules are workload-specific). Save as /tmp/tr.yaml:
+#
+#   schema_version: analysisfact-rules.v1
+#   defaults: {rule_version: "1.0.0", emit_mode: aggregate, confidence: "0.80"}
+#   rules:
+#     - id: tr.reader_pressure.v1
+#       priority: 100
+#       source_view: time_range
+#       fact_type: reader_pressure
+#       required_metrics: [reader_posix_time_proc_max, app_time_proc_max]
+#       derived_metrics:
+#         reader_frac: "fillna0(reader_posix_time_proc_max) / max(fillna0(app_time_proc_max), 1e-9)"
+#       when: "reader_frac >= 0.10"
+#       severity_score: "clip01(reader_frac)"
+#       opportunity_tags: [dataloader_prefetch, reader_parallelism]
+
+# 1. analyze -> fact bundle (facts on the time_range temporal axis)
+dfanalyzer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+    view_types=[time_range] facts.enabled=true \
+    facts.eval_rule_file=/tmp/tr.yaml output=file output.path=/tmp/bundle
+
+# 2. diagnose -> longitudinal findings
+dfdiagnoser input=file input.path=/tmp/bundle output=console
+
+# 3. optimize -> ActionPlans (offline replay of the diagnoser's findings.jsonl)
+#    (from the dfoptimizer repo root; DFOPTIMIZER_BOOTSTRAP_DLIO=1 loads the DLIO knobs)
+DFOPTIMIZER_BOOTSTRAP_DLIO=1 python main.py --transport file --findings-file findings.jsonl
+```
+
+Verified end-to-end on `dftracer-dlio`: a `reader_pressure` rule on `time_range` ->
+76 facts -> diagnoser finding (persistence 39) -> 2 ActionPlans (`dlio.prefetch_size`
+2->3, `dlio.read_threads` 1->2).
+
+The temporal axis for longitudinal facts is **`time_range`** offline; **`epoch`/`window`**
+are produced on the **streaming** path (ZMQ/Mofka), where each event is window-tagged.
+Spatial views (`file_name`/`proc_name`) yield one-shot facts.
+
+### Facts configuration
+
+| key | default | meaning |
+|---|---|---|
+| `facts.enabled` | `false` | master switch; off = analysis output unchanged |
+| `facts.eval_mode` | `rule` | `rule` (YAML conditions) or `metric` (slope) |
+| `facts.eval_rule_file` | `""` | rule YAML (when `eval_mode=rule`) |
+| `facts.emit_mode` | `aggregate` | `aggregate` (per-view rollup) or `detail` (per-entity) |
+| `facts.emit_flat_views` | `true` | also write the detail views into the bundle |
+
 ## Further Information
 
 For more details, to report issues, or to contribute to DFAnalyzer, please refer to the following resources:

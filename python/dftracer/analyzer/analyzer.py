@@ -1,5 +1,6 @@
 import abc
 import dask.dataframe as dd
+import dataclasses as dc
 import hashlib
 import itertools as it
 import json
@@ -11,7 +12,7 @@ import structlog
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .analysis_utils import (
     build_view_rename_map,
@@ -24,7 +25,8 @@ from .analysis_utils import (
     set_unique_counts,
     split_duration_records_vectorized,
 )
-from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig
+from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
+from .fact_engine import FactEngine, FactPipeline
 from .constants import (
     COL_COUNT,
     COL_FILE_NAME,
@@ -92,6 +94,7 @@ class Analyzer(abc.ABC):
         time_resolution: float = 1e6,
         time_sliced: bool = False,
         verbose: bool = False,
+        facts_config: Optional[Union[FactsConfig, Dict[str, Any]]] = None,
     ):
         """Initializes the Analyzer instance.
 
@@ -124,6 +127,17 @@ class Analyzer(abc.ABC):
         self.profile_time_granularity = profile_time_granularity
         self.quantile_stats = quantile_stats
         self.layers = list(preset.layer_defs.keys())
+        # Facts pipeline (additive): off unless facts.enabled. When on, builds the
+        # rule/metric pipeline that _analyze_hlm runs over the flat views.
+        self.facts_config = self._build_facts_config(facts_config)
+        self.fact_pipeline = None
+        if self.facts_config.enabled:
+            self.fact_pipeline = FactPipeline.from_facts_config(
+                self.facts_config,
+                layers=self.layers,
+                strict_time_semantics=self.facts_config.strict_time_semantics,
+                allow_mixed_time_aggregates=self.facts_config.allow_mixed_time_aggregates,
+            )
         self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.time_approximate = time_approximate
@@ -132,6 +146,48 @@ class Analyzer(abc.ABC):
         self.time_sliced = time_sliced
         self.verbose = verbose
         ensure_dir(self.checkpoint_dir)
+
+    @staticmethod
+    def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
+        if facts_config is None:
+            return FactsConfig()
+        if isinstance(facts_config, FactsConfig):
+            return facts_config
+        if isinstance(facts_config, dict):
+            return FactsConfig(**facts_config)
+        if OmegaConf.is_config(facts_config):
+            config_obj = OmegaConf.to_object(facts_config)
+            if isinstance(config_obj, FactsConfig):
+                return config_obj
+            if isinstance(config_obj, dict):
+                return FactsConfig(**config_obj)
+            if dc.is_dataclass(config_obj):
+                return FactsConfig(**dc.asdict(config_obj))
+            raise TypeError(f"Unsupported OmegaConf facts object type: {type(config_obj)}")
+        raise TypeError(f"Unsupported facts_config type: {type(facts_config)}")
+
+    def _evaluate_analysis_facts(
+        self,
+        flat_views: Dict[ViewKey, pd.DataFrame],
+        raw_stats: Any,
+    ) -> Dict[ViewKey, List[Any]]:
+        # facts.enabled is the single switch: if on, the pipeline exists and runs.
+        if self.fact_pipeline is None:
+            return {}
+        return self.fact_pipeline.build(
+            flat_views=flat_views,
+            raw_stats=raw_stats,
+        )
+
+    def _materialize_output_artifacts(
+        self,
+        flat_views: Dict[ViewKey, pd.DataFrame],
+        analysis_facts: Dict[ViewKey, List[Any]],
+    ) -> Tuple[Dict[ViewKey, pd.DataFrame], Dict[ViewKey, List[Any]]]:
+        # Facts pass through (they're {} unless facts.enabled). Detail (flat) views
+        # are still independently gated by emit_flat_views.
+        output_flat_views = flat_views if self.facts_config.emit_flat_views else {}
+        return output_flat_views, analysis_facts
 
     def analyze_trace(
         self,
@@ -1126,6 +1182,14 @@ class Analyzer(abc.ABC):
             with log_block("wait_for_checkpoints"):
                 wait(self.checkpoint_tasks)
 
+        # Evaluate analysis facts over the flat views (no-op {} unless facts.enabled),
+        # then gate the flat views by emit_flat_views. Facts-off leaves both untouched.
+        with log_block("evaluate_analysis_facts"):
+            analysis_facts = self._evaluate_analysis_facts(flat_views=flat_views, raw_stats=raw_stats)
+        output_flat_views, output_analysis_facts = self._materialize_output_artifacts(
+            flat_views=flat_views, analysis_facts=analysis_facts,
+        )
+
         return AnalysisResult(
             _hlms=hlms,
             _main_views=main_views,
@@ -1134,8 +1198,9 @@ class Analyzer(abc.ABC):
                 view_type: list(metrics.keys())
                 for view_type, metrics in (self.preset.additional_metrics or {}).items()
             },  # type: ignore
+            analysis_facts=output_analysis_facts,
             checkpoint_dir=self.checkpoint_dir,
-            flat_views=flat_views,
+            flat_views=output_flat_views,
             layers=self.layers,
             raw_stats=raw_stats,
             view_types=proc_view_types,
