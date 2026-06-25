@@ -1,0 +1,16 @@
+schema_version: analysisfact-rules.v1
+defaults: {rule_version: "1.0.0", emit_mode: aggregate, confidence: "0.80"}
+rules:
+  # CI-only rule: fires on the dftracer-dlio test trace's time_range view so the fact
+  # pipeline + output=file bundle are exercised end-to-end in CI (the shipped dlio.yaml
+  # rules target the streaming epoch axis). Reader time disproportionate to app time.
+  - id: ci.reader_pressure.v1
+    priority: 100
+    source_view: time_range
+    fact_type: reader_pressure
+    required_metrics: [reader_posix_time_proc_max, app_time_proc_max]
+    derived_metrics:
+      reader_frac: "fillna0(reader_posix_time_proc_max) / max(fillna0(app_time_proc_max), 1e-9)"
+    when: "reader_frac >= 0.10"
+    severity_score: "clip01(reader_frac)"
+    opportunity_tags: [dataloader_prefetch, reader_parallelism]

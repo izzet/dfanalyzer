@@ -125,7 +125,17 @@ jobs:
           else
             dfanalyzer analyzer=dftracer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
               cluster=external cluster.restart_on_connect=False cluster.scheduler_address=$scheduler_address
-          fi          
+          fi
+
+          # Facts coverage: exercise the fact pipeline end-to-end on the time_range axis
+          # (the offline longitudinal axis the released reader supports) and write the
+          # output=file bundle that DFDiagnoser consumes. Fails loudly if no facts emit.
+          dfanalyzer analyzer=dftracer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+            cluster=external cluster.restart_on_connect=False cluster.scheduler_address=$scheduler_address \
+            view_types=[time_range] facts.enabled=true facts.eval_mode=rule \
+            facts.eval_rule_file=tests/data/ci_facts_rules.yaml output=file output.path=facts_bundle
+          test -s facts_bundle/facts.jsonl || { echo "ERROR: fact pipeline produced no facts"; exit 1; }
+          echo "facts bundle: $(wc -l < facts_bundle/facts.jsonl) envelope(s) in facts_bundle/facts.jsonl"
 
           # Kill the cluster process
           kill $cluster_pid || true
