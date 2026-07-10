@@ -8,10 +8,11 @@ import math
 import numpy as np
 import os
 import pandas as pd
+import re
 import structlog
 from dask import compute, persist
 from dask.distributed import fire_and_forget, get_client, wait
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .analysis_utils import (
@@ -73,6 +74,8 @@ HLM_AGG = {
     "size": "sum",
 }
 HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
+# Categories whose events carry a transfer size, so their layers keep size/bandwidth.
+SIZE_CATEGORY_PREFIXES = ("posix", "stdio")
 PARTITION_SIZE = "128MB"
 VIEW_PERMUTATIONS = False
 
@@ -131,13 +134,7 @@ class Analyzer(abc.ABC):
         # rule/metric pipeline that _analyze_hlm runs over the flat views.
         self.facts_config = self._build_facts_config(facts_config)
         self.fact_pipeline = None
-        if self.facts_config.enabled:
-            self.fact_pipeline = FactPipeline.from_facts_config(
-                self.facts_config,
-                layers=self.layers,
-                strict_time_semantics=self.facts_config.strict_time_semantics,
-                allow_mixed_time_aggregates=self.facts_config.allow_mixed_time_aggregates,
-            )
+        self._build_fact_pipeline()
         self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
         self.preset = preset
         self.time_approximate = time_approximate
@@ -188,6 +185,92 @@ class Analyzer(abc.ABC):
         # are still independently gated by emit_flat_views.
         output_flat_views = flat_views if self.facts_config.emit_flat_views else {}
         return output_flat_views, analysis_facts
+
+    @staticmethod
+    def _category_layer_key(cat: str, taken: set) -> str:
+        key = re.sub(r"[^a-z0-9_]+", "_", cat.lower()).strip("_") or "cat"
+        if key == "app":
+            key = "app_cat"
+        base, i = key, 1
+        while key in taken:
+            i += 1
+            key = f"{base}_{i}"
+        taken.add(key)
+        return key
+
+    def _build_fact_pipeline(self) -> None:
+        """(Re)build the fact pipeline for the current ``self.layers``. Must be
+        called again whenever the layer set changes."""
+        if not self.facts_config.enabled:
+            return
+        self.fact_pipeline = FactPipeline.from_facts_config(
+            self.facts_config,
+            layers=self.layers,
+            strict_time_semantics=self.facts_config.strict_time_semantics,
+            allow_mixed_time_aggregates=self.facts_config.allow_mixed_time_aggregates,
+        )
+
+    @staticmethod
+    def _normalize_cats(values) -> List[str]:
+        cats = {str(c).lower() for c in values if c is not None and str(c) != ""}
+        return sorted(cats - {"dftracer"})
+
+    @classmethod
+    def _category_layers_from_cats(cls, cats: List[str]):
+        """Build nested layers from ``cat`` values. pydftracer supports dotted
+        categories (``ai.data.io``), so each dotted prefix becomes a parent layer
+        that also matches its descendants."""
+        nodes = set()
+        for cat in cats:
+            parts = cat.split(".")
+            for i in range(1, len(parts) + 1):
+                nodes.add(".".join(parts[:i]))
+        nodes = sorted(nodes)
+
+        taken: set = set()
+        key_of = {node: cls._category_layer_key(node, taken) for node in nodes}
+
+        layer_defs: Dict[str, Optional[str]] = {"app": None}
+        layer_deps: Dict[str, Optional[str]] = {"app": None}
+        derived_metrics: Dict[str, Dict[str, str]] = {"app": {}}
+        size_layers: List[str] = []
+        for node in nodes:
+            key = key_of[node]
+            # json.dumps quotes/escapes the cat so query-significant characters cannot
+            # break (or inject into) the expression.
+            literal = json.dumps(node)
+            if any(other.startswith(f"{node}.") for other in nodes):
+                layer_defs[key] = f'cat == {literal} or cat.str.startswith({json.dumps(node + ".")})'
+            else:
+                layer_defs[key] = f"cat == {literal}"
+            parent = node.rsplit(".", 1)[0] if "." in node else None
+            layer_deps[key] = key_of[parent] if parent else "app"
+            derived_metrics[key] = {}
+            if node.startswith(SIZE_CATEGORY_PREFIXES):
+                size_layers.append(key)
+        return layer_defs, layer_deps, derived_metrics, size_layers
+
+    def _build_category_layers(self, traces: dd.DataFrame) -> None:
+        """Rebuild the preset as an ``app`` boundary layer plus nested layers per
+        distinct ``cat`` in the trace. No-op if no categories are found."""
+        if "cat" not in traces.columns:
+            return
+        cats = traces["cat"].dropna().unique()
+        cats = self._normalize_cats(cats.compute() if hasattr(cats, "compute") else cats)
+        if not cats:
+            return
+
+        layer_defs, layer_deps, derived_metrics, size_layers = self._category_layers_from_cats(cats)
+
+        with open_dict(self.preset):
+            self.preset.layer_defs = layer_defs
+            self.preset.layer_deps = layer_deps
+            self.preset.derived_metrics = derived_metrics
+            self.preset.size_layers = size_layers
+            self.preset.size_derived_metrics = {}
+        self.layers = list(layer_defs.keys())
+        self._build_fact_pipeline()  # was configured for the pre-discovery layer set
+        logger.info("Built category layers", layers=self.layers)
 
     def analyze_trace(
         self,
@@ -243,6 +326,9 @@ class Analyzer(abc.ABC):
                 raw_stats = self.read_stats(traces=traces, profiles=profiles)
             with log_block("postread_trace"):
                 traces = self.postread_trace(traces=traces, view_types=proc_view_types)
+            if getattr(self.preset, "auto_layers_by_category", False):
+                with log_block("build_category_layers"):
+                    self._build_category_layers(traces=traces)
             with log_block("set_size_bins"):
                 traces = traces.map_partitions(set_size_bins)
             if self.time_sliced:
