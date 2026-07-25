@@ -2,7 +2,6 @@ import abc
 import colorsys
 import dask
 import dataclasses as dc
-import inflect
 import json
 import numpy as np
 import pandas as pd
@@ -65,7 +64,6 @@ class Output(abc.ABC):
         self.compact = compact
         self.name = name
         # self.output_dir = HydraConfig.get().runtime.output_dir
-        self.pluralize = inflect.engine()
         self.root_only = root_only
         self.view_names = view_names
 
