@@ -21,7 +21,7 @@ Next, ensure your trace data is accessible. You can use the sample datasets loca
 .. code-block:: bash
 
    !mkdir -p ./data
-   !tar -xzf ../../tests/data/dftracer-dlio.tar.gz -C ./data
+   !tar -xzf ../../tests/data/dftracer-ai.tar.gz -C ./data
 
 Run Analysis
 ------------
@@ -31,7 +31,7 @@ With the environment and data ready, you can run the analysis.
 Initialize DFAnalyzer
 ~~~~~~~~~~~~~~~~~~~~~
 
-Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrides as needed. This sets up the analyzer, such as ``dftracer`` with a specific preset like ``dlio``.
+Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrides as needed. This sets up the analyzer, such as ``dftracer`` with a specific preset like ``ai``.
 
 .. code-block:: python
 
@@ -39,13 +39,13 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
 
    run_dir = f"./unet3d_v100_hdf5"
    time_granularity = 5  # 5 seconds
-   trace_path = f"./data/dftracer-dlio"
+   trace_path = f"./data/dftracer-ai"
    view_types = ["time_range", "proc_name"]
 
    dfa = init_with_hydra(
        hydra_overrides=[
            'analyzer=dftracer',
-           'analyzer/preset=dlio',
+           'analyzer/preset=ai',
            'analyzer.checkpoint=False',
            f"analyzer.time_granularity={time_granularity}",
            f"hydra.run.dir={run_dir}",

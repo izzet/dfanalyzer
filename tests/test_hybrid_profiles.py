@@ -4,7 +4,7 @@ import pytest
 from dask.distributed import Client, LocalCluster
 from omegaconf import OmegaConf
 
-from dftracer.analyzer.config import AnalyzerPresetConfigDLIOAILogging, AnalyzerPresetConfigPOSIX
+from dftracer.analyzer.config import AnalyzerPresetConfigAI, AnalyzerPresetConfigPOSIX
 from dftracer.analyzer.dftracer import DFTracerAnalyzer
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -360,7 +360,7 @@ def test_read_trace_coalesces_duplicate_full_profile_rows(dask_client, full_hybr
     analyzer = make_analyzer(
         tmp_path=tmp_path,
         time_granularity=5,
-        preset=AnalyzerPresetConfigDLIOAILogging(),
+        preset=AnalyzerPresetConfigAI(),
     )
 
     read_result = analyzer.read_trace(
@@ -407,7 +407,7 @@ def test_analyze_trace_reconciles_profiles_per_layer_for_full_hybrid_case(
     analyzer = make_analyzer(
         tmp_path=tmp_path,
         time_granularity=5,
-        preset=AnalyzerPresetConfigDLIOAILogging(),
+        preset=AnalyzerPresetConfigAI(),
     )
 
     result = analyzer.analyze_trace(
@@ -753,7 +753,7 @@ def test_coalesce_takes_min_of_mins_and_max_of_maxes(dask_client, tmp_path):
     _write_trace(path, events)
     analyzer = make_analyzer(
         tmp_path=tmp_path, time_granularity=5,
-        preset=AnalyzerPresetConfigDLIOAILogging(),
+        preset=AnalyzerPresetConfigAI(),
     )
 
     profiles = analyzer.read_trace(
@@ -841,7 +841,7 @@ def test_analyze_trace_non_posix_profiles_map_to_correct_layers(dask_client, tmp
     _write_trace(path, events)
     analyzer = make_analyzer(
         tmp_path=tmp_path, time_granularity=5,
-        preset=AnalyzerPresetConfigDLIOAILogging(),
+        preset=AnalyzerPresetConfigAI(),
     )
 
     result = analyzer.analyze_trace(

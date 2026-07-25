@@ -10,8 +10,8 @@ from glob import glob
 
 # Full test matrix for comprehensive testing
 full_analyzer_trace_params = [
+    ("dftracer", "ai", "tests/data/extracted/dftracer-ai"),
     ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio"),
-    ("dftracer", "dlio-prev", "tests/data/extracted/dftracer-dlio-prev"),
     ("dftracer", "posix", "tests/data/extracted/dftracer-posix"),
 ]
 full_checkpoint_params = [True, False]
@@ -134,7 +134,10 @@ def _test_e2e(
     if os.getenv("DFANALYZER_DEBUG", "").lower() in {"1", "true", "yes"}:
         hydra_overrides.append("debug=True")
 
-    assign_epochs = analyzer == "dftracer" and preset.startswith("dlio")
+    # Both the DLIOBenchmark ("dlio") and AI-logging ("ai") presets define an
+    # `epoch` layer, so keep the membership test explicit rather than matching a
+    # shared name prefix.
+    assign_epochs = analyzer == "dftracer" and preset in ("dlio", "ai")
     if assign_epochs:
         hydra_overrides.append("analyzer.assign_epochs=True")
 
