@@ -14,7 +14,6 @@ DFAnalyzer is an open-source tool for analyzing performance data from large-scal
 To install DFAnalyzer through `pip` (recommended for most users):
 
 ```bash
-# Ensure runtime dependencies for optional features (e.g., Darshan, Recorder) are installed.
 # This might involve using your system's package manager or a tool like Spack.
 # Example using Spack to prepare the environment:
 # spack -e tools install
@@ -35,12 +34,9 @@ module load ninja
 python -m pip install --upgrade pip meson-python setuptools wheel
 
 # 3. Install DFAnalyzer from the root of this repository:
-#    The following command includes optional C++ components (tests and tools).
 #    The --prefix argument is optional and specifies the installation location.
 pip install -e . \
-  -Csetup-args="--prefix=$HOME/.local" \
-  -Csetup-args="-Denable_tests=true" \
-  -Csetup-args="-Denable_tools=true"
+  -Csetup-args="--prefix=$HOME/.local"
 
 # (Optional) Install dependencies for running tests if you plan to contribute or run local tests:
 # pip install -r tests/requirements.txt

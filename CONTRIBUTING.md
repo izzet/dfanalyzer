@@ -64,30 +64,20 @@ ruff format .
     ```
 
 2.  **Install Python Dependencies:**
-    Install DFAnalyzer in editable mode along with its optional dependencies (like Darshan support) and dependencies required for running tests.
+    Install DFAnalyzer in editable mode along with the dependencies required for running tests.
 
     ```bash
     python -m pip install --upgrade pip
-    # Install DFAnalyzer in editable mode with optional extras
-    pip install -e .[darshan]
+    # Install DFAnalyzer in editable mode
+    pip install -e .
     # Install dependencies for tests
     pip install -r tests/requirements.txt
     # Ensure build tools are available
     # pip install meson-python setuptools wheel
     ```
 
-3.  **Install System Dependencies (for C++ components):** DFAnalyzer includes C++ components. To develop these, you'll need system dependencies such as a C++ compiler, CMake, Meson, Ninja, and various development libraries (e.g., `libarrow-dev`, `libhdf5-dev`).
-    A comprehensive list and example installation commands for Ubuntu can be found in the "Install system dependencies" step within the `.github/workflows/ci.yml` file.
+3.  **Install System Dependencies:** The build uses Meson via `meson-python`, so a C++ compiler and Ninja must be available.
+    Example installation commands for Ubuntu can be found in the "Install system dependencies" step within the `.github/workflows/ci.yml` file.
 
-4.  **Build C++ Components (if making changes to them):**
-    When you install DFAnalyzer in editable mode (`pip install -e .`), the C++ components are typically built. If you make changes to the C++ source files, you may need to recompile them.
-    ```bash
-    # Navigate to the build directory (usually created by the editable install)
-    # meson compile -C build
-    # Or, if you need to reconfigure and then build:
-    # meson setup build --reconfigure -Denable_tests=true -Denable_tools=true
-    # meson compile -C build
-    ```
-    The editable pip install should handle most build aspects, but manual recompilation with Meson might be needed for iterative C++ development.
 
 We look forward to your contributions!

@@ -15,7 +15,6 @@ Welcome to DFAnalyzer's documentation!
    configuration
    metrics
    interactive-analysis
-   tools
 
 
 

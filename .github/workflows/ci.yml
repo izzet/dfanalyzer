@@ -44,26 +44,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
-            ca-certificates \
-            lsb-release \
-            wget
-          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt install -y ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt update
-          sudo apt install -y \
             build-essential \
-            cmake \
             git \
-            libarrow-dev \
-            libhdf5-dev \
-            libncurses-dev \
-            libopenmpi-dev \
-            libparquet-dev \
-            libreadline-dev \
-            ninja-build \
-            nlohmann-json3-dev \
-            openmpi-bin \
-            openmpi-common
+            ninja-build
 
       - name: Install Python dependencies
         run: |
@@ -73,20 +56,8 @@ jobs:
 
       - name: Install DFAnalyzer
         run: |
-          # The [darshan] extra is installed on 3.10-3.12 only. pydarshan ships no
-          # cp313 wheel (latest, 3.5.0, tops out at cp312), and its sdist builds a
-          # pure-Python wheel with no bundled libdarshan-util.so, so `import darshan`
-          # then fails at runtime. Darshan support is honestly 3.10-3.12; do not
-          # re-add the extra to the 3.13 leg until pydarshan publishes a cp313 wheel.
-          if [[ "${{ matrix.python }}" == "3.13" ]]; then
-            extras=""
-          else
-            extras="[darshan]"
-          fi
-          pip install ".${extras}" \
-            -Csetup-args="--prefix=$HOME/.local" \
-            -Csetup-args="-Denable_tests=true" \
-            -Csetup-args="-Denable_tools=true"
+          pip install . \
+            -Csetup-args="--prefix=$HOME/.local"
 
       - name: Determine test type
         id: test_type
@@ -127,22 +98,11 @@ jobs:
           # Run analysis commands using the external cluster. The dftracer/dlio run is
           # facts-enabled (output=console on the time_range axis) so it both validates the
           # analysis AND prints the Analysis Facts table to the CI log -- a single run, no
-          # duplicate. darshan/recorder run only in the full suite.
-          if [[ "${{ steps.test_type.outputs.test_type }}" == "full" ]]; then
-            dfanalyzer analyzer=darshan trace_path=tests/data/extracted/darshan-posix-dxt \
-              cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address
-            dfanalyzer analyzer=recorder trace_path=tests/data/extracted/recorder-posix-parquet \
-              cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address
-            dfanalyzer analyzer=dftracer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
-              cluster=external cluster.restart_on_connect=True cluster.scheduler_address=$scheduler_address \
-              view_types=[time_range] facts.enabled=true facts.eval_mode=rule \
-              facts.eval_rule_file=tests/data/ci_facts_rules.yaml output=console 2>&1 | tee facts_console.log
-          else
-            dfanalyzer analyzer=dftracer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
-              cluster=external cluster.restart_on_connect=False cluster.scheduler_address=$scheduler_address \
-              view_types=[time_range] facts.enabled=true facts.eval_mode=rule \
-              facts.eval_rule_file=tests/data/ci_facts_rules.yaml output=console 2>&1 | tee facts_console.log
-          fi
+          # duplicate.
+          dfanalyzer analyzer=dftracer analyzer/preset=dlio trace_path=tests/data/extracted/dftracer-dlio \
+            cluster=external cluster.restart_on_connect=False cluster.scheduler_address=$scheduler_address \
+            view_types=[time_range] facts.enabled=true facts.eval_mode=rule \
+            facts.eval_rule_file=tests/data/ci_facts_rules.yaml output=console 2>&1 | tee facts_console.log
           # The dftracer/dlio run above is facts-enabled; verify facts reached the console.
           grep -q "Analysis Facts (" facts_console.log || { echo "ERROR: no analysis facts printed to console"; exit 1; }
 
@@ -150,14 +110,6 @@ jobs:
           kill $cluster_pid || true
           wait $cluster_pid 2>/dev/null || true
 
-      - name: Run C++ tooling tests
-        if: steps.test_type.outputs.test_type == 'full'
-        run: |
-          rm -rf build
-          meson build --prefix=$HOME/.local -Denable_tests=true -Denable_tools=true
-          meson compile -C build --verbose
-          meson test -C build --verbose
-          meson test -C build --verbose --setup=mpi
 
       - name: Upload test coverage
         uses: codecov/codecov-action@v3
