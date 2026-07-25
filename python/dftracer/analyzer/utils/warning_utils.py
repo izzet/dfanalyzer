@@ -7,11 +7,6 @@ def filter_warnings():
         category=FutureWarning,
         message=".*grouper",
     )
-    warnings.filterwarnings(
-        action="ignore",
-        category=FutureWarning,
-        module="dask_expr._collection"
-    )
     # TODO(izzet): Remove this once we have a proper fix for the sqrt warning
     warnings.filterwarnings(
         action="ignore",
