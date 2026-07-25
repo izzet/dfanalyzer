@@ -1,11 +1,11 @@
-"""Auto-discovered category layers for the `generic` preset, plus their display names."""
+"""Discovered category layers for the `auto` preset, plus their display names."""
 from collections import Counter
 
 import pandas as pd
 import pytest
 
 from dftracer.analyzer.analyzer import Analyzer
-from dftracer.analyzer.config import AnalyzerPresetConfigGeneric, AnalyzerPresetConfigPOSIX
+from dftracer.analyzer.config import AnalyzerPresetConfigAuto, AnalyzerPresetConfigPOSIX
 from dftracer.analyzer.constants import HUMANIZED_LAYERS
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -163,12 +163,12 @@ def test_escaped_parent_condition_still_matches_descendants():
 # --- preset wiring -----------------------------------------------------------
 
 
-def test_generic_preset_enables_category_discovery():
-    assert AnalyzerPresetConfigGeneric().auto_layers_by_category is True
+def test_auto_preset_enables_category_discovery():
+    assert AnalyzerPresetConfigAuto().auto_layers_by_category is True
 
 
-def test_generic_preset_falls_back_to_a_catch_all_layer():
-    preset = AnalyzerPresetConfigGeneric()
+def test_auto_preset_falls_back_to_a_catch_all_layer():
+    preset = AnalyzerPresetConfigAuto()
     assert preset.layer_defs == {"app": None}  # used when no categories are found
 
 
