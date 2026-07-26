@@ -271,6 +271,14 @@ HUMANIZED_LAYERS = dict(
     dlio_benchmark='DLIO Benchmark',
     config='Config',
     storage='Storage',
+    # agent preset layers ('data' is intentionally omitted: it is already humanized
+    # as 'Data' above for the pydftracer category of the same name)
+    workflow='Workflow',
+    step='Agent Step',
+    llm='LLM',
+    tool='Tool',
+    message='Message',
+    judge='Judge',
 )
 HUMANIZED_METRICS = dict(
     bw='I/O Bandwidth',

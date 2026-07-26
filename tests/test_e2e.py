@@ -1,11 +1,16 @@
+import gzip
 import json
 import os
 import pathlib
 import pytest
 import random
+import shutil
 from dask.distributed import LocalCluster
 from dftracer.analyzer import init_with_hydra
 from glob import glob
+
+# Ships as .pfw.gz, so the native indexer reads it end to end.
+GZ_TRACE_FIXTURE = pathlib.Path("tests/data/extracted/dftracer-dlio/trace-0-of-8.pfw.gz")
 
 
 # Full test matrix for comprehensive testing
@@ -169,3 +174,94 @@ def _test_e2e(
 
     # Verify that the Dask client is closed
     assert dfa.client.status == "closed", "Dask client should be closed after shutdown"
+
+
+def _hydra_overrides_for_path(trace_path, tmp_path, scheduler_address, preset="posix"):
+    return [
+        "analyzer=dftracer",
+        f"analyzer/preset={preset}",
+        "analyzer.checkpoint=False",
+        f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
+        "cluster=external",
+        "cluster.restart_on_connect=True",
+        f"cluster.scheduler_address={scheduler_address}",
+        f"hydra.run.dir={tmp_path}",
+        f"hydra.runtime.output_dir={tmp_path}",
+        f"trace_path={trace_path}",
+        "view_types=[proc_name]",
+    ]
+
+
+@pytest.mark.smoke
+def test_read_trace_handles_mixed_pfw_and_pfw_gz(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """A trace dir mixing .pfw and .pfw.gz must analyze cleanly.
+
+    The dir is built in tmp_path rather than reusing a shipped fixture so the
+    uncompressed member is guaranteed to be a real trace.
+    """
+    assert GZ_TRACE_FIXTURE.exists(), f"Missing fixture: {GZ_TRACE_FIXTURE}"
+
+    mixed_dir = tmp_path / "mixed_traces"
+    mixed_dir.mkdir()
+    shutil.copy(GZ_TRACE_FIXTURE, mixed_dir / "trace_b.pfw.gz")
+    with gzip.open(GZ_TRACE_FIXTURE, "rb") as src, (mixed_dir / "trace_a.pfw").open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+    overrides = _hydra_overrides_for_path(mixed_dir, tmp_path, dask_cluster.scheduler_address)
+    dfa = init_with_hydra(hydra_overrides=overrides)
+    try:
+        result = dfa.analyze_trace()
+        assert len(result.flat_views) == 1, "Expected one flat view"
+    finally:
+        dfa.shutdown()
+
+
+@pytest.mark.smoke
+def test_read_trace_skips_zero_byte_traces_alongside_valid(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """A trace dir mixing valid and zero-byte files must analyze cleanly,
+    with the empty files reported and skipped instead of crashing the run."""
+    assert GZ_TRACE_FIXTURE.exists(), f"Missing fixture: {GZ_TRACE_FIXTURE}"
+
+    trace_dir = tmp_path / "partial_empty"
+    trace_dir.mkdir()
+    shutil.copy(GZ_TRACE_FIXTURE, trace_dir / "valid.pfw.gz")
+    (trace_dir / "empty.pfw").write_bytes(b"")
+    (trace_dir / "empty.pfw.gz").write_bytes(b"")
+
+    overrides = _hydra_overrides_for_path(trace_dir, tmp_path, dask_cluster.scheduler_address)
+    dfa = init_with_hydra(hydra_overrides=overrides)
+    try:
+        result = dfa.analyze_trace()
+        assert len(result.flat_views) == 1
+    finally:
+        dfa.shutdown()
+
+
+@pytest.mark.smoke
+def test_read_trace_raises_clear_error_when_all_traces_are_zero_byte(
+    tmp_path: pathlib.Path,
+    dask_cluster: LocalCluster,
+) -> None:
+    """All-empty trace dir must raise ValueError with an actionable message.
+
+    The native indexer happily 'indexes' zero-byte files and yields no events,
+    so without this check the run reports a successful analysis of 0 events.
+    """
+    trace_dir = tmp_path / "all_empty"
+    trace_dir.mkdir()
+    (trace_dir / "a.pfw").write_bytes(b"")
+    (trace_dir / "b.pfw.gz").write_bytes(b"")
+
+    overrides = _hydra_overrides_for_path(trace_dir, tmp_path, dask_cluster.scheduler_address)
+    dfa = init_with_hydra(hydra_overrides=overrides)
+    try:
+        with pytest.raises(ValueError, match="zero bytes"):
+            dfa.analyze_trace()
+    finally:
+        dfa.shutdown()

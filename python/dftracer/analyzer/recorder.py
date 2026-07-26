@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 from dask.distributed import Future, get_client
-from typing import List, Union
+from typing import List, Optional, Union
 
 from .analyzer import Analyzer
 from .constants import COL_FUNC_NAME, COL_TIME, COL_TIME_END, COL_TIME_START, IO_CATS
@@ -70,7 +70,12 @@ class RecorderAnalyzer(Analyzer):
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         return traces[(traces['cat'] == CAT_POSIX) & (traces['io_cat'].isin(IO_CATS))].reduction(len, sum).persist()
 
-    def get_unique_host_count(self, traces: dd.DataFrame):
+    def get_unique_host_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        if profiles is not None and "hostname" in profiles.columns:
+            return dd.concat(
+                [traces["hostname"], profiles["hostname"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["hostname"].nunique()
 
     @staticmethod

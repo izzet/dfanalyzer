@@ -26,6 +26,7 @@ from dftracer.utils.dfanalyzer import (
 )
 from dftracer.utils.dask import _assign_files_by_pid, register_auto_thread_plugin
 from dask.distributed import Client, get_client, wait
+from glob import glob
 from typing import Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer, HLM_AGG, HLM_EXTRA_COLS
@@ -241,11 +242,60 @@ class DFTracerAnalyzer(Analyzer):
         super().__init__(preset, **kwargs)
         self.assign_epochs = assign_epochs
         self.trace_groups = list(trace_groups) if trace_groups else None
+        self._zero_byte_warned: set = set()
 
     def analyze_trace(self, trace_path, *args, **kwargs):
         """Transparent indexing: ensure the dftracer index exists, then analyze."""
+        self._check_zero_byte_traces(trace_path)
         ensure_index(trace_path, self.trace_groups, self.time_granularity * 1000.0)
         return super().analyze_trace(trace_path, *args, **kwargs)
+
+    def _list_trace_files(self, trace_path) -> List[str]:
+        """Every .pfw/.pfw.gz file the indexer would pick up for ``trace_path``."""
+        directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
+        if files:
+            return list(files)
+        if not directory:
+            return []
+        found = set()
+        for suffix in ("pfw", "pfw.gz"):
+            found.update(glob(os.path.join(directory, "**", f"*.{suffix}"), recursive=True))
+        return sorted(found)
+
+    def _check_zero_byte_traces(self, trace_path) -> None:
+        """Warn about zero-byte traces, and fail loudly if every trace is empty.
+
+        The C++ indexer tolerates zero-byte trace files: it reports them as
+        indexed and yields no events. That is silent data loss when tracing was
+        misconfigured, so surface it here instead of reporting a successful run
+        with a count of zero.
+
+        ``analyze_trace`` and both read paths call this so direct
+        ``read_trace`` users are covered too; the warning is emitted once per
+        trace path.
+        """
+        all_files = self._list_trace_files(trace_path)
+        if not all_files:
+            return
+        empty = [p for p in all_files if os.path.getsize(p) == 0]
+        if not empty:
+            return
+        if len(empty) == len(all_files):
+            raise ValueError(
+                f"All {len(empty)} trace files in {trace_path} are zero bytes; "
+                "tracing may be misconfigured (DFTRACER_ENABLE not set, "
+                "LD_PRELOAD missing, or the traced process exited before "
+                "flushing its trace buffer)."
+            )
+        if trace_path in self._zero_byte_warned:
+            return
+        self._zero_byte_warned.add(trace_path)
+        logger.warning(
+            "Skipping zero-byte trace files",
+            num_empty=len(empty),
+            num_total=len(all_files),
+            files=[os.path.basename(p) for p in empty],
+        )
 
     def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None):
         """Read trace using C++ aggregation pipeline.
@@ -267,6 +317,7 @@ class DFTracerAnalyzer(Analyzer):
             # Configure aggregation to match analyzer time granularity
             time_interval_ms = self.time_granularity * 1000.0  # seconds to ms
 
+            self._check_zero_byte_traces(trace_path)
             directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
@@ -397,6 +448,7 @@ class DFTracerAnalyzer(Analyzer):
             time_interval_ms = self.time_granularity * 1000.0
             register_auto_thread_plugin()
 
+            self._check_zero_byte_traces(trace_path)
             directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
@@ -826,14 +878,31 @@ class DFTracerAnalyzer(Analyzer):
     def get_total_event_count(self, traces: dd.DataFrame) -> int:
         return traces[COL_COUNT].sum().persist()
 
-    def get_unique_file_count(self, traces: dd.DataFrame):
+    def get_unique_file_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
         file_hash = traces["file_hash"]
-        return file_hash[file_hash != ""].nunique()
+        file_hash = file_hash[file_hash != ""]
+        if profiles is not None and "file_hash" in profiles.columns:
+            profile_file_hash = profiles["file_hash"]
+            return dd.concat(
+                [file_hash, profile_file_hash[profile_file_hash != ""]],
+                interleave_partitions=True,
+            ).nunique()
+        return file_hash.nunique()
 
-    def get_unique_host_count(self, traces: dd.DataFrame):
+    def get_unique_host_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        if profiles is not None and "host_hash" in profiles.columns:
+            return dd.concat(
+                [traces["host_hash"], profiles["host_hash"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["host_hash"].nunique()
 
-    def get_unique_process_count(self, traces: dd.DataFrame):
+    def get_unique_process_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        if profiles is not None and "pid" in profiles.columns:
+            return dd.concat(
+                [traces["pid"], profiles["pid"]],
+                interleave_partitions=True,
+            ).nunique()
         return traces["pid"].nunique()
 
     @staticmethod

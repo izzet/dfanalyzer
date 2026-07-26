@@ -26,7 +26,14 @@ from .analysis_utils import (
     set_unique_counts,
     split_duration_records_vectorized,
 )
-from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
+from .config import (
+    CHECKPOINT_VIEWS,
+    DEFAULT_HLM_FIELDS,
+    HASH_CHECKPOINT_NAMES,
+    AdditionalFieldConfig,
+    AnalyzerPresetConfig,
+    FactsConfig,
+)
 from .fact_engine import FactEngine, FactPipeline
 from .constants import (
     COL_COUNT,
@@ -74,6 +81,7 @@ HLM_AGG = {
     "size": "sum",
 }
 HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
+SUPPORTED_ADDITIONAL_FIELD_AGGS = {"sum", "min", "max", "unique_set"}
 # Categories whose events carry a transfer size, so their layers keep size/bandwidth.
 SIZE_CATEGORY_PREFIXES = ("posix", "stdio")
 PARTITION_SIZE = "128MB"
@@ -86,6 +94,7 @@ class Analyzer(abc.ABC):
     def __init__(
         self,
         preset: AnalyzerPresetConfig,
+        additional_fields: Optional[Dict[str, AdditionalFieldConfig]] = None,
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
@@ -103,6 +112,8 @@ class Analyzer(abc.ABC):
 
         Args:
             preset: The configuration preset for the analyzer.
+            additional_fields: Extra per-event columns to extract, overriding
+                any same-named entry declared by the preset.
             checkpoint: Whether to enable checkpointing of intermediate results.
             checkpoint_dir: Directory to store checkpoint data.
             debug: Whether to enable debug mode.
@@ -135,14 +146,192 @@ class Analyzer(abc.ABC):
         self.facts_config = self._build_facts_config(facts_config)
         self.fact_pipeline = None
         self._build_fact_pipeline()
-        self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
+        lv = preset.logical_views
+        self.logical_views = dict(OmegaConf.to_object(lv)) if OmegaConf.is_config(lv) else dict(lv)  # type: ignore
         self.preset = preset
+        self.additional_fields = self._merge_additional_fields(
+            preset_additional_fields=getattr(preset, "additional_fields", None),
+            override_additional_fields=additional_fields,
+        )
+        # Longest names first so `_match_additional_field` prefers the most
+        # specific suffix when one field name is a suffix of another.
+        self._additional_field_names = tuple(sorted(self.additional_fields.keys(), key=len, reverse=True))
+        self._additional_unique_set_fields = {
+            name for name, field_cfg in self.additional_fields.items() if field_cfg.agg == "unique_set"
+        }
+        # A preset that widens hlm_fields puts sparse columns (e.g. the agent preset's
+        # `step`) into the HLM groupby, where the pandas default of dropna=True
+        # would silently discard every event that lacks them. Only such presets
+        # opt into NA groups; presets on the default fields keep pandas'
+        # drop-NA semantics so their existing view contents are unchanged.
+        self._groupby_dropna = list(self.preset.hlm_fields) == list(DEFAULT_HLM_FIELDS)
         self.time_approximate = time_approximate
         self.time_granularity = time_granularity
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
         self.verbose = verbose
         ensure_dir(self.checkpoint_dir)
+
+    @staticmethod
+    def _normalize_additional_fields(
+        additional_fields: Optional[Dict[str, AdditionalFieldConfig]],
+    ) -> Dict[str, AdditionalFieldConfig]:
+        if not additional_fields:
+            return {}
+
+        normalized_fields = (
+            OmegaConf.to_object(additional_fields) if OmegaConf.is_config(additional_fields) else additional_fields
+        )
+        result: Dict[str, AdditionalFieldConfig] = {}
+        for field_name, field_cfg in normalized_fields.items():  # type: ignore[union-attr]
+            if isinstance(field_cfg, AdditionalFieldConfig):
+                config = AdditionalFieldConfig(
+                    source=field_cfg.source,
+                    dtype=field_cfg.dtype,
+                    agg=field_cfg.agg.lower(),
+                )
+            elif isinstance(field_cfg, dict):
+                config = AdditionalFieldConfig(
+                    source=field_cfg["source"],
+                    dtype=field_cfg["dtype"],
+                    agg=field_cfg.get("agg", "sum").lower(),
+                )
+            else:
+                raise TypeError(
+                    f"additional_fields['{field_name}'] must be an AdditionalFieldConfig or dict, "
+                    f"got {type(field_cfg)!r}"
+                )
+            Analyzer._validate_additional_field(field_name=field_name, field_cfg=config)
+            result[field_name] = config
+        return result
+
+    @staticmethod
+    def _validate_additional_field(field_name: str, field_cfg: AdditionalFieldConfig):
+        if not field_cfg.source:
+            raise ValueError(f"additional_fields['{field_name}'].source must be defined")
+        if field_cfg.agg not in SUPPORTED_ADDITIONAL_FIELD_AGGS:
+            raise ValueError(
+                f"additional_fields['{field_name}'].agg must be one of "
+                f"{sorted(SUPPORTED_ADDITIONAL_FIELD_AGGS)}, got {field_cfg.agg!r}"
+            )
+        try:
+            field_dtype = pd.Series([], dtype=field_cfg.dtype).dtype
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"additional_fields['{field_name}'].dtype={field_cfg.dtype!r} is not a valid pandas dtype"
+            ) from error
+
+        if field_cfg.agg != "unique_set" and not pd.api.types.is_numeric_dtype(field_dtype):
+            raise ValueError(
+                f"additional_fields['{field_name}'].agg={field_cfg.agg!r} requires a numeric dtype, "
+                f"got {field_cfg.dtype!r}"
+            )
+
+    @classmethod
+    def _merge_additional_fields(
+        cls,
+        preset_additional_fields: Optional[Dict[str, AdditionalFieldConfig]],
+        override_additional_fields: Optional[Dict[str, AdditionalFieldConfig]],
+    ) -> Dict[str, AdditionalFieldConfig]:
+        preset_fields = cls._normalize_additional_fields(preset_additional_fields)
+        override_fields = cls._normalize_additional_fields(override_additional_fields)
+        return {**preset_fields, **override_fields}
+
+    @staticmethod
+    def _resolve_additional_field_source(json_dict: dict, source: str):
+        value = json_dict
+        for part in source.split("."):
+            if not hasattr(value, '__getitem__') or part not in value:
+                return None
+            value = value[part]
+        return value
+
+    @staticmethod
+    def _coerce_additional_field_value(value, dtype: str):
+        if value is None or value is pd.NA:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+
+        dtype_obj = pd.Series([], dtype=dtype).dtype
+        if pd.api.types.is_string_dtype(dtype_obj):
+            return str(value)
+        if pd.api.types.is_bool_dtype(dtype_obj):
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "t", "yes", "y"}:
+                    return True
+                if lowered in {"0", "false", "f", "no", "n"}:
+                    return False
+            return bool(value)
+        if pd.api.types.is_integer_dtype(dtype_obj):
+            return int(value)
+        if pd.api.types.is_float_dtype(dtype_obj):
+            return float(value)
+        return value
+
+    def _build_additional_field_columns(self) -> Dict[str, str]:
+        return {field_name: field_cfg.dtype for field_name, field_cfg in self.additional_fields.items()}
+
+    def _build_additional_field_extractor(self) -> Callable[[dict], dict]:
+        field_specs = tuple(
+            (field_name, field_cfg.source, field_cfg.dtype) for field_name, field_cfg in self.additional_fields.items()
+        )
+
+        def extract_additional_fields(json_dict: dict) -> dict:
+            values = {}
+            for field_name, source, dtype in field_specs:
+                value = Analyzer._resolve_additional_field_source(json_dict=json_dict, source=source)
+                if value is None:
+                    continue
+                coerced_value = Analyzer._coerce_additional_field_value(value=value, dtype=dtype)
+                if coerced_value is not None:
+                    values[field_name] = coerced_value
+            return values
+
+        return extract_additional_fields
+
+    def _match_additional_field(self, col: str) -> Optional[str]:
+        for field_name in self._additional_field_names:
+            if col == field_name or col.endswith(f"_{field_name}"):
+                return field_name
+        return None
+
+    @staticmethod
+    def _matches_suffix(col: str, suffixes: List[str]) -> bool:
+        return any(col == suffix or col.endswith(f"_{suffix}") for suffix in suffixes)
+
+    def _get_hlm_additional_aggregations(self) -> Dict[str, object]:
+        hlm_fields = set(self.preset.hlm_fields)
+        hlm_agg = {}
+        for field_name, field_cfg in self.additional_fields.items():
+            if field_name in hlm_fields:
+                continue
+            if field_cfg.agg == "unique_set":
+                hlm_agg[field_name] = unique_set()
+            else:
+                hlm_agg[field_name] = field_cfg.agg
+        return hlm_agg
+
+    def _get_rollup_aggregation(self, col: str, view_type_suffixes: List[str]):
+        if self._matches_suffix(col=col, suffixes=view_type_suffixes):
+            return unique_set_flatten()
+        # Per-call statistics columns from two-track stats
+        if col.endswith("_call_min"):
+            return "min"
+        if col.endswith("_call_max"):
+            return "max"
+        if col.endswith("_sq"):
+            return "sum"
+        additional_field = self._match_additional_field(col)
+        if additional_field is None:
+            return "sum"
+        if self.additional_fields[additional_field].agg == "unique_set":
+            return unique_set_flatten()
+        return self.additional_fields[additional_field].agg
 
     @staticmethod
     def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
@@ -301,6 +490,9 @@ class Analyzer(abc.ABC):
             An AnalysisResult object containing the analysis results.
         """
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+        if extra_columns is None and extra_columns_fn is None and self.additional_fields:
+            extra_columns = self._build_additional_field_columns()
+            extra_columns_fn = self._build_additional_field_extractor()
         read_result = None
         profiles = None
         traces = None
@@ -326,9 +518,40 @@ class Analyzer(abc.ABC):
                 raw_stats = self.read_stats(traces=traces, profiles=profiles)
             with log_block("postread_trace"):
                 traces = self.postread_trace(traces=traces, view_types=proc_view_types)
+            # Category-layer discovery REWRITES preset.layer_defs, and
+            # apply_time_correlation resolves its `layer` against those defs.
+            # Discovery therefore has to run first so correlation always sees
+            # the authoritative layer set: if a preset ever enabled both, the
+            # `tc.layer in layer_defs` guard would then correctly decline to
+            # correlate against a layer name that discovery removed, instead of
+            # silently correlating on a stale definition.
             if getattr(self.preset, "auto_layers_by_category", False):
                 with log_block("build_category_layers"):
                     self._build_category_layers(traces=traces)
+            with log_block("set_file_format"):
+                traces = self.set_file_format(traces)
+                # Profile events (ph="C" from the aggregator) share the
+                # view_types groupby, so they must also carry the derived
+                # file_format column or _compute_profile_hlm would KeyError at
+                # groupby time.
+                if profiles is not None:
+                    profiles = self.set_file_format(profiles)
+                    read_result.profiles = profiles
+            with log_block("time_correlation"):
+                traces = self.apply_time_correlation(traces, extra_boundary_sources=[profiles])
+                # Also correlate profile events. Semantic span events may live
+                # in EITHER stream depending on aggregation mode: in SELECTIVE
+                # mode (cat IN POSIX/STDIO) spans stay as X events in traces;
+                # in FULL mode they become C events in profiles.
+                # apply_time_correlation tries each candidate source until it
+                # finds boundaries.
+                if profiles is not None:
+                    profiles = self.apply_time_correlation(
+                        profiles,
+                        boundary_source=traces,
+                        extra_boundary_sources=[profiles],
+                    )
+                    read_result.profiles = profiles
             with log_block("set_size_bins"):
                 traces = traces.map_partitions(set_size_bins)
             if self.time_sliced:
@@ -421,9 +644,9 @@ class Analyzer(abc.ABC):
         trace_event_count = self.get_total_event_count(traces)
         profile_event_count = self.get_profile_event_count(profiles)
         total_event_count = trace_event_count + profile_event_count
-        unique_file_count = self.get_unique_file_count(traces)
-        unique_host_count = self.get_unique_host_count(traces)
-        unique_process_count = self.get_unique_process_count(traces)
+        unique_file_count = self.get_unique_file_count(traces, profiles)
+        unique_host_count = self.get_unique_host_count(traces, profiles)
+        unique_process_count = self.get_unique_process_count(traces, profiles)
         raw_stats_data = self.restore_extra_data(
             name=self.get_stats_checkpoint_name(),
             fallback=lambda: dict(
@@ -818,37 +1041,48 @@ class Analyzer(abc.ABC):
             return profiles[COL_COUNT].fillna(0).sum().persist()
         return profiles.index.count().persist()
 
-    def get_unique_host_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique hosts accessed in the traces.
+    def get_unique_host_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        """Computes the total number of unique hosts accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique hosts accessed as an integer.
+        When ``profiles`` is provided and shares the host column, the unique
+        count is taken over the union of trace and profile rows so aggregated
+        events contribute. Without this, hosts seen only via aggregated profile
+        events would be missed.
         """
+        if profiles is not None and COL_HOST_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_HOST_NAME], profiles[COL_HOST_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_HOST_NAME].nunique()
 
-    def get_unique_file_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique files accessed in the traces.
+    def get_unique_file_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        """Computes the total number of unique files accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique files accessed as an integer.
+        When ``profiles`` is provided and shares the file column, the unique
+        count is taken over the union of trace and profile rows so aggregated
+        events contribute. Without this, files seen only via aggregated profile
+        events would be missed.
         """
+        if profiles is not None and COL_FILE_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_FILE_NAME], profiles[COL_FILE_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_FILE_NAME].nunique()
 
-    def get_unique_process_count(self, traces: dd.DataFrame):
-        """Computes the total number of unique processes accessed in the traces.
+    def get_unique_process_count(self, traces: dd.DataFrame, profiles: Optional[dd.DataFrame] = None):
+        """Computes the total number of unique processes accessed.
 
-        Args:
-            traces: A Dask DataFrame containing the I/O trace data.
-
-        Returns:
-            The total count of unique processes accessed as an integer.
+        When ``profiles`` is provided and shares the proc column, the unique
+        count is taken over the union of trace and profile rows so aggregated
+        events contribute.
         """
+        if profiles is not None and COL_PROC_NAME in profiles.columns:
+            return dd.concat(
+                [traces[COL_PROC_NAME], profiles[COL_PROC_NAME]],
+                interleave_partitions=True,
+            ).nunique()
         return traces[COL_PROC_NAME].nunique()
 
     def has_checkpoint(self, name: str):
@@ -958,6 +1192,111 @@ class Analyzer(abc.ABC):
                 return dd.read_parquet(view_path)
         with log_block("restore_view_fallback_build_no_ckpt", name=name):
             return fallback()
+
+    def set_file_format(self, traces: dd.DataFrame) -> dd.DataFrame:
+        """Derive a ``file_format`` column from the ``file_name`` extension.
+
+        A no-op for record sources that carry no file name (e.g. recorder
+        parquet traces after column pruning).
+        """
+        if COL_FILE_NAME not in traces.columns:
+            return traces
+        traces['file_format'] = (
+            traces[COL_FILE_NAME].str.extract(r'\.([^./]+)$', expand=False).str.lower().fillna('unknown')
+        )
+        return traces
+
+    def apply_time_correlation(
+        self,
+        traces: dd.DataFrame,
+        boundary_source: Optional[dd.DataFrame] = None,
+        extra_boundary_sources: Optional[List[dd.DataFrame]] = None,
+    ) -> dd.DataFrame:
+        """Propagate fields from source-layer events to all events via time-window overlap.
+
+        Boundary extraction tries each source in order: first ``boundary_source``
+        if supplied (else ``traces``), then each of ``extra_boundary_sources``.
+        The first non-empty source wins. This is needed because with aggregation
+        enabled, the semantic spans (step / llm / tool) may end up in either the
+        trace stream (SELECTIVE mode, where they aren't aggregated and stay as X
+        events) or the profile stream (FULL mode, where they get aggregated into
+        C events); the correlator needs to find them wherever they are.
+        """
+        tc = self.preset.time_correlation
+        if not tc or not tc.enabled or not tc.field:
+            return traces
+        fields = [f for f in tc.field if f in traces.columns]
+        if not fields:
+            return traces
+        source_candidates = [boundary_source if boundary_source is not None else traces]
+        if extra_boundary_sources:
+            source_candidates.extend(s for s in extra_boundary_sources if s is not None)
+        boundaries = None
+        boundary_cols = [COL_TIME_START, COL_TIME_END] + fields
+        for cand in source_candidates:
+            if cand is None:
+                continue
+            cand_fields = [f for f in fields if f in cand.columns]
+            if not cand_fields:
+                continue
+            if tc.layer and tc.layer in (self.preset.layer_defs or {}):
+                layer_query = self.preset.layer_defs[tc.layer]
+                try:
+                    source = cand.query(layer_query)
+                except Exception:
+                    continue
+            else:
+                source = cand[cand[cand_fields[0]].notna()]
+            try:
+                candidate_boundaries = source[boundary_cols].compute()
+            except Exception:
+                continue
+            if not candidate_boundaries.empty:
+                boundaries = candidate_boundaries
+                break
+        if boundaries is None or boundaries.empty:
+            return traces
+        boundaries = boundaries.sort_values(COL_TIME_START).reset_index(drop=True)
+        return traces.map_partitions(
+            self._correlate_partition,
+            boundaries=boundaries,
+            fields=fields,
+        )
+
+    @staticmethod
+    def _correlate_partition(partition, boundaries, fields):
+        """Assign field values to events based on time-window overlap with boundary events.
+
+        Computes the time-window index mapping once, then fills all requested
+        fields in a single pass over the partition.
+        """
+        partition = partition.copy()
+        boundary_starts = boundaries[COL_TIME_START].to_numpy(dtype='int64', na_value=0)
+        boundary_ends = boundaries[COL_TIME_END].to_numpy(dtype='int64', na_value=0)
+        if len(boundary_starts) == 0:
+            return partition
+
+        for field in fields:
+            needs_fill = partition[field].isna()
+            if not needs_fill.any():
+                continue
+            event_starts = partition.loc[needs_fill, COL_TIME_START].to_numpy(dtype='int64', na_value=0)
+            if len(event_starts) == 0:
+                continue
+            indices = np.searchsorted(boundary_starts, event_starts, side='right') - 1
+            valid = (indices >= 0) & (indices < len(boundary_starts))
+            clipped = np.clip(indices, 0, max(len(boundary_starts) - 1, 0))
+            valid &= (event_starts >= boundary_starts[clipped]) & (event_starts <= boundary_ends[clipped])
+            boundary_values = boundaries[field]
+            if pd.api.types.is_string_dtype(boundary_values):
+                values = boundary_values.to_numpy(dtype='object')
+                result = np.full(len(event_starts), fill_value=None, dtype='object')
+            else:
+                values = boundary_values.to_numpy(dtype='float64', na_value=np.nan)
+                result = np.full(len(event_starts), fill_value=np.nan, dtype='float64')
+            result[valid] = values[clipped[valid]]
+            partition.loc[needs_fill, field] = result
+        return partition
 
     @staticmethod
     def set_layer_metrics(
@@ -1299,8 +1638,17 @@ class Analyzer(abc.ABC):
         view_types: list,
         partition_size: str,
     ) -> dd.DataFrame:
-        # Add layer columns
-        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
+        # Add layer columns (from the preset's hlm_fields, defaulting to HLM_EXTRA_COLS)
+        hlm_groupby = list(dict.fromkeys(view_types + list(self.preset.hlm_fields)))
+        # Profile DataFrames (from ph="C" aggregated events) can lack columns
+        # that are derived during trace post-processing or that come from
+        # `args.*` fields only present on trace events (e.g. proc_name,
+        # completion_tokens). groupby with dropna=False treats null as a valid
+        # group and sum/min/max over all-null columns yields NA, so filling
+        # absent columns with NA is a faithful no-op for aggregation.
+        missing_groupby_cols = [c for c in hlm_groupby if c not in traces.columns]
+        if missing_groupby_cols:
+            traces = traces.assign(**{c: pd.NA for c in missing_groupby_cols})
         # Build agg_dict
         bin_cols = [col for col in traces.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
@@ -1323,8 +1671,16 @@ class Analyzer(abc.ABC):
         hlm_agg["time_call_max"] = "max"
         hlm_agg["size_call_min"] = "min"
         hlm_agg["size_call_max"] = "max"
+        # Wire in additional_fields aggregations, skipping fields already in groupby
+        hlm_fields_set = set(hlm_groupby)
+        hlm_agg.update({k: v for k, v in self._get_hlm_additional_aggregations().items() if k not in hlm_fields_set})
+        # Same fallback as above: also cover agg-dict columns absent from the
+        # profile (or non-agent trace) schema.
+        missing_agg_cols = [c for c in hlm_agg if c not in traces.columns]
+        if missing_agg_cols:
+            traces = traces.assign(**{c: pd.NA for c in missing_agg_cols})
         hlm = (
-            traces.groupby(hlm_groupby)
+            traces.groupby(hlm_groupby, dropna=self._groupby_dropna)
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
             .persist()
             .repartition(partition_size=partition_size)
@@ -1501,7 +1857,7 @@ class Analyzer(abc.ABC):
         partition_size: str,
         layer: Optional[Layer] = None,
     ) -> dd.DataFrame:
-        hlm_groupby = list(dict.fromkeys(view_types + HLM_EXTRA_COLS))
+        hlm_groupby = list(dict.fromkeys(view_types + list(self.preset.hlm_fields)))
         trace_hlm = trace_hlm.reset_index()
         profile_hlm = profile_hlm.reset_index()
         for col in hlm_groupby:
@@ -1526,7 +1882,7 @@ class Analyzer(abc.ABC):
             if col in combined_hlm.columns:
                 hlm_agg[col] = unique_set_flatten()
         hlm = (
-            combined_hlm.groupby(hlm_groupby)
+            combined_hlm.groupby(hlm_groupby, dropna=self._groupby_dropna)
             .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
             .persist()
             .repartition(partition_size=partition_size)
@@ -1557,21 +1913,15 @@ class Analyzer(abc.ABC):
                 size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
             )
         with log_block("build_agg_dict", layer=layer):
-            view_types_diff = set(VIEW_TYPES).difference(view_types)
+            view_types_diff = list(set(VIEW_TYPES).difference(view_types))
             main_view_agg = {}
             for col in hlm.columns:
-                if any(map(col.endswith, view_types_diff)):
-                    main_view_agg[col] = unique_set_flatten()
-                elif col not in HLM_EXTRA_COLS:
-                    if col.endswith("_call_min"):
-                        main_view_agg[col] = "min"
-                    elif col.endswith("_call_max"):
-                        main_view_agg[col] = "max"
-                    else:
-                        main_view_agg[col] = "sum"
+                if col in HLM_EXTRA_COLS:
+                    continue
+                main_view_agg[col] = self._get_rollup_aggregation(col=col, view_type_suffixes=view_types_diff)
         with log_block("compute_main_view", layer=layer):
             main_view = (
-                hlm.groupby(list(view_types))
+                hlm.groupby(list(view_types), dropna=self._groupby_dropna)
                 .agg(main_view_agg, split_out=hlm.npartitions)
                 .map_partitions(set_main_metrics)
                 .replace(0, pd.NA)
@@ -1590,7 +1940,7 @@ class Analyzer(abc.ABC):
     ) -> dd.DataFrame:
         is_view_process_based = self.is_view_process_based(view_key)
 
-        view_types_diff = set(VIEW_TYPES).difference(view_types)
+        view_types_diff = list(set(VIEW_TYPES).difference(view_types))
         local_view_types = records.index._meta.names
         local_view_types_diff = set(local_view_types).difference([view_type])
 
@@ -1599,9 +1949,13 @@ class Analyzer(abc.ABC):
             for col in records.columns:
                 if "_bin_" in col:
                     view_agg[col] = ["sum"]
-                elif any(map(col.endswith, view_types_diff)):
+                elif self._matches_suffix(col=col, suffixes=view_types_diff):
                     view_agg[col] = [unique_set_flatten()]
                 elif col in it.chain.from_iterable(self.logical_views.values()):
+                    view_agg[col] = [unique_set_flatten()]
+                elif (additional_field := self._match_additional_field(col)) and (
+                    self.additional_fields[additional_field].agg == "unique_set"
+                ):
                     view_agg[col] = [unique_set_flatten()]
                 elif col.endswith("_sq"):
                     view_agg[col] = ["sum"]
@@ -1627,7 +1981,11 @@ class Analyzer(abc.ABC):
                         f"Unsupported data type '{records[col].dtype}' for column '{col}'. "
                         f"Developer must add explicit handling for this data type in _compute_view method."
                     )
-            view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+            # The pre-grouping below already collapses these to sets, so the
+            # outer aggregation has to flatten rather than re-wrap them.
+            for col in local_view_types_diff:
+                pre_grouped = view_type != COL_PROC_NAME and col != COL_PROC_NAME
+                view_agg[col] = [unique_set_flatten() if pre_grouped else unique_set()]
 
         with log_block("fix_std_cols", layer=layer, view_key=view_key):
             # Fix std columns to avoid pandas extension dtypes producing object arrays inside Dask.
@@ -1637,20 +1995,22 @@ class Analyzer(abc.ABC):
         with log_block("pre_grouping", layer=layer, view_key=view_key):
             pre_view = records.reset_index()
             if view_type != COL_PROC_NAME:
-                pre_agg = {}
+                pre_group_agg = {}
                 for col in pre_view.columns:
-                    if col in (view_type, COL_PROC_NAME):
+                    if col in {view_type, COL_PROC_NAME}:
                         continue
-                    if col.endswith("_call_min"):
-                        pre_agg[col] = "min"
-                    elif col.endswith("_call_max"):
-                        pre_agg[col] = "max"
+                    if col in local_view_types_diff:
+                        pre_group_agg[col] = unique_set()
                     else:
-                        pre_agg[col] = "sum"
-                pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
+                        pre_group_agg[col] = self._get_rollup_aggregation(col=col, view_type_suffixes=view_types_diff)
+                pre_view = (
+                    pre_view.groupby([view_type, COL_PROC_NAME], dropna=self._groupby_dropna)
+                    .agg(pre_group_agg)
+                    .reset_index()
+                )
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
+            view = pre_view.groupby([view_type], dropna=self._groupby_dropna).agg(view_agg).replace(0, pd.NA)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
             view = view.rename(columns=build_view_rename_map(view.columns))
@@ -1716,12 +2076,25 @@ class Analyzer(abc.ABC):
                 time_interval=self.time_granularity,
                 time_metric=time_proc_metric,
             )
-            view = view.eval(f"{metric} = {eval_condition}")
+            # Derived metric formulas can reference columns that are absent when
+            # the HLM comes from profile-only events, or when a layer produced no
+            # rows at all (e.g. the agent preset's `llm_*` columns on a non-agent trace).
+            # A missing column surfaces as UndefinedVariableError from pandas
+            # eval; set the metric to NA and move on rather than aborting the
+            # whole analysis.
+            try:
+                view = view.eval(f"{metric} = {eval_condition}")
+            except pd.errors.UndefinedVariableError:
+                view[metric] = pd.NA
+                continue
             numerator_denominators = extract_numerator_and_denominators(eval_condition)
             if numerator_denominators:
                 _, denominators = numerator_denominators
                 if denominators:
                     denominator_conditions = [f"({denom}.isna() | {denom} == 0)" for denom in denominators]
                     mask_condition = " & ".join(denominator_conditions)
-                    view[metric] = view[metric].mask(view.eval(mask_condition), pd.NA)
+                    try:
+                        view[metric] = view[metric].mask(view.eval(mask_condition), pd.NA)
+                    except pd.errors.UndefinedVariableError:
+                        pass
         return view
