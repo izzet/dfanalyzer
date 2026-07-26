@@ -56,9 +56,6 @@ jobs:
           # [web] pulls streamlit/altair so tests/test_streamlit_app.py runs
           # instead of skipping -- the front end went unnoticed-broken for 162
           # commits precisely because nothing imported it in CI.
-          # [web] pulls streamlit/altair so tests/test_streamlit_app.py runs
-          # instead of skipping -- the front end went unnoticed-broken for 162
-          # commits precisely because nothing imported it in CI.
           pip install ".[web]"
 
       - name: Determine test type

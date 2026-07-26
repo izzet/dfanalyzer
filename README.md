@@ -114,6 +114,12 @@ Upload one or more `.pfw.gz` traces, pick a preset, and press **Analyze**.
 Uncompressed `.pfw` files are not accepted: the indexer only reads `.pfw.gz`,
 and an uncompressed trace parses to zero events.
 
+The web app is for small traces. Peak memory is roughly 290 MB of fixed
+overhead plus 11-17 MB per 1,000 trace events, so uploads are capped at 2 MB
+total and a warning appears past 450 KB. For reference, a 3.8 MB trace
+(284,041 events) peaks at about 3.5 GB — well beyond what a hosted instance
+provides. Use the CLI for anything real; it has no such cap.
+
 ## Analysis facts (DFDiagnoser integration)
 
 Beyond the human-readable summary, DFAnalyzer can emit **analysis facts** — compact,

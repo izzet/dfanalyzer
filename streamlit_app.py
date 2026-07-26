@@ -18,6 +18,36 @@ from dftracer.analyzer import init_with_hydra
 DEFAULT_TIME_GRANULARITY_IN_SECONDS = 5
 TRACE_SUFFIXES = ("pfw.gz",)
 PRESETS = ["posix", "dlio", "dlio-prev", "generic"]
+
+# Total bytes accepted across one submission. Must match maxUploadSize in
+# .streamlit/config.toml, which Streamlit enforces per *file* while this
+# uploader accepts several; tests/test_streamlit_app.py asserts they agree.
+#
+# Set from measurement, not preference. Peak RSS is ~290 MB of fixed overhead
+# plus 11-17 MB per 1,000 trace events, so against a Community Cloud allocation
+# of 690 MB guaranteed / 2.7 GB ceiling:
+#
+#     ~450 KB gzipped  (~33k events)   fits the guaranteed allocation
+#     ~2.7 MB gzipped  (~200k events)  needs the best-case ceiling
+#     3.8 MB gzipped   (284k events)   measured at 3,499 MB -- cannot work
+#
+# The hard cap therefore sits at the best case: refuse what cannot complete,
+# warn about what merely might not. Note the sibling wisio app uses 16 MB; its
+# read path is far lighter (929 MB where this one peaks at 3,499 MB on the same
+# trace), so the number does not carry across.
+MAX_UPLOAD_MB = 2
+
+# Above this, the run will likely exceed the guaranteed allocation but may still
+# succeed if the host grants more. Warn rather than block.
+WARN_UPLOAD_KB = 450
+
+# Pinned rather than left to dask's autodetect, which derives a per-worker
+# budget from the host's RAM and core count. In a container that is the host's
+# numbers, not the container's, so the worker would get a limit far above the
+# memory actually available and provide no protection at all -- on a 94 GiB /
+# 40-core host it autodetects 2.35 GiB against a Community Cloud allocation of
+# 690 MB. An explicit ceiling gives dask real spill thresholds.
+WORKER_MEMORY_LIMIT_BYTES = 2 * 1024**3
 VIEW_TYPE_MAPPING = {
     "File": "file_name",
     "Process": "proc_name",
@@ -78,6 +108,12 @@ def _run_analysis(
             # can silently return a truncated result (LLNL/dfanalyzer#69), which
             # would show up here as plausible-looking but understated numbers.
             f"cluster.n_workers={n_workers}",
+            # One in-process worker instead of a separate process. Measured on
+            # this repo's fixtures, a process-based worker costs an extra
+            # 120-210 MB because it re-imports pyarrow/pandas/dftracer, and with
+            # the 0.078-2 cores Community Cloud allows it buys no parallelism.
+            "cluster.processes=False",
+            f"cluster.memory_limit={WORKER_MEMORY_LIMIT_BYTES}",
             f"hydra.run.dir={temp_dir}",
             f"hydra.runtime.output_dir={temp_dir}",
             f"logical_view_types={logical_view_types}",
@@ -170,6 +206,26 @@ if submit:
     if not selected_views:
         st.error("Please select at least one perspective.")
         st.stop()
+
+    # Streamlit's maxUploadSize is per file, so a multi-file submission can clear
+    # it and still exhaust the host. Fail here, naming the number, rather than
+    # letting the container get OOM-killed with no explanation.
+    total_bytes = sum(len(trace_file.getbuffer()) for trace_file in trace_files)
+    if total_bytes > MAX_UPLOAD_MB * 1024**2:
+        st.error(
+            f"Uploaded {total_bytes / 1024**2:.1f} MB across {len(trace_files)} file(s), "
+            f"over the {MAX_UPLOAD_MB} MB total limit. Analysis memory grows with event "
+            "count, and a hosted instance has far less than a compute node. Run the CLI "
+            "on the full trace instead:\n\n"
+            "```\ndfanalyzer analyzer/preset=<preset> trace_path=<dir> view_types=[time_range]\n```"
+        )
+        st.stop()
+    if total_bytes > WARN_UPLOAD_KB * 1024:
+        st.warning(
+            f"{total_bytes / 1024:.0f} KB uploaded. Past roughly {WARN_UPLOAD_KB} KB the run "
+            "can exceed a hosted instance's guaranteed memory and be killed mid-analysis. "
+            "It may still succeed; the CLI is the reliable path for traces this size."
+        )
 
     view_types = [VIEW_TYPE_MAPPING[view] for view in selected_views]
 

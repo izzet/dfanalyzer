@@ -8,13 +8,16 @@ one of those in a couple of seconds.
 """
 
 import pathlib
+import re
 import pytest
 
 pytest.importorskip("streamlit", reason="streamlit is an optional extra: pip install .[web]")
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-APP_PATH = str(pathlib.Path(__file__).resolve().parents[1] / "streamlit_app.py")
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+APP_PATH = str(REPO_ROOT / "streamlit_app.py")
+STREAMLIT_CONFIG = REPO_ROOT / ".streamlit" / "config.toml"
 POSIX_TRACE_DIR = pathlib.Path("tests/data/extracted/dftracer-posix")
 
 # Ground truth for the dftracer-posix fixture, matching tests/test_e2e.py.
@@ -33,6 +36,29 @@ def test_streamlit_app_renders():
 
     # Uncompressed .pfw parses to nothing (see #63), so it must not be offered.
     assert at.file_uploader[0].allowed_type == [".pfw.gz"]
+
+
+@pytest.mark.smoke
+def test_upload_limit_matches_streamlit_config():
+    """The per-file cap and the whole-submission cap must not drift apart.
+
+    Streamlit enforces maxUploadSize per file; the app enforces MAX_UPLOAD_MB
+    across a submission. Two copies of one number is exactly the kind of
+    constant that rots silently.
+    """
+    assert STREAMLIT_CONFIG.is_file(), (
+        f"{STREAMLIT_CONFIG} is missing, so Streamlit's 200 MB default applies"
+    )
+    config_match = re.search(r"^\s*maxUploadSize\s*=\s*(\d+)", STREAMLIT_CONFIG.read_text(), re.M)
+    assert config_match, "maxUploadSize not set in .streamlit/config.toml"
+
+    app_match = re.search(r"^MAX_UPLOAD_MB\s*=\s*(\d+)", pathlib.Path(APP_PATH).read_text(), re.M)
+    assert app_match, "MAX_UPLOAD_MB not defined in streamlit_app.py"
+
+    assert int(config_match.group(1)) == int(app_match.group(1)), (
+        f"maxUploadSize={config_match.group(1)} MB in .streamlit/config.toml but "
+        f"MAX_UPLOAD_MB={app_match.group(1)} MB in streamlit_app.py"
+    )
 
 
 @pytest.mark.full
