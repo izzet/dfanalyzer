@@ -1,3 +1,4 @@
+import dask
 import json
 import os
 import pathlib
@@ -16,6 +17,19 @@ full_analyzer_trace_params = [
 ]
 full_checkpoint_params = [True, False]
 
+# Ground-truth event/process counts per fixture, measured with a single worker.
+#
+# Without these, the e2e assertions below (view counts, layer counts, a
+# checkpoint glob) all hold on an empty result, so a fixture that silently
+# loads zero events keeps CI green while testing nothing -- exactly what
+# happened before #63, when the dftracer fixtures shipped uncompressed .pfw
+# traces the indexer could not read.
+EXPECTED_TRACE_STATS = {
+    "tests/data/extracted/dftracer-ai": (125669, 1),
+    "tests/data/extracted/dftracer-dlio": (18039, 8),
+    "tests/data/extracted/dftracer-posix": (2056, 1),
+}
+
 # Reduced matrix for smoke testing (fast runs)
 smoke_analyzer_trace_params = [random.choice(full_analyzer_trace_params)]
 smoke_checkpoint_params = [False]  # Skip checkpoint to make tests faster
@@ -27,6 +41,22 @@ def dask_cluster():
     yield cluster
     # This teardown code runs after all tests are done
     cluster.close()
+
+
+@pytest.mark.smoke
+def test_expected_trace_stats_keys_are_live() -> None:
+    """Every entry in EXPECTED_TRACE_STATS must name a fixture that is tested.
+
+    A key that no longer matches any parameter is not an error anyone sees --
+    the lookup just misses and the assertion silently stops running. That is
+    how renaming a fixture quietly removes its coverage.
+    """
+    tested = {trace_path for _, _, trace_path in full_analyzer_trace_params}
+    dead = sorted(set(EXPECTED_TRACE_STATS) - tested)
+    assert not dead, (
+        f"EXPECTED_TRACE_STATS keys match no tested fixture: {dead}. "
+        "Update them alongside any fixture rename, or their assertions stop running."
+    )
 
 
 @pytest.mark.full
@@ -161,6 +191,22 @@ def _test_e2e(
     )
     if checkpoint:
         assert any(glob(f"{result.checkpoint_dir}/*.parquet")), "No checkpoint found"
+
+    expected = EXPECTED_TRACE_STATS.get(trace_path)
+    if expected is not None:
+        expected_events, expected_procs = expected
+        raw_stats = dask.compute(result.raw_stats)[0]
+        stats = raw_stats if isinstance(raw_stats, dict) else raw_stats.__dict__
+        actual_events = int(stats["total_event_count"])
+        actual_procs = int(stats["unique_process_count"])
+        assert actual_events == expected_events, (
+            f"{trace_path}: expected {expected_events} events, got {actual_events}. "
+            "A zero or short count means the trace was not read, not that the "
+            "analysis is empty."
+        )
+        assert actual_procs == expected_procs, (
+            f"{trace_path}: expected {expected_procs} processes, got {actual_procs}"
+        )
 
     # Shutdown the Dask client and cluster
     dfa.shutdown()
