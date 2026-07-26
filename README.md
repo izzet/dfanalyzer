@@ -100,6 +100,20 @@ DFAnalyzer also provides a detailed breakdown of performance metrics for each la
 └───────────────────────────┴───────────────────┴───────────────────┴────────────┴─────────────────────┴────────────────────┘
 ```
 
+### Web app
+
+A Streamlit front end is available for interactive analysis. It uploads traces,
+runs the same analysis as the CLI, and renders the per-layer breakdown.
+
+```bash
+pip install ".[app]"
+streamlit run streamlit_app.py
+```
+
+Upload one or more `.pfw.gz` traces, pick a preset, and press **Analyze**.
+Uncompressed `.pfw` files are not accepted: the indexer only reads `.pfw.gz`,
+and an uncompressed trace parses to zero events.
+
 ## Analysis facts (DFDiagnoser integration)
 
 Beyond the human-readable summary, DFAnalyzer can emit **analysis facts** — compact,
