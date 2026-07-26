@@ -10,7 +10,7 @@ one of those in a couple of seconds.
 import pathlib
 import pytest
 
-pytest.importorskip("streamlit", reason="streamlit is an optional extra: pip install .[app]")
+pytest.importorskip("streamlit", reason="streamlit is an optional extra: pip install .[web]")
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 

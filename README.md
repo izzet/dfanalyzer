@@ -106,7 +106,7 @@ A Streamlit front end is available for interactive analysis. It uploads traces,
 runs the same analysis as the CLI, and renders the per-layer breakdown.
 
 ```bash
-pip install ".[app]"
+pip install ".[web]"
 streamlit run streamlit_app.py
 ```
 
