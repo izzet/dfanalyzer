@@ -54,7 +54,7 @@ raw_stats: RawStats = {}
 with st.form('analysis_form'):
     trace_files = st.file_uploader(
         "Upload a trace file",
-        type=["pfw", "pfw.gz"],
+        type=["pfw.gz"],
         accept_multiple_files=True,
     )
 
