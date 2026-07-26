@@ -1,5 +1,4 @@
 from importlib.metadata import PackageNotFoundError, version
-import dask
 import structlog
 from dataclasses import dataclass
 from distributed import Client
@@ -27,9 +26,6 @@ except PackageNotFoundError:
     pass
 
 filter_warnings()
-
-# TODO(izzet): Suppress Dask warnings that are not relevant to the user
-dask.config.set({"dataframe.query-planning-warning": False})
 
 try:
     from .darshan import DarshanAnalyzer
