@@ -13,7 +13,6 @@ from .cluster import ClusterType, ExternalCluster
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
 from .output import ConsoleOutput, CSVOutput, JSONOutput, SQLiteOutput
-from .recorder import RecorderAnalyzer
 from .types import ViewType
 from .utils.log_utils import configure_logging, log_block
 from .utils.warning_utils import filter_warnings
@@ -27,12 +26,7 @@ except PackageNotFoundError:
 
 filter_warnings()
 
-try:
-    from .darshan import DarshanAnalyzer
-except ModuleNotFoundError:
-    DarshanAnalyzer = Analyzer
-
-AnalyzerType = Union[DarshanAnalyzer, DFTracerAnalyzer, RecorderAnalyzer]
+AnalyzerType = DFTracerAnalyzer
 OutputType = Union[ConsoleOutput, JSONOutput, CSVOutput, SQLiteOutput]
 
 

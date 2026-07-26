@@ -32,6 +32,6 @@ COPY . .
 
 RUN pip install --upgrade pip && \
     pip install build "meson>=1.5.0,!=1.10.0" meson-python setuptools streamlit wheel && \
-    pip install .[darshan] -Csetup-args="-Denable_tools=true"
+    pip install .
 
 ENTRYPOINT ["dfanalyzer"]

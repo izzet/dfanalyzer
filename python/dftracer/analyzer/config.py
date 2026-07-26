@@ -320,13 +320,6 @@ class AnalyzerConfig:
 
 
 @dc.dataclass
-class DarshanAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dftracer.analyzer.darshan.DarshanAnalyzer"
-    time_granularity: Optional[float] = 1
-    time_resolution: Optional[float] = 1e3
-
-
-@dc.dataclass
 class DFTracerAnalyzerConfig(AnalyzerConfig):
     _target_: str = "dftracer.analyzer.dftracer.DFTracerAnalyzer"
     assign_epochs: Optional[bool] = False
@@ -335,13 +328,6 @@ class DFTracerAnalyzerConfig(AnalyzerConfig):
     # When trace_path points at a dftracer_organize output dir (has manifest.json),
     # restrict loading to these groups. None or empty means "read everything".
     trace_groups: Optional[List[str]] = None
-
-
-@dc.dataclass
-class RecorderAnalyzerConfig(AnalyzerConfig):
-    _target_: str = "dftracer.analyzer.recorder.RecorderAnalyzer"
-    time_granularity: Optional[float] = 1
-    time_resolution: Optional[float] = 1e7
 
 
 @dc.dataclass
@@ -518,9 +504,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="hydra/help", name="custom", node=dc.asdict(CustomHelpConfig()))
     cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
     cs.store(name="config", node=Config)
-    cs.store(group="analyzer", name="darshan", node=DarshanAnalyzerConfig)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
-    cs.store(group="analyzer", name="recorder", node=RecorderAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="generic", node=AnalyzerPresetConfigGeneric)
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)

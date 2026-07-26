@@ -41,7 +41,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-darshan = ["darshan>=3.4"]
 dev = ["pytest>=8.0", "pytest-forked>=1.6", "py>=1.11"]
 
 [project.scripts]

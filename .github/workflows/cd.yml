@@ -51,7 +51,7 @@ jobs:
           pip install --upgrade auditwheel build "meson>=1.5.0,!=1.10.0" meson-python patchelf setuptools wheel
       - name: Build DFAnalyzer
         run: |
-          python3 -m build -Csetup-args="--prefix=$HOME/.local" -Csetup-args="-Denable_tools=true" .
+          python3 -m build -Csetup-args="--prefix=$HOME/.local" .
           target_platform=$(auditwheel show dist/*.whl | grep manylinux_ | awk -F'"' '{print $2}')
           auditwheel repair dist/*.whl --plat $target_platform --wheel-dir dist/
           rm dist/*linux_x86_64.whl

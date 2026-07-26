@@ -10,12 +10,9 @@ from glob import glob
 
 # Full test matrix for comprehensive testing
 full_analyzer_trace_params = [
-    ("darshan", "posix", "tests/data/extracted/darshan-posix"),
-    ("darshan", "posix", "tests/data/extracted/darshan-posix-dxt"),
     ("dftracer", "dlio", "tests/data/extracted/dftracer-dlio"),
     ("dftracer", "dlio-prev", "tests/data/extracted/dftracer-dlio-prev"),
     ("dftracer", "posix", "tests/data/extracted/dftracer-posix"),
-    ("recorder", "posix", "tests/data/extracted/recorder-posix-parquet"),
 ]
 full_checkpoint_params = [True, False]
 
@@ -118,8 +115,6 @@ def _test_e2e(
     scheduler_address = dask_cluster.scheduler_address
 
     view_types = ["proc_name", "time_range"]
-    if trace_path.endswith("darshan-posix"):
-        view_types = ["file_name", "proc_name"]
 
     hydra_overrides = [
         f"analyzer={analyzer}",

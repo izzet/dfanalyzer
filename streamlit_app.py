@@ -54,7 +54,7 @@ raw_stats: RawStats = {}
 with st.form('analysis_form'):
     trace_files = st.file_uploader(
         "Upload a trace file",
-        type=["darshan", "parquet", "pfw", "pfw.gz"],
+        type=["pfw", "pfw.gz"],
         accept_multiple_files=True,
     )
 
@@ -101,11 +101,7 @@ if submit:
         st.error("All trace files must be of the same type.")
         st.stop()
 
-    analyzer = 'darshan'
-    if all(file.name.endswith('.parquet') for file in trace_files):
-        analyzer = 'recorder'
-    elif all(file.name.endswith('.pfw') or file.name.endswith('.pfw.gz') for file in trace_files):
-        analyzer = 'dftracer'
+    analyzer = 'dftracer'
 
     with st.status("Analyzing trace files", expanded=True) as status:
         st.write(f"Detected analyzer type: {analyzer.title()}")

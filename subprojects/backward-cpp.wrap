@@ -1,9 +1,0 @@
-[wrap-git]
-directory = backward-cpp
-method = cmake
-url = https://github.com/bombela/backward-cpp.git
-revision = v1.6
-clone-recursive = true
-
-[provide]
-backward = backward_dep
