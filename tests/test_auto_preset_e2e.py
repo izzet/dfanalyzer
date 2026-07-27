@@ -1,4 +1,4 @@
-"""End-to-end coverage for the `generic` preset's auto-discovered category layers."""
+"""End-to-end coverage for the `auto` preset's discovered category layers."""
 import gzip
 import json
 import pathlib
@@ -77,7 +77,7 @@ def suffixed_posix_trace(tmp_path: pathlib.Path) -> str:
 def _analyze(trace_path, tmp_path, dask_cluster, extra_overrides=()):
     dfa = init_with_hydra(hydra_overrides=[
         "analyzer=dftracer",
-        "analyzer/preset=generic",
+        "analyzer/preset=auto",
         "analyzer.checkpoint=False",
         f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
         "cluster=external",
@@ -105,7 +105,7 @@ def _layer_counts(result):
     }
 
 
-def test_generic_preset_discovers_nested_category_layers(
+def test_auto_preset_discovers_nested_category_layers(
     nested_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     dfa, result = _analyze(nested_cat_trace, tmp_path, dask_cluster)
@@ -124,7 +124,7 @@ def test_generic_preset_discovers_nested_category_layers(
     dfa.shutdown()
 
 
-def test_generic_preset_parent_layers_contain_descendants(
+def test_auto_preset_parent_layers_contain_descendants(
     nested_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     dfa, result = _analyze(nested_cat_trace, tmp_path, dask_cluster)
@@ -141,7 +141,7 @@ def test_generic_preset_parent_layers_contain_descendants(
     dfa.shutdown()
 
 
-def test_generic_preset_computes_parent_relative_metrics(
+def test_auto_preset_computes_parent_relative_metrics(
     nested_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     """The nesting exists so cross-layer metrics resolve against the real parent."""
@@ -156,7 +156,7 @@ def test_generic_preset_computes_parent_relative_metrics(
     dfa.shutdown()
 
 
-def test_generic_preset_omits_dftracer_metadata_category(
+def test_auto_preset_omits_dftracer_metadata_category(
     nested_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     dfa, result = _analyze(nested_cat_trace, tmp_path, dask_cluster)
@@ -168,7 +168,7 @@ def test_generic_preset_omits_dftracer_metadata_category(
     dfa.shutdown()
 
 
-def test_generic_preset_flat_categories_hang_off_the_boundary(
+def test_auto_preset_flat_categories_hang_off_the_boundary(
     flat_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     dfa, result = _analyze(flat_cat_trace, tmp_path, dask_cluster)
@@ -185,7 +185,7 @@ def test_generic_preset_flat_categories_hang_off_the_boundary(
     dfa.shutdown()
 
 
-def test_generic_preset_marks_only_io_categories_as_size_layers(
+def test_auto_preset_marks_only_io_categories_as_size_layers(
     flat_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     dfa, _ = _analyze(flat_cat_trace, tmp_path, dask_cluster)
@@ -195,7 +195,7 @@ def test_generic_preset_marks_only_io_categories_as_size_layers(
     dfa.shutdown()
 
 
-def test_generic_preset_rebuilds_the_fact_pipeline_for_discovered_layers(
+def test_auto_preset_rebuilds_the_fact_pipeline_for_discovered_layers(
     nested_cat_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     """The pipeline is built in __init__ from the pre-discovery layer set (`app`)."""
@@ -211,7 +211,7 @@ def test_generic_preset_rebuilds_the_fact_pipeline_for_discovered_layers(
     dfa.shutdown()
 
 
-def test_generic_preset_discovers_posix_cat_rule_suffixes(
+def test_auto_preset_discovers_posix_cat_rule_suffixes(
     suffixed_posix_trace: str, tmp_path: pathlib.Path, dask_cluster: LocalCluster
 ) -> None:
     """POSIX cats rewritten by POSIX_CAT_RULES are discovered under their new name."""

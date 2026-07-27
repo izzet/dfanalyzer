@@ -80,7 +80,7 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
 
 
 @dc.dataclass
-class AnalyzerPresetConfigGeneric(AnalyzerPresetConfig):
+class AnalyzerPresetConfigAuto(AnalyzerPresetConfig):
     """Catch-all preset: an ``app`` boundary layer plus one auto-discovered
     layer per distinct ``cat`` in the trace. Scored on operations/second."""
 
@@ -104,7 +104,7 @@ class AnalyzerPresetConfigGeneric(AnalyzerPresetConfig):
             },
         }
     )
-    name: str = "generic"
+    name: str = "auto"
 
 
 @dc.dataclass
@@ -506,7 +506,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(name="config", node=Config)
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
-    cs.store(group="analyzer/preset", name="generic", node=AnalyzerPresetConfigGeneric)
+    cs.store(group="analyzer/preset", name="auto", node=AnalyzerPresetConfigAuto)
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
