@@ -88,14 +88,14 @@ def test_materialize_gate_is_disablable(tmp_path: pathlib.Path, dask_cluster) ->
     from dftracer.analyzer.analyzer import Analyzer
 
     seen = []
-    original = Analyzer._materialize_small_view
+    original = Analyzer._materialize_if_small
 
     def spy(self, main_view):
         out = original(self, main_view)
         seen.append(out is not main_view)
         return out
 
-    Analyzer._materialize_small_view = spy
+    Analyzer._materialize_if_small = spy
     try:
         _analyze(tmp_path / "off", dask_cluster, 0)
         assert seen and not any(seen), "gate should not have materialised anything when disabled"
@@ -103,4 +103,4 @@ def test_materialize_gate_is_disablable(tmp_path: pathlib.Path, dask_cluster) ->
         _analyze(tmp_path / "on", dask_cluster, 256 * 1024**2)
         assert any(seen), "gate should have materialised at least one layer when enabled"
     finally:
-        Analyzer._materialize_small_view = original
+        Analyzer._materialize_if_small = original

@@ -56,6 +56,7 @@ from .types import (
 from .utils.collection_utils import is_set_like_series
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 from .utils.dask_utils import flatten_column_names, persisted_nbytes
+from .utils.dataframe_ops import DataFrameOps
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
@@ -78,7 +79,7 @@ HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 SIZE_CATEGORY_PREFIXES = ("posix", "stdio")
 PARTITION_SIZE = "128MB"
 # Byte value of PARTITION_SIZE, used to bound a frame's materialised size
-# from npartitions alone -- see Analyzer._materialize_small_view.
+# from npartitions alone -- see Analyzer._materialize_if_small.
 PARTITION_SIZE_BYTES = 128 * 1024**2
 VIEW_PERMUTATIONS = False
 
@@ -631,7 +632,7 @@ class Analyzer(abc.ABC):
             A dictionary where keys are metrics and values are dictionaries
             mapping ViewKey to ViewResult.
         """
-        main_view = self._materialize_small_view(main_view)
+        main_view = self._materialize_if_small(main_view)
         views = {}
         for view_key in self.view_permutations(view_types=view_types):
             view_type = view_key[-1]
@@ -651,8 +652,8 @@ class Analyzer(abc.ABC):
             )
         return views
 
-    def _materialize_small_view(self, main_view):
-        """Bring a layer's main view into memory when it is provably small.
+    def _materialize_if_small(self, frame):
+        """Bring a frame into memory when it is provably small enough.
 
         The per-view Dask machinery costs seconds per view regardless of size,
         and these frames are routinely a few hundred rows. Materialising once
@@ -667,15 +668,15 @@ class Analyzer(abc.ABC):
         real size already, that is used instead -- but it is never waited for.
         """
         if not self.view_materialize_max_bytes:
-            return main_view
-        if not isinstance(main_view, dd.DataFrame):
-            return main_view
+            return frame
+        if not isinstance(frame, dd.DataFrame):
+            return frame
 
-        exact = persisted_nbytes(main_view)
-        size = exact if exact is not None else main_view.npartitions * PARTITION_SIZE_BYTES
+        exact = persisted_nbytes(frame)
+        size = exact if exact is not None else frame.npartitions * PARTITION_SIZE_BYTES
         if size > self.view_materialize_max_bytes:
-            return main_view
-        return main_view.compute()
+            return frame
+        return frame.compute()
 
     def compute_logical_views(
         self,
@@ -1172,6 +1173,13 @@ class Analyzer(abc.ABC):
                 main_indexes = {}
                 views = {}
                 view_keys = set()
+                # One decision for the whole loop: every layer's main view and
+                # views descend from this frame, so materialising it here is
+                # what lets them all run in pandas. The hybrid trace/profile
+                # inputs are left on Dask -- reconcile_hlm is Dask-specific.
+                if hlm is not None:
+                    with log_block("materialize_hlm"):
+                        hlm = self._materialize_if_small(hlm)
                 for layer, layer_condition in self.preset.layer_defs.items():
                     layer_hlm = None
                     if layer_main_views is not None and layer in layer_main_views:
@@ -1587,6 +1595,7 @@ class Analyzer(abc.ABC):
         view_types: List[ViewType],
         partition_size: str,
     ) -> dd.DataFrame:
+        ops = DataFrameOps.of(hlm)
         with log_block("drop_and_set_metrics", layer=layer):
             size_layers = {configured_layer.lower() for configured_layer in (self.preset.size_layers or [])}
             keep_size_for_layer = layer.lower() in size_layers
@@ -1595,7 +1604,8 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            hlm = hlm.map_partitions(
+            hlm = ops.apply(
+                hlm,
                 self.set_layer_metrics,
                 derived_metrics=self.preset.derived_metrics[layer],
                 size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
@@ -1605,7 +1615,7 @@ class Analyzer(abc.ABC):
             main_view_agg = {}
             for col in hlm.columns:
                 if any(map(col.endswith, view_types_diff)):
-                    main_view_agg[col] = unique_set_flatten()
+                    main_view_agg[col] = ops.set_union_flatten()
                 elif col not in HLM_EXTRA_COLS:
                     if col.endswith("_call_min"):
                         main_view_agg[col] = "min"
@@ -1614,14 +1624,11 @@ class Analyzer(abc.ABC):
                     else:
                         main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
-            main_view = (
-                hlm.groupby(list(view_types))
-                .agg(main_view_agg, split_out=hlm.npartitions)
-                .map_partitions(set_main_metrics)
-                .replace(0, pd.NA)
-                .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
-                .persist()
-            )
+            main_view = hlm.groupby(list(view_types)).agg(main_view_agg, **ops.agg_kwargs(hlm))
+            main_view = ops.apply(main_view, set_main_metrics)
+            main_view = main_view.replace(0, pd.NA)
+            main_view = ops.apply(main_view, fix_dtypes, time_sliced=self.time_sliced)
+            main_view = ops.finalize(main_view)
         return main_view
 
     def _compute_view(

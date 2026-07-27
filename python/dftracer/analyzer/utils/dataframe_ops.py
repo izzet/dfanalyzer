@@ -64,6 +64,10 @@ class DataFrameOps:
         """Aggregation unioning set-valued entries."""
         raise NotImplementedError
 
+    def agg_kwargs(self, df) -> dict:
+        """Extra keyword arguments for `groupby().agg()` on this engine."""
+        raise NotImplementedError
+
     def finalize(self, df):
         """Make the result concrete, if the engine has such a notion."""
         raise NotImplementedError
@@ -93,6 +97,10 @@ class _DaskOps(DataFrameOps):
 
     def set_union_flatten(self):
         return unique_set_flatten()
+
+    def agg_kwargs(self, df):
+        # one output partition per input partition, as the Dask path has always done
+        return {"split_out": df.npartitions}
 
     def finalize(self, df):
         return df.persist()
@@ -137,6 +145,10 @@ class _PandasOps(DataFrameOps):
 
     def set_union_flatten(self):
         return unique_set_flatten_pd
+
+    def agg_kwargs(self, df):
+        # `split_out` is a Dask partitioning concern with no pandas equivalent
+        return {}
 
     def finalize(self, df):
         return df
