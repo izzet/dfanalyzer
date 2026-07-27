@@ -317,6 +317,11 @@ class AnalyzerConfig:
     time_granularity: Optional[float] = MISSING
     time_resolution: Optional[float] = MISSING
     time_sliced: Optional[bool] = False
+    # Compute a layer's views in pandas when its main view is provably smaller
+    # than this. The per-view Dask machinery costs seconds regardless of size,
+    # and these frames are routinely a few hundred rows. 0 keeps everything on
+    # Dask, which is also how to exercise that path in tests.
+    view_materialize_max_bytes: Optional[int] = 256 * 1024**2
 
 
 @dc.dataclass

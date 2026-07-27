@@ -55,7 +55,7 @@ from .types import (
 )
 from .utils.collection_utils import is_set_like_series
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
-from .utils.dask_utils import flatten_column_names
+from .utils.dask_utils import flatten_column_names, persisted_nbytes
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
@@ -77,6 +77,9 @@ HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 # Categories whose events carry a transfer size, so their layers keep size/bandwidth.
 SIZE_CATEGORY_PREFIXES = ("posix", "stdio")
 PARTITION_SIZE = "128MB"
+# Byte value of PARTITION_SIZE, used to bound a frame's materialised size
+# from npartitions alone -- see Analyzer._materialize_small_view.
+PARTITION_SIZE_BYTES = 128 * 1024**2
 VIEW_PERMUTATIONS = False
 
 logger = structlog.get_logger()
@@ -97,6 +100,7 @@ class Analyzer(abc.ABC):
         time_resolution: float = 1e6,
         time_sliced: bool = False,
         verbose: bool = False,
+        view_materialize_max_bytes: int = 256 * 1024**2,
         facts_config: Optional[Union[FactsConfig, Dict[str, Any]]] = None,
     ):
         """Initializes the Analyzer instance.
@@ -115,6 +119,9 @@ class Analyzer(abc.ABC):
             time_resolution: The time resolution for analysis, in microseconds.
             time_sliced: Whether to slice time ranges for analysis.
             verbose: Whether to enable verbose logging.
+            view_materialize_max_bytes: Compute a layer's views in pandas when
+                its main view is provably smaller than this. 0 disables it and
+                keeps everything on Dask.
         """
         if checkpoint:
             assert checkpoint_dir != "", "Checkpoint directory must be defined"
@@ -142,6 +149,7 @@ class Analyzer(abc.ABC):
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
         self.verbose = verbose
+        self.view_materialize_max_bytes = view_materialize_max_bytes
         ensure_dir(self.checkpoint_dir)
 
     @staticmethod
@@ -623,6 +631,7 @@ class Analyzer(abc.ABC):
             A dictionary where keys are metrics and values are dictionaries
             mapping ViewKey to ViewResult.
         """
+        main_view = self._materialize_small_view(main_view)
         views = {}
         for view_key in self.view_permutations(view_types=view_types):
             view_type = view_key[-1]
@@ -641,6 +650,32 @@ class Analyzer(abc.ABC):
                 view_types=view_types,
             )
         return views
+
+    def _materialize_small_view(self, main_view):
+        """Bring a layer's main view into memory when it is provably small.
+
+        The per-view Dask machinery costs seconds per view regardless of size,
+        and these frames are routinely a few hundred rows. Materialising once
+        per layer lets `_compute_view` run in pandas instead.
+
+        The size test must not itself trigger a computation, which rules out
+        `len()` and `memory_usage()` on a lazy frame. `persist()` is
+        asynchronous, so the scheduler usually cannot report a size yet either.
+        What is always available is `npartitions`, and the HLM is repartitioned
+        to PARTITION_SIZE upstream, so `npartitions * PARTITION_SIZE` bounds the
+        materialised size statically. If the scheduler does happen to know the
+        real size already, that is used instead -- but it is never waited for.
+        """
+        if not self.view_materialize_max_bytes:
+            return main_view
+        if not isinstance(main_view, dd.DataFrame):
+            return main_view
+
+        exact = persisted_nbytes(main_view)
+        size = exact if exact is not None else main_view.npartitions * PARTITION_SIZE_BYTES
+        if size > self.view_materialize_max_bytes:
+            return main_view
+        return main_view.compute()
 
     def compute_logical_views(
         self,
@@ -1244,6 +1279,15 @@ class Analyzer(abc.ABC):
                     view_type = view_key[-1]
                     top_layer = list(self.preset.layer_defs)[0]
                     time_proc_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_proc_max"
+                    # Sort before any order-sensitive metric is computed. Row
+                    # order otherwise comes from whichever engine produced the
+                    # view -- Dask's shuffle or pandas' groupby -- and the
+                    # `_frac_total` sums are floating point, so their last bits
+                    # follow summation order. That is invisible until
+                    # `rank(pct=True)` turns a near-tie into a visible jump.
+                    # Sorting makes the output reproducible across engines and
+                    # partition counts.
+                    flat_views[view_key] = flat_views[view_key].sort_index()
                     with log_block("calculate_metric_boundary", view_key=view_key):
                         time_boundary = flat_views[view_key][f"{top_layer}_{time_proc_suffix}"].sum()
                         metric_boundaries.setdefault(view_type, {})

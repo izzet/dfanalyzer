@@ -637,9 +637,16 @@ class DFTracerAnalyzer(Analyzer):
 
     def _compute_view(self, layer, records, view_key, view_type, view_types):
         from .constants import VIEW_TYPES
+        from .utils.dataframe_ops import DataFrameOps
         import itertools as it
 
+        # `records` is a Dask frame, or a pandas one when compute_views decided
+        # the layer was small enough to materialise. The algorithm below is
+        # written once; `ops` absorbs the difference.
+        ops = DataFrameOps.of(records)
+
         keep_object_cols = set(VIEW_TYPES) | set(view_types) | set(it.chain.from_iterable(self.logical_views.values()))
+        records = ops.mutable(records)
         drop_cols = []
         for col in records.columns:
             dtype_str = str(records[col].dtype)
@@ -657,7 +664,7 @@ class DFTracerAnalyzer(Analyzer):
 
         # Arrow-based view computation
         view_types_diff = set(VIEW_TYPES).difference(view_types)
-        local_view_types = records.index._meta.names
+        local_view_types = ops.index_names(records)
         local_view_types_diff = set(local_view_types).difference([view_type])
 
         view_agg = {}
@@ -665,9 +672,9 @@ class DFTracerAnalyzer(Analyzer):
             if "_bin_" in col:
                 view_agg[col] = ["sum"]
             elif any(map(col.endswith, view_types_diff)):
-                view_agg[col] = [unique_set_flatten()]
+                view_agg[col] = [ops.set_union_flatten()]
             elif col in it.chain.from_iterable(self.logical_views.values()):
-                view_agg[col] = [unique_set_flatten()]
+                view_agg[col] = [ops.set_union_flatten()]
             elif col.endswith("_sq"):
                 view_agg[col] = ["sum"]
             elif col.endswith("_call_min"):
@@ -678,7 +685,7 @@ class DFTracerAnalyzer(Analyzer):
                 view_agg[col] = ["sum", "min", "max", "mean", "std"]
             else:
                 raise TypeError(f"Unsupported dtype '{records[col].dtype}' for column '{col}'")
-        view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+        view_agg.update({col: [ops.set_union()] for col in local_view_types_diff})
 
         # Decompose view_agg into tree-reducible partials. Each input column's
         # aggregation list is split into per-partition chunks that later merge
@@ -704,10 +711,10 @@ class DFTracerAnalyzer(Analyzer):
                 set_cols_items.append((col, aggs[0]))
 
         std_cols = list(full_cols)
-        records = records.map_partitions(fix_std_cols, std_cols=std_cols)
+        records = ops.apply(records, fix_std_cols, std_cols=std_cols)
 
-        partial_meta = build_partial_meta(records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items)
-        partials = records.map_partitions(
+        partials = ops.apply(
+            records,
             partial_arrow_view_groupby,
             view_type,
             full_cols,
@@ -716,7 +723,9 @@ class DFTracerAnalyzer(Analyzer):
             max_cols,
             set_cols_items,
             BetterSet.flatten,
-            meta=partial_meta,
+            meta=lambda: build_partial_meta(
+                ops.meta_source(records), view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
+            ),
         )
 
         merge_aggs = {}
@@ -733,22 +742,23 @@ class DFTracerAnalyzer(Analyzer):
         for c in max_cols:
             merge_aggs[f"{c}_max"] = "max"
         for c, _ in set_cols_items:
-            merge_aggs[f"{c}_unique"] = unique_set_flatten()
+            merge_aggs[f"{c}_unique"] = ops.set_union_flatten()
 
         merged = partials.groupby(view_type).agg(merge_aggs)
 
-        final_meta = build_final_meta(merged, full_cols)
-        final = merged.map_partitions(finalize_view_partials, full_cols, meta=final_meta)
+        final = ops.apply(
+            merged,
+            finalize_view_partials,
+            full_cols,
+            meta=lambda: build_final_meta(ops.meta_source(merged), full_cols),
+        )
         final = final.rename(columns=build_view_rename_map(final.columns))
         final = final.replace(0, pd.NA)
-        final = (
-            final.map_partitions(derive_call_stats)
-            .map_partitions(set_unique_counts, layer=layer)
-            .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
-            .map_partitions(coerce_arrow_numerics_to_pandas_native)
-            .persist()
-        )
-        return final
+        final = ops.apply(final, derive_call_stats)
+        final = ops.apply(final, set_unique_counts, layer=layer)
+        final = ops.apply(final, fix_dtypes, time_sliced=self.time_sliced)
+        final = ops.apply(final, coerce_arrow_numerics_to_pandas_native)
+        return ops.finalize(final)
 
     def postread_trace(
         self,
