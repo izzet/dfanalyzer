@@ -212,7 +212,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             },
         }
     )
-    name: str = "dlio-prev"
+    name: str = "dlio"
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
         default_factory=lambda: {
             'posix': list(DERIVED_POSIX_SIZE_METRICS),
@@ -231,7 +231,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
 
 
 @dc.dataclass
-class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
+class AnalyzerPresetConfigAI(AnalyzerPresetConfigDLIO):
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {
             'app': {},
@@ -302,7 +302,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'checkpoint_posix': 'checkpoint',
         }
     )
-    name: str = "dlio"
+    name: str = "ai"
 
 
 @dc.dataclass
@@ -507,8 +507,8 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="auto", node=AnalyzerPresetConfigAuto)
-    cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
-    cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
+    cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIO)
+    cs.store(group="analyzer/preset", name="ai", node=AnalyzerPresetConfigAI)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
