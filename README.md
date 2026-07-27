@@ -14,29 +14,17 @@ DFAnalyzer is an open-source tool for analyzing performance data from large-scal
 To install DFAnalyzer through `pip` (recommended for most users):
 
 ```bash
-# This might involve using your system's package manager or a tool like Spack.
-# Example using Spack to prepare the environment:
-# spack -e tools install
 pip install dftracer-analyzer
 ```
 
 To install DFAnalyzer from source (for developers or custom builds):
 
 ```bash
-# 1. Install system dependencies:
-#    Refer to the "Install system dependencies" step in .github/workflows/ci.yml
-#    (e.g., build-essential, cmake, libarrow-dev, libhdf5-dev, ninja-build, etc.).
-#    Alternatively, tools like Spack can help manage these:
-#    # spack -e tools install
-module load ninja
+# 1. Install Python build dependencies:
+python -m pip install --upgrade pip setuptools wheel
 
-# 2. Install Python build dependencies:
-python -m pip install --upgrade pip meson-python setuptools wheel
-
-# 3. Install DFAnalyzer from the root of this repository:
-#    The --prefix argument is optional and specifies the installation location.
-pip install -e . \
-  -Csetup-args="--prefix=$HOME/.local"
+# 2. Install DFAnalyzer from the root of this repository:
+pip install -e .
 
 # (Optional) Install dependencies for running tests if you plan to contribute or run local tests:
 # pip install -r tests/requirements.txt

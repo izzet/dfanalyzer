@@ -73,11 +73,10 @@ ruff format .
     # Install dependencies for tests
     pip install -r tests/requirements.txt
     # Ensure build tools are available
-    # pip install meson-python setuptools wheel
+    # pip install setuptools wheel
     ```
 
-3.  **Install System Dependencies:** The build uses Meson via `meson-python`, so a C++ compiler and Ninja must be available.
-    Example installation commands for Ubuntu can be found in the "Install system dependencies" step within the `.github/workflows/ci.yml` file.
+DFAnalyzer is a pure Python package, so no system build dependencies are required beyond Python itself.
 
 
 We look forward to your contributions!

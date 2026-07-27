@@ -198,3 +198,4 @@ cython_debug/
 outputs/
 tmp/
 VERSION.txt
+python/dftracer/analyzer/_version.py

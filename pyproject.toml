@@ -1,6 +1,6 @@
 [build-system]
-build-backend = "mesonpy"
-requires = ["meson>=1.5.0,!=1.10.0", "meson-python>=0.15.0"]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=64", "setuptools_scm>=8"]
 
 [project]
 name = "dftracer-analyzer"
@@ -52,11 +52,18 @@ documentation = "https://dfanalyzer.readthedocs.io/en/latest/"
 source = "https://github.com/LLNL/dfanalyzer"
 tracker = "https://github.com/LLNL/dfanalyzer/issues"
 
-[tool.meson-python.args]
-install = ["--skip-subprojects"]
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["dftracer*"]
+# dftracer is an implicit namespace package: it has no __init__.py so that
+# dftracer.analyzer can coexist with the separately distributed dftracer package.
+namespaces = true
+
+[tool.setuptools.package-data]
+"dftracer.analyzer" = ["configs/**/*.yaml", "configs/**/*.json"]
 
 [tool.pyright]
-exclude = ["build/", "subprojects/", "tmp/"]
+exclude = ["build/", "tmp/"]
 
 [tool.pytest.ini_options]
 # --forked runs each test in its own process. Required because the C++
@@ -77,9 +84,6 @@ line-length = 119
 
 [tool.ruff.format]
 quote-style = "preserve"
-
-[tool.spin]
-package = 'dftracer.analyzer'
 
 [tool.setuptools_scm]
 local_scheme = "no-local-version"
