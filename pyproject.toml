@@ -26,6 +26,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "betterframe>=0.3.0",
     "betterset>=0.2.0",
     "dask[bag,dataframe,distributed]>=2025.1.0,<2027.0.0",
     "dask_jobqueue>=0.9.0",

@@ -10,7 +10,7 @@ import os
 import pandas as pd
 import re
 import structlog
-from dask import compute, persist
+from dask import compute, delayed, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf, open_dict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -54,6 +54,8 @@ from .types import (
     Views,
 )
 from .utils.collection_utils import is_set_like_series
+from betterframe import BetterFrame
+
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 from .utils.dask_utils import flatten_column_names
 from .utils.expr_utils import extract_numerator_and_denominators
@@ -77,6 +79,9 @@ HLM_EXTRA_COLS = ["cat", "io_cat", "acc_pat", "func_name"]
 # Categories whose events carry a transfer size, so their layers keep size/bandwidth.
 SIZE_CATEGORY_PREFIXES = ("posix", "stdio")
 PARTITION_SIZE = "128MB"
+# Byte value of PARTITION_SIZE, used to bound a frame's materialised size
+# from npartitions alone -- see Analyzer._materialize_if_small.
+PARTITION_SIZE_BYTES = 128 * 1024**2
 VIEW_PERMUTATIONS = False
 
 logger = structlog.get_logger()
@@ -97,6 +102,7 @@ class Analyzer(abc.ABC):
         time_resolution: float = 1e6,
         time_sliced: bool = False,
         verbose: bool = False,
+        view_materialize_max_bytes: int = 256 * 1024**2,
         facts_config: Optional[Union[FactsConfig, Dict[str, Any]]] = None,
     ):
         """Initializes the Analyzer instance.
@@ -115,6 +121,9 @@ class Analyzer(abc.ABC):
             time_resolution: The time resolution for analysis, in microseconds.
             time_sliced: Whether to slice time ranges for analysis.
             verbose: Whether to enable verbose logging.
+            view_materialize_max_bytes: Compute a layer's views in pandas when
+                its main view is provably smaller than this. 0 disables it and
+                keeps everything on Dask.
         """
         if checkpoint:
             assert checkpoint_dir != "", "Checkpoint directory must be defined"
@@ -142,6 +151,7 @@ class Analyzer(abc.ABC):
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
         self.verbose = verbose
+        self.view_materialize_max_bytes = view_materialize_max_bytes
         ensure_dir(self.checkpoint_dir)
 
     @staticmethod
@@ -623,6 +633,7 @@ class Analyzer(abc.ABC):
             A dictionary where keys are metrics and values are dictionaries
             mapping ViewKey to ViewResult.
         """
+        main_view = self._materialize_if_small(main_view)
         views = {}
         for view_key in self.view_permutations(view_types=view_types):
             view_type = view_key[-1]
@@ -641,6 +652,33 @@ class Analyzer(abc.ABC):
                 view_types=view_types,
             )
         return views
+
+    def _materialize_if_small(self, frame):
+        """Bring a frame into memory when it is provably small enough.
+
+        The per-view Dask machinery costs seconds per view regardless of size,
+        and these frames are routinely a few hundred rows.
+
+        betterframe owns the mechanism -- sizing a frame without triggering a
+        computation, which rules out len() and memory_usage() on a lazy frame.
+        What stays here is the policy: the threshold, and the bound to fall back
+        on when the scheduler cannot report a size yet. persist() is
+        asynchronous so that is the usual case, and the bound holds because this
+        pipeline repartitions the HLM to PARTITION_SIZE upstream -- something no
+        library could know on our behalf.
+        """
+        if not self.view_materialize_max_bytes:
+            return frame
+        if not isinstance(frame, dd.DataFrame):
+            return frame
+        return (
+            BetterFrame(frame)
+            .materialize_if_under(
+                self.view_materialize_max_bytes,
+                fallback_bound=frame.npartitions * PARTITION_SIZE_BYTES,
+            )
+            .native
+        )
 
     def compute_logical_views(
         self,
@@ -1034,16 +1072,26 @@ class Analyzer(abc.ABC):
             )
         return []
 
-    def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
-        """Stores a Dask DataFrame view to a Parquet checkpoint.
+    def store_view(self, name: str, view, partition_size="64MB"):
+        """Stores a view to a Parquet checkpoint.
 
-        The view DataFrame is repartitioned and then written to a subdirectory
-        named `name` within the `checkpoint_dir`.
+        The view is repartitioned and then written to a subdirectory named
+        `name` within the `checkpoint_dir`.
+
+        A view may arrive as pandas rather than Dask, since layers small enough
+        to materialise are computed in pandas (see `_materialize_if_small`). It
+        is wrapped back into a single Dask partition rather than written through
+        pandas directly, so the checkpoint keeps one on-disk shape: a Parquet
+        directory carrying the `_metadata` file that `has_checkpoint` looks for
+        and `restore_view` reads back.
+
+        The wrapping goes through `from_delayed` rather than `from_pandas`
+        because views are indexed by their view type -- a MultiIndex whenever
+        there is more than one -- and `from_pandas` rejects a MultiIndex.
 
         Args:
             name: The name of the checkpoint.
-            view: The Dask DataFrame to store.
-            compute: Whether to compute the DataFrame before writing (Dask default is True).
+            view: The Dask or pandas DataFrame to store.
             partition_size: The desired partition size for the output Parquet files.
 
         Returns:
@@ -1052,7 +1100,9 @@ class Analyzer(abc.ABC):
         for col in view.columns:
             if view.dtypes[col].name == "object":
                 view[col] = view[col].astype(str)
-        if view.npartitions > 1:
+        if not isinstance(view, dd.DataFrame):
+            view = dd.from_delayed([delayed(view)], meta=view.iloc[:0])
+        elif view.npartitions > 1:
             view = view.repartition(partition_size=partition_size)
         return view.to_parquet(
             self.get_checkpoint_path(name=name),
@@ -1137,6 +1187,13 @@ class Analyzer(abc.ABC):
                 main_indexes = {}
                 views = {}
                 view_keys = set()
+                # One decision for the whole loop: every layer's main view and
+                # views descend from this frame, so materialising it here is
+                # what lets them all run in pandas. The hybrid trace/profile
+                # inputs are left on Dask -- reconcile_hlm is Dask-specific.
+                if hlm is not None:
+                    with log_block("materialize_hlm"):
+                        hlm = self._materialize_if_small(hlm)
                 for layer, layer_condition in self.preset.layer_defs.items():
                     layer_hlm = None
                     if layer_main_views is not None and layer in layer_main_views:
@@ -1244,6 +1301,15 @@ class Analyzer(abc.ABC):
                     view_type = view_key[-1]
                     top_layer = list(self.preset.layer_defs)[0]
                     time_proc_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_proc_max"
+                    # Sort before any order-sensitive metric is computed. Row
+                    # order otherwise comes from whichever engine produced the
+                    # view -- Dask's shuffle or pandas' groupby -- and the
+                    # `_frac_total` sums are floating point, so their last bits
+                    # follow summation order. That is invisible until
+                    # `rank(pct=True)` turns a near-tie into a visible jump.
+                    # Sorting makes the output reproducible across engines and
+                    # partition counts.
+                    flat_views[view_key] = flat_views[view_key].sort_index()
                     with log_block("calculate_metric_boundary", view_key=view_key):
                         time_boundary = flat_views[view_key][f"{top_layer}_{time_proc_suffix}"].sum()
                         metric_boundaries.setdefault(view_type, {})
@@ -1543,6 +1609,7 @@ class Analyzer(abc.ABC):
         view_types: List[ViewType],
         partition_size: str,
     ) -> dd.DataFrame:
+        frame = BetterFrame(hlm)
         with log_block("drop_and_set_metrics", layer=layer):
             size_layers = {configured_layer.lower() for configured_layer in (self.preset.size_layers or [])}
             keep_size_for_layer = layer.lower() in size_layers
@@ -1551,17 +1618,18 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            hlm = hlm.map_partitions(
+            frame = BetterFrame(hlm).apply(
                 self.set_layer_metrics,
                 derived_metrics=self.preset.derived_metrics[layer],
                 size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
             )
+            hlm = frame.native
         with log_block("build_agg_dict", layer=layer):
             view_types_diff = set(VIEW_TYPES).difference(view_types)
             main_view_agg = {}
             for col in hlm.columns:
                 if any(map(col.endswith, view_types_diff)):
-                    main_view_agg[col] = unique_set_flatten()
+                    main_view_agg[col] = frame.ops.set_union_flatten()
                 elif col not in HLM_EXTRA_COLS:
                     if col.endswith("_call_min"):
                         main_view_agg[col] = "min"
@@ -1570,14 +1638,13 @@ class Analyzer(abc.ABC):
                     else:
                         main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
-            main_view = (
-                hlm.groupby(list(view_types))
-                .agg(main_view_agg, split_out=hlm.npartitions)
-                .map_partitions(set_main_metrics)
-                .replace(0, pd.NA)
-                .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
-                .persist()
+            main_view = frame.pipe(
+                lambda df, kw=frame.agg_kwargs(): df.groupby(list(view_types)).agg(main_view_agg, **kw)
             )
+            main_view = main_view.apply(set_main_metrics)
+            main_view = main_view.pipe(lambda df: df.replace(0, pd.NA))
+            main_view = main_view.apply(fix_dtypes, time_sliced=self.time_sliced)
+            main_view = main_view.finalize()
         return main_view
 
     def _compute_view(
