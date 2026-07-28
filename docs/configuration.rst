@@ -231,7 +231,7 @@ Saves the analysis results to a SQLite database file.
 Cluster Configuration
 ---------------------
 
-Configure settings for running DFAnalyzer in a distributed environment using Dask.
+Configure how DFAnalyzer executes: on a Dask cluster, or in the calling process.
 Select a cluster type with ``cluster=<type>``.
 
 Local Cluster (``cluster=local``)
@@ -255,6 +255,38 @@ The **default** cluster configuration, which runs analysis on the local machine.
      - int
      - null
      - Memory limit per worker (e.g., "8GB").
+
+In-Process (``cluster=none``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Runs the analysis in the calling process, with no scheduler and no workers.
+
+Layers small enough to materialise are already computed in pandas rather than
+Dask (see ``analyzer.view_materialize_max_bytes``), so for a small trace the
+cluster is mostly orchestration. On the ``dftracer-ai`` fixture, cluster setup
+and teardown alone account for roughly 2.2 seconds of a 14.4 second run.
+
+.. code-block:: bash
+
+   dfanalyzer analyzer=dftracer trace_path=/path/to/traces cluster=none
+
+Results are identical to a clustered run — the same code path is used, with
+this process acting as the single worker. Prefer this for small traces,
+interactive exploration, and hosted deployments where spawning worker
+processes is undesirable.
+
+.. warning::
+
+   Not suitable for traces too large to aggregate in a single process. The
+   whole trace is read here rather than staying spread across workers, so
+   memory is bounded by one machine. Use ``cluster=local`` (the default) or a
+   job-queue cluster at scale.
+
+Note that this mode consolidates memory rather than reducing it: a local
+cluster keeps its workers in separate processes, so their memory does not
+count against the driver's.
+
+Takes no parameters beyond ``cluster.local_directory``.
 
 Slurm Cluster (``cluster=slurm``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -26,7 +26,7 @@ from dftracer.utils.dfanalyzer import (
     scan_to_ipc,
 )
 from dftracer.utils.dask import _assign_files_by_pid, register_auto_thread_plugin
-from dask.distributed import Client, get_client, wait
+from dask.distributed import Client, get_client
 from typing import Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer, HLM_AGG, HLM_EXTRA_COLS
@@ -458,10 +458,22 @@ class DFTracerAnalyzer(Analyzer):
             indexer.close()
 
         with log_block("dask_client_connect"):
-            try:
-                dask_client = client or get_client()
-            except ValueError:
-                dask_client = None
+            # Prefer the client the analyzer already resolved: a real one, or the
+            # `NullClient` that `cluster=none` installs. Everything below is written
+            # against the client interface, so it runs unchanged either way -- with
+            # NullClient there is exactly one "worker", this process, and `submit`
+            # executes inline.
+            #
+            # Keeping one read path is what makes the HLM correct in-process:
+            # `distributed_hlm` is built from the very futures produced here, and
+            # returns None if there are none, silently falling back to a second
+            # implementation whose dtypes do not match.
+            dask_client = client or getattr(self, "dask_client", None)
+            if dask_client is None:
+                try:
+                    dask_client = get_client()
+                except ValueError:
+                    dask_client = None
 
             if dask_client is None:
                 return self.read_trace_local(trace_path)
@@ -802,7 +814,7 @@ class DFTracerAnalyzer(Analyzer):
                 traces = traces.map_partitions(self._set_epochs, epoch_boundaries=epoch_boundaries)
 
         with log_block("wait"):
-            _ = wait(traces)
+            self._wait_for(traces)
 
         with log_block("set_basic_columns"):
             traces[COL_ACC_PAT] = 0

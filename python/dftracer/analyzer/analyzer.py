@@ -11,7 +11,7 @@ import pandas as pd
 import re
 import structlog
 from dask import compute, delayed, persist
-from dask.distributed import fire_and_forget, get_client, wait
+from dask.distributed import fire_and_forget, get_client
 from omegaconf import OmegaConf, open_dict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -26,6 +26,7 @@ from .analysis_utils import (
     set_unique_counts,
     split_duration_records_vectorized,
 )
+from .cluster import NullClient, wait_for
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
 from .fact_engine import FactEngine, FactPipeline
 from .constants import (
@@ -133,7 +134,7 @@ class Analyzer(abc.ABC):
         self.checkpoint = checkpoint
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_tasks = []
-        self.dask_client = get_client()
+        self.dask_client = self._resolve_client()
         self.debug = debug
         self.profile_distribution = profile_distribution
         self.profile_time_granularity = profile_time_granularity
@@ -153,6 +154,24 @@ class Analyzer(abc.ABC):
         self.verbose = verbose
         self.view_materialize_max_bytes = view_materialize_max_bytes
         ensure_dir(self.checkpoint_dir)
+
+    @staticmethod
+    def _resolve_client():
+        """The client to submit work through.
+
+        Normally the one the caller connected, found via `get_client()`. Under
+        `cluster=none` there is no ambient client and `get_client()` raises, so
+        fall back to a `NullClient` that runs the same calls in this process.
+        Constructing a second one is harmless -- it holds no state.
+        """
+        try:
+            return get_client()
+        except ValueError:
+            return NullClient()
+
+    def _wait_for(self, items) -> None:
+        """Block until `items` are finished. See `cluster.wait_for`."""
+        wait_for(self.dask_client, items)
 
     @staticmethod
     def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
@@ -365,7 +384,7 @@ class Analyzer(abc.ABC):
                 with log_block("persist"):
                     (hlm, raw_stats) = persist(hlm, raw_stats)
                 with log_block("wait"):
-                    wait([hlm, raw_stats])
+                    self._wait_for([hlm, raw_stats])
             else:
                 with log_block("compute_trace_hlm"):
                     trace_hlm = self.compute_high_level_metrics(
@@ -383,7 +402,7 @@ class Analyzer(abc.ABC):
                 with log_block("persist"):
                     (trace_hlm, profile_hlm, raw_stats) = persist(trace_hlm, profile_hlm, raw_stats)
                 with log_block("wait"):
-                    wait([trace_hlm, profile_hlm, raw_stats])
+                    self._wait_for([trace_hlm, profile_hlm, raw_stats])
 
         # Validate time granularity
         # self.validate_time_granularity(hlm=hlm, view_types=hlm_view_types)
@@ -1332,7 +1351,7 @@ class Analyzer(abc.ABC):
         # Wait for all checkpoint tasks
         if self.checkpoint:
             with log_block("wait_for_checkpoints"):
-                wait(self.checkpoint_tasks)
+                self._wait_for(self.checkpoint_tasks)
 
         # Evaluate analysis facts over the flat views (no-op {} unless facts.enabled),
         # then gate the flat views by emit_flat_views. Facts-off leaves both untouched.

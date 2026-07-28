@@ -348,6 +348,26 @@ class ExternalClusterConfig(ClusterConfig):
 
 
 @dc.dataclass
+class InProcessClusterConfig(ClusterConfig):
+    """Run the analysis in this process, with no scheduler and no workers.
+
+    Everything the analyzer would send to a cluster is executed inline by
+    `NullClient`. Worth choosing when the cluster costs more than it buys:
+    startup and teardown are ~1.8s of an 11.9s run on the `dftracer-ai`
+    fixture, and the workers reserve memory that a hosted deployment may not
+    have. Views are already computed in pandas whenever they are small enough
+    (see `view_materialize_max_bytes`), so for small traces the cluster is
+    largely orchestration overhead.
+
+    Not a good choice for traces too large to aggregate in one process: the
+    whole trace is read here rather than staying spread across workers.
+    """
+
+    _target_: str = "dftracer.analyzer.cluster.InProcessCluster"
+    local_directory: Optional[str] = None
+
+
+@dc.dataclass
 class JobQueueClusterSchedulerConfig:
     dashboard_address: Optional[str] = None
     host: Optional[str] = dc.field(default_factory=socket.gethostname)
@@ -516,6 +536,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="ai", node=AnalyzerPresetConfigAI)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
+    cs.store(group="cluster", name="none", node=InProcessClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
     cs.store(group="cluster", name="pbs", node=PBSClusterConfig)
     cs.store(group="cluster", name="slurm", node=SLURMClusterConfig)
