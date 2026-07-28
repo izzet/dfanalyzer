@@ -1,0 +1,86 @@
+schema_version: analysisfact-rules.v1
+
+# ABLATION COUNTERPART to halo3d.yaml (see LIVEFLOW-STATUS.md sec 17).
+#
+# halo3d.yaml is THRESHOLD-FREE: one rule, no domain gate, constant severity, fires every window, and
+# the CLBO optimizer owns every decision. That is a headline claim ("no magic numbers") which so far
+# rests on no dedicated experiment.
+#
+# This file is the same three-way signal expressed the way the SC'26-era rules were written: per-domain
+# facts, each behind a hand-tuned `when` gate, with severity scaled off the domain fraction (the shape
+# of stormer.yaml: fetch_frac >= 0.20, comm_frac >= 0.30, compute_frac < 0.85 ...). Running the two
+# against the identical workload isolates what the gates actually cost: delayed onset (a gate must be
+# crossed before anything is emitted), mis-targeting (a domain below its threshold is invisible even
+# when it is the largest term), and severity-driven evidence selection.
+#
+# The thresholds below are deliberately the stormer.yaml values, NOT tuned for halo3d -- that is the
+# point: they are magic numbers carried across workloads.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "0.80"
+
+rules:
+  - id: halo3d_gated.storage_pressure.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: storage_pressure
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - reader_posix_time_proc_max
+      - reader_decode_time_proc_max
+      - comm_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+      storage_frac: "fillna0(reader_posix_time_proc_max) / max(active_time, 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+    when: "storage_frac >= 0.20 and compute_frac < 0.85"
+    severity_score: "clip01((storage_frac - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(storage_frac - 0.20))"
+    opportunity_tags:
+      - storage_pressure
+
+  - id: halo3d_gated.decode_pressure.v1
+    priority: 99
+    source_view: epoch
+    emit_mode: window
+    fact_type: decode_pressure
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - reader_posix_time_proc_max
+      - reader_decode_time_proc_max
+      - comm_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+      decode_frac: "fillna0(reader_decode_time_proc_max) / max(active_time, 1e-9)"
+      compute_frac: "fillna0(compute_time_proc_max) / max(active_time, 1e-9)"
+    when: "decode_frac >= 0.20 and compute_frac < 0.85"
+    severity_score: "clip01((decode_frac - 0.10) / 0.25)"
+    confidence: "clip01(0.75 + 0.20 * abs(decode_frac - 0.20))"
+    opportunity_tags:
+      - decode_pressure
+
+  - id: halo3d_gated.comm_dominance.v1
+    priority: 150
+    source_view: epoch
+    emit_mode: window
+    fact_type: comm_dominance
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - comm_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+      comm_frac: "fillna0(comm_time_proc_max) / max(active_time, 1e-9)"
+    when: "comm_frac >= 0.30"
+    severity_score: "clip01((comm_frac - 0.25) / 0.50)"
+    confidence: "clip01(0.70 + 0.25 * comm_frac)"
+    opportunity_tags:
+      - comm_pressure
+    suppresses_tags:
+      - storage_pressure
+      - decode_pressure
