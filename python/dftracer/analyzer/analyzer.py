@@ -57,7 +57,7 @@ from .utils.collection_utils import is_set_like_series
 from betterframe import BetterFrame
 
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
-from .utils.dask_utils import flatten_column_names, persisted_nbytes
+from .utils.dask_utils import flatten_column_names
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
@@ -657,27 +657,28 @@ class Analyzer(abc.ABC):
         """Bring a frame into memory when it is provably small enough.
 
         The per-view Dask machinery costs seconds per view regardless of size,
-        and these frames are routinely a few hundred rows. Materialising once
-        per layer lets `_compute_view` run in pandas instead.
+        and these frames are routinely a few hundred rows.
 
-        The size test must not itself trigger a computation, which rules out
-        `len()` and `memory_usage()` on a lazy frame. `persist()` is
-        asynchronous, so the scheduler usually cannot report a size yet either.
-        What is always available is `npartitions`, and the HLM is repartitioned
-        to PARTITION_SIZE upstream, so `npartitions * PARTITION_SIZE` bounds the
-        materialised size statically. If the scheduler does happen to know the
-        real size already, that is used instead -- but it is never waited for.
+        betterframe owns the mechanism -- sizing a frame without triggering a
+        computation, which rules out len() and memory_usage() on a lazy frame.
+        What stays here is the policy: the threshold, and the bound to fall back
+        on when the scheduler cannot report a size yet. persist() is
+        asynchronous so that is the usual case, and the bound holds because this
+        pipeline repartitions the HLM to PARTITION_SIZE upstream -- something no
+        library could know on our behalf.
         """
         if not self.view_materialize_max_bytes:
             return frame
         if not isinstance(frame, dd.DataFrame):
             return frame
-
-        exact = persisted_nbytes(frame)
-        size = exact if exact is not None else frame.npartitions * PARTITION_SIZE_BYTES
-        if size > self.view_materialize_max_bytes:
-            return frame
-        return frame.compute()
+        return (
+            BetterFrame(frame)
+            .materialize_if_under(
+                self.view_materialize_max_bytes,
+                fallback_bound=frame.npartitions * PARTITION_SIZE_BYTES,
+            )
+            .native
+        )
 
     def compute_logical_views(
         self,
