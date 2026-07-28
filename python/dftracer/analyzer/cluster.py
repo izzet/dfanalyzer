@@ -1,14 +1,16 @@
 import hydra
 import signal
+import structlog
 from dask_jobqueue import LSFCluster, PBSCluster, SLURMCluster
 from dataclasses import asdict, dataclass, field
-from distributed import LocalCluster, wait
+from distributed import Client, LocalCluster, wait
 from hydra.core.config_store import ConfigStore
 from hydra.utils import instantiate
 from omegaconf import MISSING
 from typing import Any, List, Optional, Union
 
 from .config import (
+    AutoClusterConfig,
     ClusterConfig,
     CustomHelpConfig,
     CustomJobConfig,
@@ -20,11 +22,46 @@ from .config import (
 )
 
 
+logger = structlog.get_logger()
+
+
 @dataclass
 class ExternalCluster:
     restart_on_connect: Optional[bool]
     scheduler_address: str
     local_directory: Optional[str]
+
+
+@dataclass
+class AutoCluster:
+    """Marker for `cluster=auto` -- see `AutoClusterConfig`.
+
+    Holds the settings a `LocalCluster` would be built with, in case the trace
+    turns out to be too large to analyse in one process.
+    """
+
+    max_bytes: int = 256 * 1024 * 1024
+    host: Optional[str] = None
+    memory_limit: Optional[int] = None
+    n_workers: Optional[int] = None
+    processes: Optional[bool] = True
+    silence_logs: Optional[int] = None
+    local_directory: Optional[str] = None
+
+    def build_cluster(self) -> LocalCluster:
+        kwargs = {
+            "host": self.host,
+            "memory_limit": self.memory_limit,
+            "n_workers": self.n_workers,
+            "processes": self.processes,
+            "local_directory": self.local_directory,
+        }
+        if self.silence_logs is not None:
+            kwargs["silence_logs"] = self.silence_logs
+        return LocalCluster(**{k: v for k, v in kwargs.items() if v is not None})
+
+    def close(self) -> None:
+        """The cluster, if one was ever built, is owned and closed by AutoClient."""
 
 
 @dataclass
@@ -119,6 +156,93 @@ class NullClient:
         """Nothing to shut down."""
 
 
+class AutoClient:
+    """Runs in-process until the trace proves too big, then starts a cluster.
+
+    Begins as a `NullClient` and forwards everything to it. `promote()` builds a
+    `LocalCluster`, connects a real `Client`, and swaps it in -- *in place*, so
+    every reference already handed out (notably `Analyzer.dask_client`) keeps
+    working and starts talking to the cluster.
+
+    The caller decides when to promote, because only it can see how much data
+    the scan is producing; `max_bytes` is carried here so it has the budget to
+    compare against.
+    """
+
+    can_promote = True
+
+    # How much larger than the budget the traces may be on disk before the
+    # in-process attempt is abandoned without scanning at all. Deliberately
+    # loose: across the bundled fixtures the aggregated result runs between 0.3x
+    # and 2.8x the bytes on disk, so this sits an order of magnitude above
+    # anything observed. It guards against exhausting memory during the scan
+    # itself; it is not an attempt to predict the aggregated size.
+    on_disk_budget_factor = 50
+
+    def __init__(self, cluster: AutoCluster) -> None:
+        self.max_bytes = cluster.max_bytes
+        self._spec = cluster
+        self._impl = NullClient()
+        self._cluster: Optional[LocalCluster] = None
+
+    @property
+    def is_distributed(self) -> bool:
+        return self._cluster is not None
+
+    def accepts_estimate(self, on_disk_bytes: int) -> bool:
+        """Whether a scan is worth attempting here, judged before doing one.
+
+        Callers pass whatever cheap upper bound they have. Rejecting promotes,
+        so the caller can simply stop and submit its work as usual.
+        """
+        if on_disk_bytes <= self.max_bytes * self.on_disk_budget_factor:
+            return True
+        logger.info(
+            "traces far larger than the in-process budget, starting a cluster unscanned",
+            on_disk_bytes=on_disk_bytes,
+            max_bytes=self.max_bytes,
+        )
+        self.promote()
+        return False
+
+    def accepts(self, nbytes: int) -> bool:
+        """Whether this much aggregated data should be handled in process.
+
+        Rejecting promotes, so a caller that has already scanned can drop what
+        it holds and re-submit through the cluster.
+        """
+        if nbytes <= self.max_bytes:
+            logger.info("analysing in process", scanned_bytes=nbytes, max_bytes=self.max_bytes)
+            return True
+        logger.info(
+            "trace too large to analyse in process, starting a cluster",
+            scanned_bytes=nbytes,
+            max_bytes=self.max_bytes,
+        )
+        self.promote()
+        return False
+
+    def promote(self):
+        """Start a real cluster and route everything to it from here on."""
+        if self._cluster is None:
+            self._cluster = self._spec.build_cluster()
+            self._impl = Client(self._cluster)
+        return self._impl
+
+    def close(self, *args, **kwargs) -> None:
+        self._impl.close(*args, **kwargs)
+        if self._cluster is not None:
+            self._cluster.close()
+            self._cluster = None
+
+    def __getattr__(self, name):
+        # Only consulted for names not found on the instance or class, so the
+        # attributes above keep their own meaning and the rest -- submit,
+        # gather, compute, cancel, nthreads, run -- follow whichever client is
+        # currently in charge.
+        return getattr(self._impl, name)
+
+
 def wait_for(client, items) -> None:
     """Block until `items` are finished, where finishing means anything.
 
@@ -154,6 +278,7 @@ cs = ConfigStore.instance()
 cs.store(group="hydra/help", name="custom", node=asdict(CustomHelpConfig()))
 cs.store(group="hydra/job", name="custom", node=CustomJobConfig)
 cs.store(name="config", node=Config)
+cs.store(group="cluster", name="auto", node=AutoClusterConfig)
 cs.store(group="cluster", name="local", node=LocalClusterConfig)
 cs.store(group="cluster", name="none", node=InProcessClusterConfig)
 cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
@@ -161,12 +286,18 @@ cs.store(group="cluster", name="pbs", node=PBSClusterConfig)
 cs.store(group="cluster", name="slurm", node=SLURMClusterConfig)
 
 
-ClusterType = Union[ExternalCluster, InProcessCluster, LocalCluster, LSFCluster, PBSCluster, SLURMCluster]
+ClusterType = Union[AutoCluster, ExternalCluster, InProcessCluster, LocalCluster, LSFCluster, PBSCluster, SLURMCluster]
 
 
 @hydra.main(version_base=None, config_name="config")
 def main(cfg: Config) -> None:
     cluster: ClusterType = instantiate(cfg.cluster)
+    if not hasattr(cluster, "scheduler"):
+        raise ValueError(
+            f"cluster={type(cluster).__name__} has no scheduler to serve. "
+            "dfanalyzer-cluster starts a cluster for other processes to connect to; "
+            "choose cluster=local, slurm, lsf or pbs."
+        )
     print(cluster.scheduler.address, flush=True)
     try:
         signal.pause()

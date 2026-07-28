@@ -348,6 +348,36 @@ class ExternalClusterConfig(ClusterConfig):
 
 
 @dc.dataclass
+class AutoClusterConfig(ClusterConfig):
+    """Start in this process, and fall back to a local cluster if the trace is big.
+
+    The scan runs here first, one file group at a time, accumulating the
+    aggregated Arrow payloads. If they outgrow `max_bytes` the partial scan is
+    dropped, a `LocalCluster` is started, and the read is redone across its
+    workers. Small traces therefore never pay for a cluster, and large ones are
+    not asked to fit in one process.
+
+    Gating on the aggregated size rather than the trace's size on disk is
+    deliberate: the C++ indexer aggregates before Python sees anything, and how
+    much it collapses depends on time buckets x processes x categories, not on
+    bytes. Across the bundled fixtures the ratio of aggregated size to on-disk
+    size varies about twentyfold, so no threshold on file size predicts this.
+    """
+
+    _target_: str = "dftracer.analyzer.cluster.AutoCluster"
+    # Aggregated Arrow bytes, not trace bytes on disk. Generous next to what the
+    # fixtures produce (under a megabyte), while staying well inside the memory
+    # a single process can turn into pandas frames.
+    max_bytes: int = 256 * 1024 * 1024
+    # Used only if the budget is exceeded and a cluster has to be started.
+    host: Optional[str] = None
+    memory_limit: Optional[int] = None
+    n_workers: Optional[int] = None
+    processes: Optional[bool] = True
+    silence_logs: Optional[int] = logging.CRITICAL
+
+
+@dc.dataclass
 class InProcessClusterConfig(ClusterConfig):
     """Run the analysis in this process, with no scheduler and no workers.
 
@@ -504,7 +534,7 @@ class Config:
             {"analyzer": "dftracer"},
             {"analyzer/preset": "posix"},
             {"hydra/job": "custom"},
-            {"cluster": "local"},
+            {"cluster": "auto"},
             {"output": "console"},
             "_self_",
             {"override hydra/help": "custom"},
@@ -534,6 +564,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="auto", node=AnalyzerPresetConfigAuto)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="ai", node=AnalyzerPresetConfigAI)
+    cs.store(group="cluster", name="auto", node=AutoClusterConfig)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="none", node=InProcessClusterConfig)

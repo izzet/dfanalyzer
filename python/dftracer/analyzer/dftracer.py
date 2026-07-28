@@ -250,6 +250,77 @@ class DFTracerAnalyzer(Analyzer):
         ensure_index(trace_path, self.trace_groups, self.time_granularity * 1000.0)
         return super().analyze_trace(trace_path, *args, **kwargs)
 
+    @staticmethod
+    def _plan_scan(file_id_to_path, file_pids, n_groups):
+        """Split the indexed files into scan jobs, one per worker.
+
+        Files are grouped by pid so that a group owns whole processes, and each
+        job carries the query narrowing its scan to the pids it owns.
+        """
+        all_file_ids = set(file_id_to_path.keys())
+        full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
+        jobs = []
+        for fids in _assign_files_by_pid(full_file_pids, n_groups).values():
+            wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
+            if not wfiles:
+                continue
+            pids = set()
+            for fid in fids:
+                if fid in file_pids:
+                    pids.update(file_pids[fid])
+            query = None
+            if pids:
+                pid_conditions = " or ".join(f"pid == {pid}" for pid in sorted(pids))
+                query = f"({pid_conditions})"
+            jobs.append((wfiles, query))
+        return jobs
+
+    def _scan_within_budget(self, dask_client, scan_plan, index_path, trace_files):
+        """Scan here, if the client will accept what the scan produces.
+
+        Measuring is this class's job because only it knows how a dftracer trace
+        is scanned and sized; deciding what to do with the number belongs to the
+        client, which owns the budget and the cluster (`AutoClient.accepts`).
+        Returns the per-group IPC payloads, or None if the client would rather
+        have a cluster -- by which point it has started one.
+
+        The scan is not subdivided to check the budget part-way through. Each
+        group is a separate full scan of the aggregation column family filtered
+        by pid, so splitting into N groups costs N sequential scans: measured at
+        roughly five times the read time on an eight-file fixture. A cluster
+        pays that cost in parallel; one process cannot. Scanning once and
+        measuring afterwards is the only version that is not slower than what it
+        replaces.
+
+        So the budget bounds what gets *processed* here, not what gets read in:
+        an oversized trace is aggregated once before being handed to the
+        cluster. `accepts_estimate` is the cheap guard for when even that is too
+        much to attempt.
+        """
+        on_disk = 0
+        for path in trace_files:
+            try:
+                on_disk += os.path.getsize(path)
+            except OSError:
+                continue
+        if not dask_client.accepts_estimate(on_disk):
+            return None
+
+        payloads = []
+        scanned_bytes = 0
+        for wfiles, query in scan_plan:
+            payload = scan_to_ipc(
+                wfiles,
+                index_path,
+                self.time_granularity,
+                self.time_resolution,
+                query,
+            )
+            scanned_bytes += sum(len(chunk) for chunk in payload.values() if chunk)
+            payloads.append(payload)
+
+        return payloads if dask_client.accepts(scanned_bytes) else None
+
     def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None):
         """Read trace using C++ aggregation pipeline.
 
@@ -486,32 +557,39 @@ class DFTracerAnalyzer(Analyzer):
         worker_scan_args = []
 
         with log_block("submit_workers"):
-            all_file_ids = set(file_id_to_path.keys())
-            full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
-            worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
-            for worker_id, fids in worker_file_ids.items():
-                wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
-                if not wfiles:
-                    continue
-                pids = set()
-                for fid in fids:
-                    if fid in file_pids:
-                        pids.update(file_pids[fid])
-                query = None
-                if pids:
-                    pid_conditions = " or ".join(f"pid == {pid}" for pid in sorted(pids))
-                    query = f"({pid_conditions})"
-                worker_addr = worker_list[worker_id % len(worker_list)] if worker_list else None
-                future = dask_client.submit(
-                    scan_to_ipc,
-                    wfiles,
-                    index_path,
-                    self.time_granularity,
-                    self.time_resolution,
-                    query,
-                    workers=[worker_addr] if worker_addr else None,
-                    pure=False,
+            scan_plan = self._plan_scan(file_id_to_path, file_pids, n_workers)
+
+            # cluster=auto: try the scan here first, and only start a cluster if
+            # the aggregated data turns out not to fit. Deciding needs the scan's
+            # actual output, so it cannot happen before this point.
+            prescanned = None
+            if getattr(dask_client, "can_promote", False):
+                prescanned = self._scan_within_budget(
+                    dask_client, scan_plan, index_path, file_id_to_path.values()
                 )
+                if prescanned is None:
+                    # Declining started the cluster; re-plan for its workers.
+                    worker_nthreads = dask_client.nthreads()
+                    n_workers = len(worker_nthreads) or 1
+                    worker_list = list(worker_nthreads.keys())
+                    scan_plan = self._plan_scan(file_id_to_path, file_pids, n_workers)
+
+            for scan_index, (wfiles, query) in enumerate(scan_plan):
+                if prescanned is not None:
+                    worker_addr = None
+                    future = prescanned[scan_index]
+                else:
+                    worker_addr = worker_list[scan_index % len(worker_list)] if worker_list else None
+                    future = dask_client.submit(
+                        scan_to_ipc,
+                        wfiles,
+                        index_path,
+                        self.time_granularity,
+                        self.time_resolution,
+                        query,
+                        workers=[worker_addr] if worker_addr else None,
+                        pure=False,
+                    )
                 event_futures.append(future)
                 worker_scan_args.append((worker_addr, wfiles, query))
 
