@@ -10,7 +10,7 @@ import os
 import pandas as pd
 import re
 import structlog
-from dask import compute, persist
+from dask import compute, delayed, persist
 from dask.distributed import fire_and_forget, get_client, wait
 from omegaconf import OmegaConf, open_dict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -1072,16 +1072,26 @@ class Analyzer(abc.ABC):
             )
         return []
 
-    def store_view(self, name: str, view: dd.DataFrame, partition_size="64MB"):
-        """Stores a Dask DataFrame view to a Parquet checkpoint.
+    def store_view(self, name: str, view, partition_size="64MB"):
+        """Stores a view to a Parquet checkpoint.
 
-        The view DataFrame is repartitioned and then written to a subdirectory
-        named `name` within the `checkpoint_dir`.
+        The view is repartitioned and then written to a subdirectory named
+        `name` within the `checkpoint_dir`.
+
+        A view may arrive as pandas rather than Dask, since layers small enough
+        to materialise are computed in pandas (see `_materialize_if_small`). It
+        is wrapped back into a single Dask partition rather than written through
+        pandas directly, so the checkpoint keeps one on-disk shape: a Parquet
+        directory carrying the `_metadata` file that `has_checkpoint` looks for
+        and `restore_view` reads back.
+
+        The wrapping goes through `from_delayed` rather than `from_pandas`
+        because views are indexed by their view type -- a MultiIndex whenever
+        there is more than one -- and `from_pandas` rejects a MultiIndex.
 
         Args:
             name: The name of the checkpoint.
-            view: The Dask DataFrame to store.
-            compute: Whether to compute the DataFrame before writing (Dask default is True).
+            view: The Dask or pandas DataFrame to store.
             partition_size: The desired partition size for the output Parquet files.
 
         Returns:
@@ -1090,7 +1100,9 @@ class Analyzer(abc.ABC):
         for col in view.columns:
             if view.dtypes[col].name == "object":
                 view[col] = view[col].astype(str)
-        if view.npartitions > 1:
+        if not isinstance(view, dd.DataFrame):
+            view = dd.from_delayed([delayed(view)], meta=view.iloc[:0])
+        elif view.npartitions > 1:
             view = view.repartition(partition_size=partition_size)
         return view.to_parquet(
             self.get_checkpoint_path(name=name),

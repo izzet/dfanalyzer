@@ -37,11 +37,11 @@ def dask_cluster():
     cluster.close()
 
 
-def _analyze(tmp_path: pathlib.Path, cluster, view_materialize_max_bytes: int):
+def _analyze(tmp_path: pathlib.Path, cluster, view_materialize_max_bytes: int, checkpoint: bool = False):
     overrides = [
         "analyzer=dftracer",
         f"analyzer/preset={PRESET}",
-        "analyzer.checkpoint=False",
+        f"analyzer.checkpoint={checkpoint}",
         f"analyzer.checkpoint_dir={tmp_path}/checkpoints",
         f"analyzer.view_materialize_max_bytes={view_materialize_max_bytes}",
         "cluster=external",
@@ -80,6 +80,45 @@ def test_view_paths_agree(tmp_path: pathlib.Path, dask_cluster) -> None:
             rtol=1e-9,
             obj=f"flat view {view_key}",
         )
+
+
+@pytest.mark.smoke
+def test_materialised_views_can_be_checkpointed(tmp_path: pathlib.Path, dask_cluster) -> None:
+    """Checkpointing must survive a view that materialised to pandas.
+
+    `store_view` writes through Dask, so a materialised layer has to be wrapped
+    back into a Dask frame first -- and views are indexed by their view type,
+    which is a MultiIndex whenever there is more than one. Both facts are easy
+    to miss because every other test here disables checkpointing.
+    """
+    checkpoint_dir = tmp_path / "ckpt" / "checkpoints"
+
+    cold = _analyze(tmp_path / "ckpt", dask_cluster, 256 * 1024**2, checkpoint=True)
+
+    written = sorted(p.name for p in checkpoint_dir.iterdir()) if checkpoint_dir.is_dir() else []
+    assert written, "no checkpoints written -- the test would pass without exercising store_view"
+
+    # Reruns hit the read-back path instead of recomputing, so it needs covering too.
+    warm = _analyze(tmp_path / "ckpt", dask_cluster, 256 * 1024**2, checkpoint=True)
+
+    baseline = _analyze(tmp_path / "nockpt", dask_cluster, 256 * 1024**2)
+    assert set(baseline) == set(cold) == set(warm), "checkpointing changed which views were produced"
+
+    for view_key in baseline:
+        # Index types are compared on the cold run only. Restoring from Parquet
+        # widens string indexes to `large_string[pyarrow]`, which predates
+        # materialisation -- a pure-Dask run (view_materialize_max_bytes=0) does
+        # it too -- so requiring it here would assert something never true.
+        for label, actual, check_index_type in (("cold", cold, True), ("warm", warm, False)):
+            assert_frame_equal(
+                baseline[view_key],
+                actual[view_key],
+                check_dtype=True,
+                check_index_type=check_index_type,
+                check_exact=False,
+                rtol=1e-9,
+                obj=f"flat view {view_key} ({label} checkpoint)",
+            )
 
 
 @pytest.mark.smoke
