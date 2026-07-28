@@ -1,0 +1,38 @@
+schema_version: analysisfact-rules.v1
+
+# halo3d three-way (storage<->decode<->comm) — THRESHOLD-FREE by design.
+# Unlike stormer.yaml (fetch_frac>=0.20, comm_frac>=0.30, ... = hand-tuned magic-number gates), this
+# preset emits ONE per-window finding carrying the raw per-domain times and lets the CLBO optimizer
+# own EVERY decision (domain inferred from the knob->domain map; config chosen by the GP + EI). The
+# only `when` is a trivially-true "there was activity this window" guard, NOT a domain-attribution
+# threshold -> no magic numbers anywhere in the diagnosis path.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "1.0"
+
+rules:
+  - id: halo3d.threeway_signal.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: threeway_signal
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - reader_posix_time_proc_max
+      - reader_decode_time_proc_max
+      - comm_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      # wall = exposed step = app-level fetch + comm + compute (matches the Path A in-process wall).
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+    when: "active_time > 0"          # trivially true (a window ran) -> NOT a domain gate. Threshold-free.
+    severity_score: "1.0"
+    confidence: "1.0"
+    # tags map knobs to this finding in the registry; under DFOPTIMIZER_ALGO=clbo they are inert
+    # (the planner infers domain from _DOMAIN_OF and decides by EI), preserving no-magic-numbers.
+    opportunity_tags:
+      - storage_pressure
+      - decode_pressure
+      - comm_pressure

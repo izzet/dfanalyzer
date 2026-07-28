@@ -307,6 +307,60 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
 
 
 @dc.dataclass
+class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
+    """Preset for halo3d (LiveFlow three-way storage<->decode<->comm).
+
+    The cross-layer JOIN splits the input pole into two reader-domain layers (sibling to how DLIO
+    scopes reader_posix):
+    - 'reader_posix'  : the POSIX read latency on cube_*.zz (syscall layer) -> STORAGE domain,
+    - 'reader_decode' : the data.decode region (zlib inflate; emitted from the MAIN thread because the
+                        MOFKA writer is unsafe for daemon-thread emission) -> DECODE domain,
+    while 'comm' (halo) and 'compute' (conv+backward) are the main-thread app regions. The analyzer
+    emits reader_posix_time_proc_max / reader_decode_time_proc_max / comm_time_proc_max /
+    compute_time_proc_max / fetch_iter_time_proc_max per window; clbo_planner maps read_threads->storage
+    (reader_posix), decode_threads->decode (reader_decode), halo_width->comm.
+    NOTE: async_layers / derived_metrics / size_derived_metrics are OVERRIDDEN so they reference ONLY
+    the layers this preset defines -- the inherited Stormer/DLIO values name data_loader/reader/... which
+    do not exist here and cause a hard KeyError (analysis_skipped_missing_column) in set_cross_layer_metrics.
+    (POSIX cat matched case-insensitively: some dftracer builds emit "POSIX", others "posix".)"""
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'app': 'cat == "ai_root" & func_name == "ai_root"',
+            'training': 'cat == "pipeline" & func_name == "train"',
+            'fetch_iter': 'cat == "dataloader"',                 # dataloader.fetch (app-level fetch)
+            'comm': 'cat == "comm"',                             # halo exchange (COMM domain)
+            'compute': 'cat == "compute"',                       # conv + backward (COMPUTE domain)
+            'posix': 'cat.str.contains("posix|stdio", case=False)',
+            'reader_posix': 'cat.str.contains("posix|stdio", case=False) & func_name == "read"',  # STORAGE
+            'reader_decode': 'cat == "data"',                    # data.decode (DECODE domain)
+        }
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'app': None,
+            'training': 'app',
+            'fetch_iter': 'training',
+            'comm': 'training',
+            'compute': 'training',
+            'posix': None,
+            'reader_posix': 'fetch_iter',    # reader-domain, overlaps fetch via the prefetch queue
+            'reader_decode': 'fetch_iter',
+        }
+    )
+    # Async (overlapping) reader-domain layers -- MUST only name layers defined above.
+    async_layers: List[str] = dc.field(
+        default_factory=lambda: ['reader_posix', 'reader_decode', 'posix'])
+    # No extra derived/size metrics needed (the fact rule uses the per-layer *_time_proc_max directly);
+    # override to only-defined layers so nothing references data_loader/reader/checkpoint.
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {k: {} for k in
+                                 ['app', 'training', 'fetch_iter', 'comm', 'compute',
+                                  'posix', 'reader_posix', 'reader_decode']})
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=lambda: {})
+    name: str = "halo3d"
+
+
+@dc.dataclass
 class AnalyzerConfig:
     checkpoint: Optional[bool] = False
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
@@ -560,6 +614,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="analyzer/preset", name="stormer", node=AnalyzerPresetConfigStormer)
+    cs.store(group="analyzer/preset", name="halo3d", node=AnalyzerPresetConfigHalo3d)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
