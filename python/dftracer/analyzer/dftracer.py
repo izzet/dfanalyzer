@@ -13,6 +13,7 @@ from dftracer.utils.dfanalyzer import (
     build_partial_meta,
     coerce_arrow_numerics_to_pandas_native,
     coerce_profile_dtypes,
+    decode_dictionary_columns,
     distributed_hlm,
     distributed_time_origin,
     ensure_index,
@@ -323,22 +324,37 @@ class DFTracerAnalyzer(Analyzer):
             system_batches = [pa.record_batch(b) for b in all_batches.get("system", [])]
 
         with log_block("cpp_to_dask"):
-            # Convert Arrow batches to Dask DataFrames
+            # Convert Arrow batches to Dask DataFrames.
+            #
+            # Every table goes through `decode_dictionary_columns` first, which is
+            # what `ipc_to_pandas` does on the distributed path. Without it the
+            # C++ aggregator's dictionary-encoded columns land as pandas
+            # `category` rather than `string`; `normalize_arrow_dtypes` then
+            # demotes them to `object`, and arithmetic on object columns follows
+            # Python scalar rules -- so `count / time` raises ZeroDivisionError
+            # instead of yielding inf. The two read paths must agree on dtypes.
             if event_batches:
-                events_table = pa.Table.from_batches(event_batches)
+                events_table = decode_dictionary_columns(pa.Table.from_batches(event_batches))
                 events_pd = events_table.to_pandas()
+                # The distributed path derives this from the per-worker futures via
+                # `distributed_time_origin`; here the events are already local, so
+                # take the minimum directly. `_postread_hlm_config` skips time
+                # rebucketing entirely when it is unset, which silently bucketed
+                # `time_range` against a different origin than the distributed path.
+                self._time_origin = int(events_pd[COL_TIME_START].min()) if not events_pd.empty else None
                 traces = dd.from_pandas(
                     events_pd,
                     npartitions=max(1, len(event_batches) // 10),
                 )
             else:
+                self._time_origin = None
                 traces = dd.from_pandas(
                     pd.DataFrame(columns=list(PROFILE_OUTPUT_COLUMNS.keys())),
                     npartitions=1,
                 )
 
             if profile_batches:
-                profiles_table = pa.Table.from_batches(profile_batches)
+                profiles_table = decode_dictionary_columns(pa.Table.from_batches(profile_batches))
                 profile_window = int(self.profile_time_granularity * self.time_resolution)
                 profiles_pd = coerce_profile_dtypes(
                     profiles_table.to_pandas(), PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
@@ -351,7 +367,7 @@ class DFTracerAnalyzer(Analyzer):
                 profiles = None
 
             if system_batches:
-                system_table = pa.Table.from_batches(system_batches)
+                system_table = decode_dictionary_columns(pa.Table.from_batches(system_batches))
                 system_pd = system_table.to_pandas()
                 # time_bucket is already the bucket-start timestamp in us
                 # (compute_time_bucket floors ts to the bucket boundary), so
