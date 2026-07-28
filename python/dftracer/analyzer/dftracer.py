@@ -36,6 +36,8 @@ from .analysis_utils import (
     fix_std_cols,
     set_unique_counts,
 )
+from betterframe import BetterFrame
+
 from .utils.dask_agg import unique_set, unique_set_flatten
 from .constants import (
     COL_ACC_PAT,
@@ -637,16 +639,16 @@ class DFTracerAnalyzer(Analyzer):
 
     def _compute_view(self, layer, records, view_key, view_type, view_types):
         from .constants import VIEW_TYPES
-        from .utils.dataframe_ops import DataFrameOps
         import itertools as it
 
         # `records` is a Dask frame, or a pandas one when compute_views decided
         # the layer was small enough to materialise. The algorithm below is
-        # written once; `ops` absorbs the difference.
-        ops = DataFrameOps.of(records)
+        # written once; BetterFrame absorbs the difference.
+        frame = BetterFrame(records).mutable()
+        ops = frame.ops
 
         keep_object_cols = set(VIEW_TYPES) | set(view_types) | set(it.chain.from_iterable(self.logical_views.values()))
-        records = ops.mutable(records)
+        records = frame.native
         drop_cols = []
         for col in records.columns:
             dtype_str = str(records[col].dtype)
@@ -661,10 +663,11 @@ class DFTracerAnalyzer(Analyzer):
                 drop_cols.append(col)
         if drop_cols:
             records = records.drop(columns=drop_cols, errors="ignore")
+        frame = BetterFrame(records)
 
         # Arrow-based view computation
         view_types_diff = set(VIEW_TYPES).difference(view_types)
-        local_view_types = ops.index_names(records)
+        local_view_types = frame.index_names()
         local_view_types_diff = set(local_view_types).difference([view_type])
 
         view_agg = {}
@@ -711,10 +714,9 @@ class DFTracerAnalyzer(Analyzer):
                 set_cols_items.append((col, aggs[0]))
 
         std_cols = list(full_cols)
-        records = ops.apply(records, fix_std_cols, std_cols=std_cols)
+        prepared = frame.apply(fix_std_cols, std_cols=std_cols)
 
-        partials = ops.apply(
-            records,
+        partials = prepared.apply(
             partial_arrow_view_groupby,
             view_type,
             full_cols,
@@ -724,7 +726,7 @@ class DFTracerAnalyzer(Analyzer):
             set_cols_items,
             BetterSet.flatten,
             meta=lambda: build_partial_meta(
-                ops.meta_source(records), view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
+                prepared.meta_source(), view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
             ),
         )
 
@@ -744,21 +746,19 @@ class DFTracerAnalyzer(Analyzer):
         for c, _ in set_cols_items:
             merge_aggs[f"{c}_unique"] = ops.set_union_flatten()
 
-        merged = partials.groupby(view_type).agg(merge_aggs)
+        merged = partials.pipe(lambda df: df.groupby(view_type).agg(merge_aggs))
 
-        final = ops.apply(
-            merged,
+        final = merged.apply(
             finalize_view_partials,
             full_cols,
-            meta=lambda: build_final_meta(ops.meta_source(merged), full_cols),
+            meta=lambda: build_final_meta(merged.meta_source(), full_cols),
         )
-        final = final.rename(columns=build_view_rename_map(final.columns))
-        final = final.replace(0, pd.NA)
-        final = ops.apply(final, derive_call_stats)
-        final = ops.apply(final, set_unique_counts, layer=layer)
-        final = ops.apply(final, fix_dtypes, time_sliced=self.time_sliced)
-        final = ops.apply(final, coerce_arrow_numerics_to_pandas_native)
-        return ops.finalize(final)
+        final = final.pipe(lambda df: df.rename(columns=build_view_rename_map(df.columns)).replace(0, pd.NA))
+        final = final.apply(derive_call_stats)
+        final = final.apply(set_unique_counts, layer=layer)
+        final = final.apply(fix_dtypes, time_sliced=self.time_sliced)
+        final = final.apply(coerce_arrow_numerics_to_pandas_native)
+        return final.finalize()
 
     def postread_trace(
         self,

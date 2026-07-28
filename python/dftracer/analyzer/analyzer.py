@@ -54,9 +54,10 @@ from .types import (
     Views,
 )
 from .utils.collection_utils import is_set_like_series
+from betterframe import BetterFrame
+
 from .utils.dask_agg import quantile_stats, unique_set, unique_set_flatten
 from .utils.dask_utils import flatten_column_names, persisted_nbytes
-from .utils.dataframe_ops import DataFrameOps
 from .utils.expr_utils import extract_numerator_and_denominators
 from .utils.file_utils import ensure_dir
 from .utils.json_encoders import NpEncoder
@@ -1595,7 +1596,7 @@ class Analyzer(abc.ABC):
         view_types: List[ViewType],
         partition_size: str,
     ) -> dd.DataFrame:
-        ops = DataFrameOps.of(hlm)
+        frame = BetterFrame(hlm)
         with log_block("drop_and_set_metrics", layer=layer):
             size_layers = {configured_layer.lower() for configured_layer in (self.preset.size_layers or [])}
             keep_size_for_layer = layer.lower() in size_layers
@@ -1604,18 +1605,18 @@ class Analyzer(abc.ABC):
                 hlm = hlm.drop(columns=size_cols)  # type: ignore
                 if "file_name" in hlm.columns:
                     hlm = hlm.drop(columns=["file_name"])  # type: ignore
-            hlm = ops.apply(
-                hlm,
+            frame = BetterFrame(hlm).apply(
                 self.set_layer_metrics,
                 derived_metrics=self.preset.derived_metrics[layer],
                 size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
             )
+            hlm = frame.native
         with log_block("build_agg_dict", layer=layer):
             view_types_diff = set(VIEW_TYPES).difference(view_types)
             main_view_agg = {}
             for col in hlm.columns:
                 if any(map(col.endswith, view_types_diff)):
-                    main_view_agg[col] = ops.set_union_flatten()
+                    main_view_agg[col] = frame.ops.set_union_flatten()
                 elif col not in HLM_EXTRA_COLS:
                     if col.endswith("_call_min"):
                         main_view_agg[col] = "min"
@@ -1624,11 +1625,13 @@ class Analyzer(abc.ABC):
                     else:
                         main_view_agg[col] = "sum"
         with log_block("compute_main_view", layer=layer):
-            main_view = hlm.groupby(list(view_types)).agg(main_view_agg, **ops.agg_kwargs(hlm))
-            main_view = ops.apply(main_view, set_main_metrics)
-            main_view = main_view.replace(0, pd.NA)
-            main_view = ops.apply(main_view, fix_dtypes, time_sliced=self.time_sliced)
-            main_view = ops.finalize(main_view)
+            main_view = frame.pipe(
+                lambda df, kw=frame.agg_kwargs(): df.groupby(list(view_types)).agg(main_view_agg, **kw)
+            )
+            main_view = main_view.apply(set_main_metrics)
+            main_view = main_view.pipe(lambda df: df.replace(0, pd.NA))
+            main_view = main_view.apply(fix_dtypes, time_sliced=self.time_sliced)
+            main_view = main_view.finalize()
         return main_view
 
     def _compute_view(
