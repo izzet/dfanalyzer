@@ -169,6 +169,18 @@ class Analyzer(abc.ABC):
         except ValueError:
             return NullClient()
 
+    def use_client(self, client) -> None:
+        """Adopt the client the caller set up.
+
+        `_resolve_client` can only find a client that registered itself as the
+        ambient one, which the Dask `Client` does and the in-process shims
+        cannot. Without this an `AutoClient` would be replaced by a plain
+        `NullClient` -- still correct, but silently unable to promote itself to
+        a cluster, which is the whole point of `cluster=auto`.
+        """
+        if client is not None:
+            self.dask_client = client
+
     def _wait_for(self, items) -> None:
         """Block until `items` are finished. See `cluster.wait_for`."""
         wait_for(self.dask_client, items)

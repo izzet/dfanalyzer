@@ -234,10 +234,59 @@ Cluster Configuration
 Configure how DFAnalyzer executes: on a Dask cluster, or in the calling process.
 Select a cluster type with ``cluster=<type>``.
 
+Automatic (``cluster=auto``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The **default**. Analyses the trace in the calling process when it is small
+enough, and starts a local cluster when it is not.
+
+The trace is scanned here first and the aggregated result measured against
+``cluster.max_bytes``. Under the budget, that scan is used as-is and no cluster
+is ever built, which avoids roughly 2.2 seconds of setup and teardown. Over it,
+the scan is discarded, a ``LocalCluster`` is started, and the read is redone
+across its workers. Results are identical either way.
+
+The budget is compared against the *aggregated* Arrow data, not the size of the
+traces on disk. The C++ indexer aggregates before Python sees anything, and how
+far it collapses the trace depends on time buckets, processes and categories
+rather than bytes — across the bundled fixtures the ratio between the two varies
+about twentyfold, so no threshold on file size predicts it.
+
+.. list-table::
+   :widths: 25 15 15 45
+   :header-rows: 1
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``cluster.max_bytes``
+     - int
+     - 268435456
+     - Aggregated Arrow bytes that may be analysed in process. Above this, a local cluster is started.
+   * - ``cluster.n_workers``
+     - int
+     - null
+     - Workers to start *if* a cluster turns out to be needed.
+   * - ``cluster.memory_limit``
+     - int
+     - null
+     - Memory limit per worker, if a cluster is started.
+
+.. note::
+
+   The budget bounds what is *processed* in this process, not what is read into
+   it. An oversized trace is aggregated here once before being handed to the
+   cluster, because checking part-way through the scan would mean scanning each
+   file group separately — several times slower, since each group is a full
+   scan of the index. Traces whose files are more than fifty times the budget
+   skip the attempt entirely. If you already know a trace is large, naming
+   ``cluster=local`` or a job-queue cluster avoids the wasted scan.
+
 Local Cluster (``cluster=local``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The **default** cluster configuration, which runs analysis on the local machine.
+Always runs a Dask cluster on the local machine, whatever the trace size.
 
 .. list-table::
    :widths: 25 15 15 45
@@ -259,7 +308,8 @@ The **default** cluster configuration, which runs analysis on the local machine.
 In-Process (``cluster=none``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Runs the analysis in the calling process, with no scheduler and no workers.
+Runs the analysis in the calling process, with no scheduler and no workers,
+unconditionally — unlike ``cluster=auto``, it never falls back to a cluster.
 
 Layers small enough to materialise are already computed in pandas rather than
 Dask (see ``analyzer.view_materialize_max_bytes``), so for a small trace the

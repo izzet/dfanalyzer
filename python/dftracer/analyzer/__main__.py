@@ -6,7 +6,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from . import AnalyzerType, ClusterType, OutputType
-from .cluster import ExternalCluster, InProcessCluster, NullClient
+from .cluster import AutoClient, AutoCluster, ExternalCluster, InProcessCluster, NullClient
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, init_hydra_config_store
 from .utils.log_utils import configure_logging, console_block, log_block
 from .utils.warning_utils import filter_warnings
@@ -28,7 +28,9 @@ def main(cfg: Config) -> None:
     # Setup cluster
     with console_block("Cluster setup"):
         cluster: ClusterType = instantiate(cfg.cluster)
-        if isinstance(cluster, InProcessCluster):
+        if isinstance(cluster, AutoCluster):
+            client = AutoClient(cluster)
+        elif isinstance(cluster, InProcessCluster):
             client = NullClient()
         elif isinstance(cluster, ExternalCluster):
             client = Client(cluster.scheduler_address)
@@ -49,6 +51,7 @@ def main(cfg: Config) -> None:
             verbose=cfg.verbose,
             facts_config=cfg.facts,
         )
+        analyzer.use_client(client)
 
     # Analyze trace
     result = analyzer.analyze_trace(
