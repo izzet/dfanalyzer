@@ -102,6 +102,10 @@ Common Analyzer Parameters
      - float
      - Varies
      - Time resolution for the analyzer (in nanoseconds). Defaults vary by analyzer.
+   * - ``analyzer.view_materialize_max_bytes``
+     - int
+     - 268435456
+     - Layers whose main view is smaller than this are computed in pandas rather than Dask, which avoids building a task graph for frames that are often only a few dozen rows. Output is identical either way, so a wrong value costs speed, never correctness. Set to ``0`` to keep everything on Dask.
 
 Analyzer Presets (``analyzer/preset``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

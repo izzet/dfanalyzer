@@ -53,11 +53,14 @@ Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrid
        ]
    )
 
-You can inspect the Dask client and the preset configuration:
+You can inspect the execution client and the preset configuration:
 
 .. code-block:: python
 
-   # Access the Dask client
+   # The client work is submitted through. With the default ``cluster=auto``
+   # this is an ``AutoClient``, which runs work in this process until the
+   # trace proves too large and then starts a cluster; with ``cluster=local``
+   # or ``cluster=external`` it is a Dask ``Client``.
    dfa.client
 
    # View the preset configuration
@@ -90,14 +93,14 @@ AnalysisResult Class
 
 The ``AnalysisResult`` dataclass encapsulates all the results from a DFAnalyzer analysis run. It provides both direct attribute access and convenience methods for exploring the data.
 
-**Key Distinction**: Most users should primarily use ``flat_views`` (pandas DataFrames) for interactive analysis. The other views are Dask DataFrames exposed for advanced users who need distributed processing capabilities.
+**Key Distinction**: Most users should primarily use ``flat_views``, which are always pandas DataFrames. The other views are exposed for advanced use, and may be either pandas or Dask DataFrames: layers small enough to materialise are computed in pandas (see ``analyzer.view_materialize_max_bytes``), and the rest stay on Dask. Code that consumes them should not assume one engine — ``.head()``, ``.columns`` and the like work on both, but ``.compute()`` exists only on Dask.
 
 Key Attributes:
 
 - ``layers``: List of layer names available in the analysis
 - ``view_types``: List of view types used in the analysis  
 - ``flat_views``: Dictionary of flattened pandas DataFrames for quick access to aggregated metrics (recommended for most users)
-- ``views``: Nested dictionary of Dask DataFrames organized by layer and view type (for advanced distributed processing)
+- ``views``: Nested dictionary organized by layer and view type; pandas or Dask DataFrames depending on whether the layer was materialised
 - ``raw_stats``: Basic statistics about the trace data
 - ``checkpoint_dir``: Directory where analysis checkpoints are stored
 
@@ -115,27 +118,27 @@ List all the layers available for detailed analysis:
 
    result.layers
 
-Advanced Methods (Dask DataFrames - for distributed processing):
+Advanced Methods (pandas or Dask DataFrames, depending on whether the layer was materialised):
 
-Show the high-level metrics for a specific layer (returns Dask DataFrame):
+Show the high-level metrics for a specific layer (returns a pandas or Dask DataFrame):
 
 .. code-block:: python
 
    result.get_hlm('app').head()
 
-Display a layered main view for a specific layer (returns Dask DataFrame):
+Display a layered main view for a specific layer (returns a pandas or Dask DataFrame):
 
 .. code-block:: python
 
    result.get_main_view('reader_posix_lustre').head()
 
-Access a specific view for a layer, grouped by a particular dimension (returns Dask DataFrame):
+Access a specific view for a layer, grouped by a particular dimension (returns a pandas or Dask DataFrame):
 
 .. code-block:: python
 
    result.get_layer_view('reader_posix_lustre', 'time_range').head()
 
-Display the raw trace data, showing individual I/O events (returns Dask DataFrame):
+Display the raw trace data, showing individual I/O events (returns a pandas or Dask DataFrame):
 
 .. code-block:: python
 
