@@ -11,6 +11,7 @@ import numpy as np
 import os
 import pandas as pd
 import signal
+import threading
 import structlog
 import time
 from betterset import BetterSet as S
@@ -22,13 +23,43 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 _shutdown_requested = False
 
 
+def _ack_event(event) -> None:
+    """Acknowledge a Mofka event -- disabled by default. See LIVEFLOW-STATUS sec 60.
+
+    On diaspora-stream-api 0.5.1, acking an event that belongs to a multi-event batch
+    permanently stops delivery to that consumer, and leaves the group in a state where
+    peer processes hang on exit. Measured with liveflow_validation/repro_consumer_stall.sh:
+    ack on -> 1 of 100 events received; ack off -> 100 of 100.
+
+    LiveFlow loses nothing by not acking: topics are created per run with `--type memory`
+    partitions, so no consumer ever resumes a previous offset.
+
+    Set LIVEFLOW_MOFKA_ACK=1 to restore the old behaviour.
+    """
+    if os.environ.get("LIVEFLOW_MOFKA_ACK", "0") == "1":
+        event.acknowledge()
+
+
 def _sigterm_handler(signum, frame):
     global _shutdown_requested
     _shutdown_requested = True
 
 
 def install_shutdown_handler():
-    """Install SIGTERM handler so the analyzer exits gracefully."""
+    """Install SIGTERM handler so the analyzer exits gracefully.
+
+    No-op off the main thread. `signal.signal` raises ValueError anywhere else, and under the
+    Option C node agent (LIVEFLOW-ARCHITECTURE.md sec 6) this analyzer runs as ONE THREAD beside
+    the diagnoser and optimizer rather than owning its own process. Signal disposition is
+    process-wide, so a stage thread was never the right place to set it: the agent installs its
+    own handler on the main thread and shuts the stages down through it.
+
+    Silently skipping is correct rather than merely convenient. The handler exists so a
+    standalone analyzer process exits cleanly on SIGTERM; when the analyzer is not the process,
+    that responsibility belongs to whoever is.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
 from .analysis_utils import (
@@ -502,7 +533,7 @@ class Analyzer(abc.ABC):
         output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
     ) -> None:
-        from .streaming.mofka_io import open_consumer
+        from .streaming.transport import open_consumer
 
         trace_driver, trace_consumer = open_consumer(
             group_file,
@@ -612,7 +643,7 @@ class Analyzer(abc.ABC):
                 results.append(_normalize_single_trace(metadata))
 
             if hasattr(mofka_event, "acknowledge"):
-                mofka_event.acknowledge()
+                _ack_event(mofka_event)
             return results
 
         def _append_trace_event_to_window(
@@ -708,7 +739,7 @@ class Analyzer(abc.ABC):
                 control_event = control_mofka_event.metadata
                 if not isinstance(control_event, dict) or control_event.get("type") != "boundary_event":
                     if hasattr(control_mofka_event, "acknowledge"):
-                        control_mofka_event.acknowledge()
+                        _ack_event(control_mofka_event)
                     continue
 
                 try:
@@ -718,11 +749,11 @@ class Analyzer(abc.ABC):
                 except (KeyError, TypeError, ValueError):
                     logger.warning("mofka.control_boundary.invalid", metadata=control_event)
                     if hasattr(control_mofka_event, "acknowledge"):
-                        control_mofka_event.acknowledge()
+                        _ack_event(control_mofka_event)
                     continue
 
                 if hasattr(control_mofka_event, "acknowledge"):
-                    control_mofka_event.acknowledge()
+                    _ack_event(control_mofka_event)
 
                 if trigger_name == "window.start":
                     started_window = window_tracker.observe_start_boundary(
@@ -1045,7 +1076,7 @@ class Analyzer(abc.ABC):
         """
         import io as _io
 
-        from .streaming.mofka_io import open_consumer
+        from .streaming.transport import open_consumer
 
         install_shutdown_handler()
 
@@ -1099,7 +1130,7 @@ class Analyzer(abc.ABC):
                     hlm_index=hlm_index_names,
                 )
 
-                event.acknowledge()
+                _ack_event(event)
                 future = consumer.pull()
 
                 if window_index not in window_buffer:

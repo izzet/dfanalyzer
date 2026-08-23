@@ -260,7 +260,17 @@ def set_unique_counts(df: pd.DataFrame, layer: str):
                 )
             nunique_cols[nunique_col] = pd.Series(0, index=df.index, dtype='Int32')
         else:
-            nunique_cols[nunique_col] = df[unique_col].map(len).astype('Int32')
+            # len() only where there is something to measure. The all-null guard above handles real
+            # partitions, but dask calls this on an EMPTY, arrow-backed meta frame first to infer
+            # the schema, and there the column arrives as float rather than object -- so the bare
+            # map(len) raised "object of type 'float' has no len()" and killed the job during
+            # metadata inference, before any real data was touched. That aborted every file-based
+            # dfanalyzer run regardless of preset (dlio and posix both) and regardless of whether
+            # the traces were .pfw or .pfw.gz. Scalars have no members, so 0 is the right count and
+            # the result is identical to len() for the list/set values real partitions carry.
+            nunique_cols[nunique_col] = df[unique_col].map(
+                lambda v: len(v) if hasattr(v, '__len__') else 0
+            ).astype('Int32')
 
     if nunique_cols:
         nunique_df = pd.DataFrame(nunique_cols, index=df.index).astype('Int32')

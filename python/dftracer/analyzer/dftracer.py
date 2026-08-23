@@ -9,7 +9,13 @@ import os
 import pandas as pd
 import portion as I
 import structlog
-from dftracer.utils import Indexer, Reader
+# dftracer-utils >=0.0.12 renamed Reader -> TraceReader. Support BOTH rather than pinning:
+# pinning to 0.0.5 forces a SOURCE build, which fails on this cluster at the cpplogger
+# git-clone step, whereas 0.0.12 ships a wheel and installs cleanly.
+try:
+    from dftracer.utils import Indexer, Reader
+except ImportError:  # dftracer-utils >= 0.0.12
+    from dftracer.utils import Indexer, TraceReader as Reader
 from dask.distributed import wait
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -183,11 +189,22 @@ SYSTEM_OUTPUT_COLUMNS = {
 
 
 def create_index(filename):
-    index_file = f"{filename}.idx"
-    if not os.path.exists(index_file):
-        indexer = Indexer(filename, index_file, checkpoint_size=32 * 1024 * 1024)
-        indexer.build()
-        logger.debug("Creating index", filename=filename)
+    # dftracer-utils 0.0.12 changed the Indexer API. The old call was
+    # Indexer(<trace file>, <index file>), but the new signature is
+    # Indexer(directory="", files=None, index_dir="", ...) -- so the positional form passed a FILE
+    # where a DIRECTORY is expected and died with
+    #   DFTUtilsError: filesystem error: Path is not a directory: [...].pfw.gz
+    # which made EVERY .pfw.gz trace unreadable by dfanalyzer. Since gzipped traces are how we keep
+    # the trace corpus on disk (7-12x smaller, byte-identical), that incompatibility is what stands
+    # between us and compressing the archive at all.
+    #
+    # ensure_indexed() rather than build(): the new indexer keeps its state in a `.dftindex` store
+    # beside the traces, not in a `<file>.idx` sibling, so the old existence guard could never fire
+    # and would have rebuilt the index on every call. ensure_indexed() resolves first and builds
+    # only what is missing, which is idempotent and cheap on an already-indexed corpus.
+    indexer = Indexer(files=[filename], checkpoint_size=32 * 1024 * 1024)
+    indexer.ensure_indexed()
+    logger.debug("Ensured index", filename=filename)
     return filename
 
 
@@ -206,9 +223,16 @@ def get_size(filename):
     if filename.endswith(".pfw"):
         size = os.stat(filename).st_size
     elif filename.endswith(".pfw.gz"):
-        index_file = f"{filename}.idx"
-        indexer = Indexer(filename, index_file)
-        size = indexer.get_max_bytes()
+        # dftracer-utils 0.0.12 moved get_max_bytes() off Indexer and onto the per-file
+        # CheckpointIndexer, reached via Indexer.get_checkpoint_indexer(<path>). Verified to return
+        # the exact UNCOMPRESSED byte count (753291066 for trace-3-of-4, byte-identical to the
+        # original .pfw), which is what generate_batches needs to plan read batches.
+        #
+        # Deliberately NOT derived from the gzip ISIZE trailer: dftracer_pgzip writes MULTI-MEMBER
+        # gzip (one independent member per 4 MB chunk, which is what makes parallel decode possible),
+        # so the trailer describes only the final member, not the file.
+        indexer = Indexer(files=[filename])
+        size = indexer.get_checkpoint_indexer(filename).get_max_bytes()
     logger.debug("File has size", filename=filename, size=size / 1024**3)
     return filename, int(size)
 
@@ -297,10 +321,54 @@ def system_function(json_dict: dict):
     return d
 
 
+def _unflatten_args(rec):
+    """Restore the nested ``args`` dict that dftracer-utils 0.0.12 flattens away.
+
+    THE .pfw.gz "EMPTY ANALYSIS" BUG. read_lines_json() no longer returns the on-disk record
+    shape. It hands back FLATTENED keys -- ``args.fhash``, ``args.hhash``, ``args.p_idx`` -- with
+    the ``args`` key itself set to None, whereas the plain .pfw path (db.read_text -> json.loads)
+    still yields the nested ``{"args": {...}}`` form.
+
+    load_objects_dict() reads ``json_dict["args"]["fhash"]``. Against the flattened shape that
+    lookup finds nothing and silently produces no file_hash/host_hash -- while name, cat and type
+    keep working because they are top level. The result was an analysis that ran to completion and
+    reported "Total Files 0 / Total Nodes 0" with an empty layer breakdown, against 6,146 files and
+    1 node for the byte-identical uncompressed corpus. Silent, not an error, which is what made it
+    dangerous.
+
+    Normalising here -- at the reader boundary, where the schema difference actually is -- keeps
+    both read paths feeding load_objects_dict() the same shape and leaves everything downstream
+    untouched. None-valued keys are dropped rather than carried, because the nested form only ever
+    contains keys that were present, and callers test membership (``"fhash" in args``).
+    """
+    if not isinstance(rec, dict) or rec.get("args") is not None:
+        return rec
+    args = {}
+    flat = [k for k in rec if k.startswith("args.")]
+    if not flat:
+        return rec
+    for k in flat:
+        v = rec.pop(k)
+        if v is not None:
+            args[k[len("args."):]] = v
+    rec["args"] = args
+    return rec
+
+
 def load_indexed_gzip_files(filename, start, end):
-    index_file = f"{filename}.idx"
-    reader = Reader(filename, index_file)
-    json_lines = reader.read_line_bytes_json(start, end)
+    # The Reader -> TraceReader rename is already handled by the import shim above, but 0.0.12 also
+    # changed the CONSTRUCTOR and the read METHOD, which the shim does not cover:
+    #   old: Reader(<trace>, <index file>).read_line_bytes_json(start, end)
+    #   new: TraceReader(<trace>, index_dir=<DIR>).read_lines_json(start_byte=, end_byte=)
+    # Passing the old `<file>.idx` as the second positional now lands in `index_dir`, i.e. a file
+    # where a directory is expected -- the same trap as create_index/get_size. Omitting it lets the
+    # reader find the `.dftindex` store beside the trace, which is where the indexer writes it.
+    reader = Reader(filename)
+    if hasattr(reader, "read_line_bytes_json"):  # dftracer-utils < 0.0.12
+        json_lines = reader.read_line_bytes_json(start, end)
+    else:                                        # dftracer-utils >= 0.0.12
+        json_lines = reader.read_lines_json(start_byte=start, end_byte=end)
+        json_lines = [_unflatten_args(r) for r in json_lines]
     logger.debug("Read json lines", filename=filename, start=start, end=end, num_lines=len(json_lines))
     return json_lines
 
@@ -456,10 +524,32 @@ class DFTracerAnalyzer(Analyzer):
                 logger.debug("Max bytes per file", sizes=sizes)
                 json_line_delayed = []
                 total_lines = 0
+                # ONE task per gz file, NOT per 4 MB batch.
+                #
+                # The batched form silently DUPLICATED data. TraceReader.read_lines_json() in
+                # dftracer-utils 0.0.12 streams from an internal cursor and ignores the
+                # start_byte/end_byte it is handed; since each dask task constructs its own reader,
+                # every batch restarted at byte 0 and returned the WHOLE file. Measured on a 20 MB
+                # trace: 5 batches x 86,334 records = 431,670 records for a file that holds 86,334.
+                # The 5x duplicate rows then broke the hash joins that resolve file and host names,
+                # which is why the compressed run reported "Total Files 0" and an empty layer
+                # breakdown while the uncompressed run reported 6,146 files -- same bytes, same
+                # parser, different row multiplicity.
+                #
+                # Reading each file in a single call is the form that is actually verified: over the
+                # full range the reader returns exactly the plain file's record count (3,131,587)
+                # and metadata-record count (6,151 ph=="M"). Parallelism is preserved across FILES,
+                # which is how the corpus is laid out anyway (one trace per rank), and the reader
+                # already decodes gzip members in parallel internally.
+                #
+                # Only pfw_gz_pattern is walked here: `sizes` also carries plain .pfw entries, which
+                # this branch must not claim -- those are handled by db.read_text below.
+                _gz = set(pfw_gz_pattern)
                 for filename, max_bytes in sizes:
+                    if filename not in _gz:
+                        continue
                     total_lines += max_bytes
-                    for _, start, end in generate_batches(filename, max_bytes):
-                        json_line_delayed.append((filename, start, end))
+                    json_line_delayed.append((filename, 0, max_bytes))
 
                 logger.info(
                     "Loading batches",
@@ -507,7 +597,12 @@ class DFTracerAnalyzer(Analyzer):
             with log_block("to_dataframe"):
                 raw_traces = main_bag.to_dataframe(meta=self._columns)
             with log_block("_handle_metadata"):
-                traces, profiles, system_events = self._handle_metadata(raw_traces)
+                _hash_tables = (
+                    self._index_hash_tables(pfw_gz_pattern) if len(pfw_gz_pattern) > 0 else None
+                )
+                traces, profiles, system_events = self._handle_metadata(
+                    raw_traces, hash_tables=_hash_tables
+                )
             with log_block("compute_time_origin"):
                 trace_min, profile_min, system_min = dask.compute(
                     traces["ts"].min(), profiles["ts"].min(), system_events["ts"].min()
@@ -1008,7 +1103,43 @@ class DFTracerAnalyzer(Analyzer):
         logger.debug("get_columns", columns=columns)
         return columns
 
-    def _handle_metadata(self, raw_traces: dd.DataFrame) -> Tuple[dd.DataFrame, dd.DataFrame, dd.DataFrame]:
+    @staticmethod
+    def _index_hash_tables(gz_files):
+        """Read the file/host/string hash tables straight out of the C++ index.
+
+        Ported from upstream dfanalyzer (origin/main, "feat(analyzer): integrate to new
+        dftracer-utils"), which builds these from `Indexer.get_hash_table(...)` rather than by
+        joining the "M" metadata records out of the JSON stream.
+
+        WHY. On the .pfw.gz path the M-record join yields nothing, so `file_name` and `host_name`
+        never resolve: a compressed corpus analysed to "Total Files 0 / Total Nodes 0" and an empty
+        layer breakdown, where the byte-identical uncompressed corpus reported 6,146 files and 1
+        node. The index already holds these mappings -- verified on a 20 MB trace: 6,147 file
+        entries and 1 host entry, matching the uncompressed run -- so taking them from there is both
+        correct and cheaper than re-deriving them from the event stream.
+
+        Returns (file_hashes, host_hashes, string_hashes) as hash-indexed frames, or None.
+        """
+        try:
+            ix = Indexer(files=list(gz_files))
+            ix.ensure_indexed()
+
+            def _frame(d):
+                return pd.DataFrame(
+                    {"name": list(d.values())},
+                    index=pd.Index(list(d.keys()), name="hash", dtype="string"),
+                )
+
+            return (
+                _frame(ix.get_hash_table("file")),
+                _frame(ix.get_hash_table("host")),
+                _frame(ix.get_hash_table("string")),
+            )
+        except Exception as e:  # index unavailable -> fall back to the M-record join
+            logger.warning("index hash tables unavailable", error=str(e))
+            return None
+
+    def _handle_metadata(self, raw_traces: dd.DataFrame, hash_tables=None) -> Tuple[dd.DataFrame, dd.DataFrame, dd.DataFrame]:
         is_dask = isinstance(raw_traces, dd.DataFrame)
         traces = raw_traces.query(f"type == {TYPE_EVENT}")
         profile_events = raw_traces.query(f"type == {TYPE_PROFILE}")
@@ -1025,6 +1156,46 @@ class DFTracerAnalyzer(Analyzer):
             host_hashes = host_hashes.persist()
             string_hashes = string_hashes.persist()
             metadata = metadata.persist()
+        # Index-derived tables win over the M-record join when the join came back empty, which is
+        # what happens for .pfw.gz input (see _index_hash_tables). Only substituted when the join
+        # produced nothing, so the plain .pfw path is bit-for-bit unchanged.
+        if hash_tables is not None:
+            idx_file, idx_host, idx_string = hash_tables
+
+            def _prefer_index(existing, idx, label):
+                """Index table wins; anything only the M-record join knows about is kept.
+
+                The index is authoritative -- upstream's C++ reader builds these tables from it and
+                does no M-record join at all. Substituting only when the join looked EMPTY was not
+                enough: on the gz path the join returns rows whose key does not match the traces'
+                `file_hash`, so `file_name` stayed unresolved while the table looked populated.
+                Union rather than replace so a mixed .pfw + .pfw.gz corpus keeps the hashes that
+                only the plain files carry.
+                """
+                if idx is None or not len(idx.index):
+                    return existing
+                try:
+                    cur = existing.compute() if hasattr(existing, "compute") else existing
+                except Exception:
+                    cur = None
+                idx = idx.copy()
+                idx.index = idx.index.astype(str)
+                if cur is None or len(cur.index) == 0:
+                    logger.info(f"using index-derived {label} hashes", count=len(idx.index))
+                    return idx
+                cur.index = cur.index.astype(str)
+                extra = cur[~cur.index.isin(idx.index)]
+                out = pd.concat([idx, extra]) if len(extra.index) else idx
+                logger.info(
+                    f"using index-derived {label} hashes",
+                    count=len(idx.index),
+                    kept_from_json=len(extra.index),
+                )
+                return out
+
+            file_hashes = _prefer_index(file_hashes, idx_file, "file")
+            host_hashes = _prefer_index(host_hashes, idx_host, "host")
+            string_hashes = _prefer_index(string_hashes, idx_string, "string")
         traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
         profile_events = self._attach_metadata(profile_events, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes

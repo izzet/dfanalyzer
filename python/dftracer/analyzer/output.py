@@ -552,7 +552,7 @@ class ZMQOutput:
 class MofkaOutput:
     def __init__(self, group_file: str, topic_name: str, source_node: str = "",
                  global_group_file: str = "", global_hlm_topic: str = ""):
-        from .streaming.mofka_io import open_producer
+        from .streaming.transport import open_producer
 
         self.group_file = group_file
         self.topic_name = topic_name

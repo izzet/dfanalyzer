@@ -307,6 +307,55 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
 
 
 @dc.dataclass
+class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
+    """StorMer with the DECODE domain exposed (LIVEFLOW-STATUS.md sec 36/37).
+
+    Identical to the stormer preset EXCEPT it adds one layer:
+        reader_decode : the `dft_ai.data.decode` region emitted by the two-stage reader
+                        (STORMER_TWOSTAGE=1), i.e. the zlib inflate of the per-variable chunks.
+    Everything else is inherited, so every existing stormer metric keeps its meaning and no
+    derived_metrics entry can reference an undefined layer (the KeyError ->
+    analysis_skipped_missing_column trap that silently skipped every window before).
+
+    WHY NOT DERIVE STORAGE FROM POSIX. The stormer preset's `reader_posix` layer requires POSIX
+    syscall interception, and that does NOT reliably reach forked DataLoader workers: measured,
+    a workers=1 run yields 130 reader_posix-scoped findings while workers=8 runs yield ZERO
+    (the sec 16.5 fork gap). So the three-way split here is built from APP-LEVEL regions we emit
+    ourselves, which do work in workers:
+        decode  = reader_decode_time_proc_max          (explicit region)
+        input   = fetch_iter_time_proc_max - decode    (the remainder: queueing + raw chunk I/O)
+        comm    = comm_time_proc_max
+    reader_posix is left defined and still used opportunistically when it IS populated.
+
+    Selected with DFANALYZER_PRESET=stormer_xlayer. Running the SAME trace under `stormer` gives
+    the 2-domain view and under `stormer_xlayer` the 3-domain view -- a free attribution ablation.
+    """
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: dict(
+            AnalyzerPresetConfigStormer().layer_defs,
+            **{'reader_decode': 'cat == "data" & func_name == "decode"'}
+        )
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: dict(
+            AnalyzerPresetConfigStormer().layer_deps,
+            # decode runs in the forked workers and overlaps the main-process fetch wait through
+            # the prefetch queue -> child of fetch_iter AND async (see async_layers below).
+            **{'reader_decode': 'fetch_iter'}
+        )
+    )
+    async_layers: List[str] = dc.field(
+        default_factory=lambda: list(AnalyzerPresetConfigStormer().async_layers) + ['reader_decode']
+    )
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: dict(
+            AnalyzerPresetConfigStormer().derived_metrics or {}, **{'reader_decode': {}}
+        )
+    )
+    name: str = "stormer_xlayer"
+
+
+@dc.dataclass
 class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
     """Preset for halo3d (LiveFlow three-way storage<->decode<->comm).
 
@@ -434,6 +483,15 @@ class LocalClusterConfig(ClusterConfig):
     host: Optional[str] = None
     memory_limit: Optional[int] = None
     n_workers: Optional[int] = None
+    # MUST be settable (LIVEFLOW-STATUS.md sec 54). Without this field the value cannot be
+    # overridden, and dask then derives it as
+    #     threads_per_worker = ceil(CPU_COUNT / n_workers)
+    # so the streaming analyzer's `n_workers=1` yields a NINETY-SIX thread worker on a 96-core
+    # node -- one per node, fired at every control-window boundary, on the same cores as the
+    # training ranks and their ncclProxyProgress threads. That burst starves NCCL's CPU-side proxy,
+    # the GPU stream never drains, and the job dies in hipDeviceSynchronize. n_workers alone bounds
+    # workers, NOT threads, which is why "--workers 1" looked safe and was not.
+    threads_per_worker: Optional[int] = None
     processes: Optional[bool] = True
     silence_logs: Optional[int] = logging.CRITICAL
 
@@ -615,6 +673,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="analyzer/preset", name="stormer", node=AnalyzerPresetConfigStormer)
     cs.store(group="analyzer/preset", name="halo3d", node=AnalyzerPresetConfigHalo3d)
+    cs.store(group="analyzer/preset", name="stormer_xlayer", node=AnalyzerPresetConfigStormerXLayer)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
