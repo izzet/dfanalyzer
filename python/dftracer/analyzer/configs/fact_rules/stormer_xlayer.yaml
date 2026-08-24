@@ -62,7 +62,14 @@ rules:
       fillna0(compute_time_proc_max)
     decode_frac: fillna0(reader_decode_time_proc_max) / max(active_time, 1e-9)
   when: active_time > 0
-  severity_score: clip01(decode_frac / 0.25)
+  # DE-SATURATED, same defect and same fix as dlio.fetch_pressure in phase 23.
+  # Was clip01(decode_frac / 0.25), which pins severity to exactly 1.000 for any decode_frac at or
+  # above 0.25. decode_frac is ALREADY a fraction of active time, so dividing by 0.25 only throws
+  # away the gradient the effectiveness gate needs: CooldownTracker.check computes
+  # improvement = (severity_at_action - current)/severity_at_action, which is identically 0 when
+  # severity cannot move, and then blocks every later action on this knob whether or not the first
+  # one helped. Measured in the phase 29 run: severity=1.000 on the one decode plan it ever made.
+  severity_score: clip01(decode_frac)
   confidence: '1.0'
   opportunity_tags:
   - decode_parallelism
@@ -105,7 +112,9 @@ rules:
     compute_frac: fillna0(compute_time_proc_max) / max(fillna0(fetch_iter_time_proc_max)
       + fillna0(compute_time_proc_max), 1e-9)
   when: fetch_frac >= 0.20 and compute_frac < 0.85
-  severity_score: clip01((fetch_frac - 0.10) / 0.25)
+  # De-saturated for the same reason; fetch_frac is already the stall fraction because
+  # fetch_iter_time comes from dft_ai.dataloader.fetch.iter, which times the blocking __next__.
+  severity_score: clip01(fetch_frac)
   confidence: clip01(0.75 + 0.20 * abs(fetch_frac - 0.20))
   opportunity_tags:
   - dataloader_prefetch

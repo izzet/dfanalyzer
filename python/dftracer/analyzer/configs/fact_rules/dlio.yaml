@@ -18,7 +18,25 @@ rules:
       fetch_frac: "fillna0(fetch_iter_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
       compute_frac: "fillna0(compute_time_proc_max) / max(fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max), 1e-9)"
     when: "fetch_frac >= 0.20 and compute_frac < 0.85"
-    severity_score: "clip01((fetch_frac - 0.10) / 0.25)"
+    # SEVERITY IS THE STALL FRACTION, NOT A RESCALED ONE (sec 83.2).
+    #
+    # Was: clip01((fetch_frac - 0.10) / 0.25), which saturates at fetch_frac >= 0.35 and pins
+    # severity to exactly 1.000 across the entire useful range. Measured on unet3d
+    # (liveflow_shm/tests/sweep_stall.sh, n=3), the stall the training loop actually suffers is:
+    #
+    #   read_threads   1      2      4      6      8      12
+    #   stall frac     0.72   0.54   0.39   0.39   0.39   0.39
+    #   old severity   1.000  1.000  1.000  1.000  1.000  1.000
+    #
+    # Every one of those clipped to the same number, so the effectiveness gate was being asked
+    # whether an action helped using a value that cannot change. The gradient is present in the
+    # data and the formula threw it away.
+    #
+    # `fetch_iter_time` comes from `dft_ai.dataloader.fetch.iter`, which times the blocking
+    # __next__, so fetch_frac is ALREADY the fraction of the step spent stalled on fetch. Using it
+    # directly makes severity mean something physical -- 1.0 is a fully stalled step -- and keeps
+    # it monotone over the whole range instead of only below 0.35.
+    severity_score: "clip01(fetch_frac)"
     confidence: "clip01(0.75 + 0.20 * abs(fetch_frac - 0.20))"
     opportunity_tags:
       - dataloader_prefetch
