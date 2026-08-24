@@ -60,28 +60,41 @@ rules:
   derived_metrics:
     active_time: fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) +
       fillna0(compute_time_proc_max)
-    decode_frac: fillna0(reader_decode_time_proc_max) / max(active_time, 1e-9)
+    # DECODE IS NESTED INSIDE FETCH_ITER, so the denominator is the fetch it lives in.
+    #
+    # Was decode / active_time, where active_time = fetch + comm + compute. Since decode is a
+    # COMPONENT of fetch, that denominator double-counts the interval decode sits inside and adds
+    # two more that decode is not part of at all -- it is not a fraction of anything, and measured
+    # on StorMer it came out >= 1, pinning clip01 at exactly 1.000 (phase 30).
+    #
+    # decode / fetch_iter answers the question the knob actually poses: of the time the step spends
+    # waiting on fetch, how much is the inflate stage that `decode_threads` parallelises? A value
+    # near 1 means decode owns the fetch path and decode_parallelism is the right lever; near 0
+    # means the fetch cost is elsewhere and raising decode_threads would buy nothing.
+    #
+    # `severity_frac` then rescales that by fetch's own share of the step, so a workload whose
+    # fetch is irrelevant cannot report a severe decode problem: decode owning 100% of a fetch that
+    # is 5% of the step is a 0.05 severity, not a 1.0.
+    decode_frac: fillna0(reader_decode_time_proc_max) / max(fillna0(fetch_iter_time_proc_max), 1e-9)
+    fetch_share: fillna0(fetch_iter_time_proc_max) / max(active_time, 1e-9)
+    severity_frac: min(decode_frac, 1.0) * fetch_share
   when: active_time > 0
-  # DE-SATURATION ATTEMPTED HERE AND IT DID NOT WORK. Left in place with the reason, because the
-  # reason is the useful part.
+  # Severity is decode's contribution TO THE STEP: its share of fetch, times fetch's share of the
+  # step. Bounded by construction, monotone, and physical -- 1.0 means the step is entirely decode.
   #
-  # Was clip01(decode_frac / 0.25). I changed it to clip01(decode_frac) on the same argument that
-  # fixed dlio.fetch_pressure in phase 23 -- that the divisor merely discards a gradient the
-  # effectiveness gate needs. Measured afterwards: severity is still EXACTLY 1.000.
+  # The earlier attempt here rescaled clip01(decode_frac / 0.25) to clip01(decode_frac) on the
+  # phase 23 argument that a divisor only discards gradient. That was wrong because the DENOMINATOR
+  # was wrong, not the scale, and the measurement said so: severity stayed at exactly 1.000 and the
+  # effectiveness gate -- improvement = (severity_at_action - current)/severity_at_action -- stayed
+  # identically 0, so decode_threads got one increment (1 -> 2) and was blocked forever after.
+  # Phase 34 priced that: the loop reached num_workers=8 (the optimum) and decode_threads=2 (should
+  # be 8), landing 91.6% off the best static config.
   #
-  # The argument was wrong here. `decode_frac` is NOT a fraction of active_time, because
-  # active_time above is fetch_iter + comm + compute and does NOT include decode. It is an
-  # unbounded RATIO of decode time to everything else, and on this workload it is >= 1, so clip01
-  # saturates whatever the divisor is. Contrast fetch_frac, which genuinely is a fraction of its
-  # own denominator and de-saturated properly in the same run (1.000 -> 0.984, and the resulting
-  # plan moved num_workers 1 -> 8 instead of 1 -> 2).
-  #
-  # The real fix is to the DENOMINATOR, not the scale, and it needs a fact this file cannot settle:
-  # whether reader_decode_time is already nested inside fetch_iter_time (in which case decode
-  # belongs in no denominator that also has fetch) or is separately accumulated across decode
-  # threads (in which case it needs its own normaliser, probably wall time). Changing it blindly
-  # would alter what the rule MEANS, so it is left saturated and documented rather than guessed.
-  severity_score: clip01(decode_frac)
+  # `min(decode_frac, 1.0)` is a guard, not a rescale: decode and fetch_iter are aggregated per
+  # process, so a multi-threaded decode pool can sum to more thread-time than the wall interval it
+  # is nested in. Capping the SHARE at 1 keeps the product meaningful; it does not flatten the
+  # range the way the old formula did.
+  severity_score: clip01(severity_frac)
   confidence: '1.0'
   opportunity_tags:
   - decode_parallelism
