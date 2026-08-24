@@ -62,13 +62,25 @@ rules:
       fillna0(compute_time_proc_max)
     decode_frac: fillna0(reader_decode_time_proc_max) / max(active_time, 1e-9)
   when: active_time > 0
-  # DE-SATURATED, same defect and same fix as dlio.fetch_pressure in phase 23.
-  # Was clip01(decode_frac / 0.25), which pins severity to exactly 1.000 for any decode_frac at or
-  # above 0.25. decode_frac is ALREADY a fraction of active time, so dividing by 0.25 only throws
-  # away the gradient the effectiveness gate needs: CooldownTracker.check computes
-  # improvement = (severity_at_action - current)/severity_at_action, which is identically 0 when
-  # severity cannot move, and then blocks every later action on this knob whether or not the first
-  # one helped. Measured in the phase 29 run: severity=1.000 on the one decode plan it ever made.
+  # DE-SATURATION ATTEMPTED HERE AND IT DID NOT WORK. Left in place with the reason, because the
+  # reason is the useful part.
+  #
+  # Was clip01(decode_frac / 0.25). I changed it to clip01(decode_frac) on the same argument that
+  # fixed dlio.fetch_pressure in phase 23 -- that the divisor merely discards a gradient the
+  # effectiveness gate needs. Measured afterwards: severity is still EXACTLY 1.000.
+  #
+  # The argument was wrong here. `decode_frac` is NOT a fraction of active_time, because
+  # active_time above is fetch_iter + comm + compute and does NOT include decode. It is an
+  # unbounded RATIO of decode time to everything else, and on this workload it is >= 1, so clip01
+  # saturates whatever the divisor is. Contrast fetch_frac, which genuinely is a fraction of its
+  # own denominator and de-saturated properly in the same run (1.000 -> 0.984, and the resulting
+  # plan moved num_workers 1 -> 8 instead of 1 -> 2).
+  #
+  # The real fix is to the DENOMINATOR, not the scale, and it needs a fact this file cannot settle:
+  # whether reader_decode_time is already nested inside fetch_iter_time (in which case decode
+  # belongs in no denominator that also has fetch) or is separately accumulated across decode
+  # threads (in which case it needs its own normaliser, probably wall time). Changing it blindly
+  # would alter what the rule MEANS, so it is left saturated and documented rather than guessed.
   severity_score: clip01(decode_frac)
   confidence: '1.0'
   opportunity_tags:
