@@ -49,6 +49,20 @@ def find_layer_time_metrics(metrics: list, layer: str, time_metric: str):
     return [m for m in metrics if m.startswith(layer) and m.endswith(time_metric)]
 
 
+def _as_nullable_float(series: pd.Series) -> pd.Series:
+    """Coerce a metric column to nullable Float64 before arithmetic.
+
+    `_compute_high_level_metrics` ends in `.replace(0, pd.NA)`, which turns
+    integer columns into object dtype. Dividing object columns falls through to
+    Python's `float.__truediv__`, which raises ZeroDivisionError on a zero
+    denominator instead of yielding the inf that the surrounding `.where` and
+    the later inf-to-NA replace are written to absorb.
+    """
+    if series.dtype == 'Float64':
+        return series
+    return pd.to_numeric(series, errors='coerce').astype('Float64')
+
+
 def set_main_metrics(df: pd.DataFrame):
     df = df.copy()
 
@@ -62,15 +76,18 @@ def set_main_metrics(df: pd.DataFrame):
         count_col = size_col.replace('size', 'count')
         intensity_col = size_col.replace('size', 'intensity')
         time_col = size_col.replace('size', 'time')
-        df[size_col] = df[size_col].where(df[size_col] > 0, pd.NA)
-        df[bw_col] = (df[size_col] / df[time_col]).where(df[size_col] > 0, pd.NA)
-        df[intensity_col] = (df[count_col] / df[size_col]).where(df[size_col] > 0, pd.NA)
+        size = _as_nullable_float(df[size_col])
+        time = _as_nullable_float(df[time_col])
+        count = _as_nullable_float(df[count_col])
+        df[size_col] = size.where(size > 0, pd.NA)
+        df[bw_col] = (size / time).where(size > 0, pd.NA)
+        df[intensity_col] = (count / size).where(size > 0, pd.NA)
         new_metrics.extend([bw_col, intensity_col, time_col])
 
     for count_col in count_cols:
         ops_col = count_col.replace('count', 'ops')
         time_col = count_col.replace('count', 'time')
-        df[ops_col] = df[count_col] / df[time_col]
+        df[ops_col] = _as_nullable_float(df[count_col]) / _as_nullable_float(df[time_col])
         new_metrics.append(ops_col)
 
     df[new_metrics] = df[new_metrics].replace([np.inf, -np.inf], pd.NA).astype('Float64')

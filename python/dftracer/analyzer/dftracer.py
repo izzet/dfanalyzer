@@ -1,13 +1,15 @@
 import dask
 import dask.dataframe as dd
+import json
 import math
 import numpy as np
 import os
 import pandas as pd
+import re
 import structlog
 import pyarrow as pa
 from betterset import BetterSet
-from dftracer.utils import AggregationConfig, Indexer
+from dftracer.utils import AggregationConfig, Indexer, TraceReader
 from dftracer.utils.dfanalyzer import (
     build_final_meta,
     build_partial_meta,
@@ -52,6 +54,7 @@ from .constants import (
     COL_TIME_RANGE,
     COL_TIME_START,
     IOCategory,
+    POSIX_IO_CAT_MAPPING,
 )
 from .types import ReadTraceResult, ViewType
 from .utils.log_utils import log_block
@@ -212,6 +215,12 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
+def _is_numeric_dtype_name(dtype) -> bool:
+    """True for pandas dtype names that hold numbers rather than strings."""
+    name = str(dtype).lower()
+    return "int" in name or "float" in name
+
+
 def io_columns():
     columns = {
         "file_hash": "string",
@@ -240,6 +249,7 @@ class DFTracerAnalyzer(Analyzer):
         **kwargs,
     ):
         super().__init__(preset, **kwargs)
+        self._has_semantic_spans = False
         self.assign_epochs = assign_epochs
         self.trace_groups = list(trace_groups) if trace_groups else None
         self._zero_byte_warned: set = set()
@@ -602,6 +612,9 @@ class DFTracerAnalyzer(Analyzer):
                 profiles = profiles.map_partitions(
                     coerce_profile_dtypes, PROFILE_OUTPUT_COLUMNS, profile_window=profile_window
                 )
+                # Profiles bypass postread_trace, so the io_cat repair has to be
+                # applied here as well or every aggregated read stays in OTHER.
+                profiles = profiles.map_partitions(self._fix_posix_io_cat)
             else:
                 profiles = None
 
@@ -628,6 +641,31 @@ class DFTracerAnalyzer(Analyzer):
             else:
                 system_metrics = None
 
+        with log_block("read_semantic_spans"):
+            spans = self._read_semantic_spans(directory, files, extra_columns, extra_columns_fn)
+            self._has_semantic_spans = spans is not None and not spans.empty
+            if self._has_semantic_spans:
+                # Widen the native stream with the span-only columns first, so
+                # the two schemas match before concat. Numeric fields default to
+                # NaN rather than pd.NA so the later astype to float succeeds.
+                span_only = [column for column in spans.columns if column not in traces.columns]
+                if span_only:
+                    defaults = {}
+                    numeric = []
+                    for column in span_only:
+                        dtype = (extra_columns or {}).get(column)
+                        if dtype is not None and _is_numeric_dtype_name(dtype):
+                            defaults[column] = np.nan
+                            numeric.append((column, dtype))
+                        else:
+                            defaults[column] = pd.NA
+                    traces = traces.assign(**defaults)
+                    for column, dtype in numeric:
+                        traces[column] = traces[column].astype(dtype)
+                spans = spans.reindex(columns=list(traces.columns))
+                traces = dd.concat([traces, dd.from_pandas(spans, npartitions=1)])
+                logger.debug("semantic spans appended", rows=len(spans), cats=sorted(spans["cat"].unique()))
+
         self._file_hashes = pd.DataFrame(columns=["name"])
         self._host_hashes = pd.DataFrame(columns=["name"])
         self._string_hashes = pd.DataFrame(columns=["name"])
@@ -639,6 +677,130 @@ class DFTracerAnalyzer(Analyzer):
             profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
             system_metrics=system_metrics,
         )
+
+    # ------------------------------------------------------------------
+    # Semantic spans
+    #
+    # The native indexer emits a fixed POSIX-shaped schema: it drops non-I/O
+    # categories and carries no `args.*` fields. Agent traces put their
+    # workflow/step/llm/tool spans in exactly those dropped rows, so without
+    # this the analyzer never sees them, `apply_time_correlation` has neither a
+    # `step` column to fill nor boundaries to fill it from, and every agent
+    # layer comes back empty. The spans are few (tens per run against millions
+    # of I/O events), so they are read directly with TraceReader and appended to
+    # the trace stream, leaving every downstream derivation unchanged.
+    # ------------------------------------------------------------------
+
+    _SEMANTIC_CAT_QUERY = re.compile(r"""^\s*cat\s*==\s*['"]([^'"]+)['"]\s*$""")
+    _NON_SEMANTIC_CATS = frozenset({"posix", "stdio", "dftracer"})
+
+    def _semantic_span_cats(self):
+        """Categories the preset defines as non-I/O layers, from its layer_defs."""
+        cats = set()
+        for query in (self.preset.layer_defs or {}).values():
+            if not query:
+                continue
+            match = self._SEMANTIC_CAT_QUERY.match(str(query))
+            if not match:
+                continue
+            cat = match.group(1)
+            if cat.lower() in self._NON_SEMANTIC_CATS:
+                continue
+            cats.add(cat)
+        return cats
+
+    def _read_semantic_spans(self, directory, files, extra_columns, extra_columns_fn):
+        """Read the preset's non-I/O span events straight from the trace files."""
+        cats = self._semantic_span_cats()
+        if not cats:
+            return None
+        paths = list(files) if files else sorted(
+            glob(os.path.join(directory, "*.pfw")) + glob(os.path.join(directory, "*.pfw.gz"))
+        )
+        # Bytes prefilter so a full-corpus scan stays substring-search bound:
+        # only lines naming one of the categories are parsed as JSON.
+        probes = tuple(cat.encode("utf-8") for cat in cats)
+        records = []
+        for path in paths:
+            try:
+                lines = TraceReader(path).iter_lines()
+            except Exception as error:
+                logger.debug("semantic span read skipped", path=path, error=str(error))
+                continue
+            for raw in lines:
+                payload = bytes(raw)
+                if not any(probe in payload for probe in probes):
+                    continue
+                text = payload.decode("utf-8", errors="replace").strip().rstrip(",")
+                if not text.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("cat") in cats:
+                    records.append(record)
+        if not records:
+            return None
+        return self._semantic_spans_to_frame(records, extra_columns, extra_columns_fn)
+
+    def _semantic_spans_to_frame(self, records, extra_columns, extra_columns_fn):
+        """Shape raw span records like the native indexer's event schema.
+
+        Timestamps stay absolute microseconds and `time` stays seconds, matching
+        what `iter_arrow_dfanalyzer_all` produces, so the two streams share one
+        clock once concatenated.
+        """
+        bucket = self.time_granularity * self.time_resolution
+        rows = []
+        for record in records:
+            args = record.get("args") or {}
+            ts = int(record.get("ts") or 0)
+            dur = int(record.get("dur") or 0)
+            pid = int(record.get("pid") or 0)
+            tid = int(record.get("tid") or 0)
+            host_hash = str(args.get("hhash") or "")
+            seconds = dur / self.time_resolution
+            row = {
+                "cat": str(record.get("cat") or ""),
+                COL_FUNC_NAME: str(record.get("name") or ""),
+                "pid": pid,
+                "tid": tid,
+                "file_hash": "",
+                "host_hash": host_hash,
+                COL_FILE_NAME: "",
+                COL_HOST_NAME: "",
+                # _set_proc_names returns early once any row has a proc_name, and
+                # the native rows already do, so spans must name themselves the
+                # same way it would.
+                COL_PROC_NAME: "app#{}#{}#{}".format(host_hash or "unknown", pid, tid),
+                COL_IO_CAT: 0,
+                COL_ACC_PAT: 0,
+                COL_COUNT: 1,
+                COL_TIME: seconds,
+                COL_SIZE: np.nan,
+                "time_min": seconds,
+                "time_max": seconds,
+                "size_min": np.nan,
+                "size_max": np.nan,
+                "offset_min": 0,
+                "offset_max": 0,
+                COL_TIME_RANGE: int(ts // bucket) if bucket else 0,
+                COL_TIME_START: ts,
+                COL_TIME_END: ts + dur,
+            }
+            if extra_columns_fn is not None:
+                row.update(extra_columns_fn(record))
+            rows.append(row)
+        frame = pd.DataFrame(rows)
+        for column, dtype in (extra_columns or {}).items():
+            if column not in frame.columns:
+                frame[column] = np.nan if _is_numeric_dtype_name(dtype) else pd.NA
+            try:
+                frame[column] = frame[column].astype(dtype)
+            except (TypeError, ValueError):
+                logger.debug("semantic span field left uncast", column=column, dtype=str(dtype))
+        return frame
 
     def _postread_hlm_config(self, data_type):
         """Postread transformations the distributed HLM must replicate."""
@@ -659,6 +821,15 @@ class DFTracerAnalyzer(Analyzer):
         return config
 
     def _hlm(self, data_type, view_types, traces):
+        # The native distributed HLM aggregates straight off the indexer's IPC
+        # bytes. It therefore cannot see semantic spans appended after the read,
+        # nor anything derived from them (`step`) or derived by the analyzer
+        # after the read (`file_format`, size bins). It also silently drops any
+        # group-by column missing from the Arrow schema while still declaring it
+        # in the meta, which surfaces as a KeyError at compute() far downstream.
+        # Decline it whenever spans are in play and let the dataframe HLM run.
+        if getattr(self, "_has_semantic_spans", False):
+            return None
         return distributed_hlm(
             data_type,
             view_types,
@@ -863,9 +1034,33 @@ class DFTracerAnalyzer(Analyzer):
 
         return (
             traces.map_partitions(self._set_proc_names)
+            .map_partitions(self._fix_posix_io_cat)
             .map_partitions(self._fix_file_posix_category)
             .map_partitions(self._sanitize_size_offset)
         )
+
+    @staticmethod
+    def _fix_posix_io_cat(df: pd.DataFrame):
+        """Reclassify POSIX io_cat from func_name using the analyzer's mapping.
+
+        The native indexer assigns io_cat itself and its table omits the 64-bit
+        variants, so pread64/pwrite64/preadv64/pwritev64 land in OTHER: on an
+        HDF5 or NetCDF workload that is nearly every read, which zeroes out
+        read counts and read bytes while the total op count still looks right.
+        POSIX_IO_CAT_MAPPING is the same table the Python read path used, so
+        recomputing here restores the classification without touching the
+        indexer.
+        """
+        if COL_FUNC_NAME not in df.columns or COL_IO_CAT not in df.columns:
+            return df
+        posix = df["cat"].astype(str).str.contains("posix|stdio", case=False, na=False)
+        if not posix.any():
+            return df
+        mapped = df.loc[posix, COL_FUNC_NAME].map(
+            {name: int(category.value) for name, category in POSIX_IO_CAT_MAPPING.items()}
+        )
+        df.loc[posix, COL_IO_CAT] = mapped.fillna(df.loc[posix, COL_IO_CAT]).astype(df[COL_IO_CAT].dtype)
+        return df
 
     def get_job_time(self, traces):
         return super().get_job_time(traces) / self.time_resolution
