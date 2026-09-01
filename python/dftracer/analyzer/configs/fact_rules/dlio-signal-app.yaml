@@ -1,0 +1,41 @@
+schema_version: analysisfact-rules.v1
+
+# DLIO APP-ONLY observability boundary — THRESHOLD-FREE. Threshold-free twin of dlio-app.yaml.
+#
+# The layers ablation compares what different OBSERVABILITY BOUNDARIES can achieve: app-only vs
+# POSIX-only vs cross-layer. That comparison is about which metrics are visible, and it was
+# previously confounded with threshold quality, because each arm carried its own hand-tuned gates.
+# Running the arms threshold-free removes the confound: any difference that remains is the
+# boundary, which is the thing the ablation is actually about.
+#
+# Sees ONLY framework-level metrics. No reader_posix_*, which is the whole point: an app-only
+# observer knows how long a fetch took but not whether the time went to storage.
+#
+# CONSEQUENCE, and it is the ablation's expected result rather than a defect: with no POSIX layer
+# there is no storage domain, so the entire fetch time is unsplit. The planner sees fetch against
+# compute and cannot tell a slow filesystem from a slow decode or a starved queue. Under the
+# unattributed-domain rule (cbandit._finalize_window) that shows up honestly as a large
+# unexplained share rather than as a confident wrong attribution.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "1.0"
+
+rules:
+  - id: dlio_app.signal.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: input_compute_signal
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+    when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
+    severity_score: "1.0"
+    confidence: "1.0"
+    opportunity_tags:
+      - reader_parallelism
+      - dataloader_prefetch
