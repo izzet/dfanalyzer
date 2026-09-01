@@ -309,12 +309,18 @@ class FactEngine:
                 logger.warning("facts.rule.derived_metric_error", rule_id=rule.id, exc_info=True)
                 continue
 
-            # Log derived metric values for debugging rule evaluation
-            if rule.derived_metrics:
+            # Log derived metric values for debugging rule evaluation.
+            #
+            # REQUIRED metrics are logged alongside the derived ones. Without them a window's
+            # evaluation is unfalsifiable from the logs: you can see that a rule fired but not on
+            # what. That gap hid a frozen objective -- ten consecutive windows reporting
+            # byte-identical fetch/compute times while carrying between 16 and 156,492 events --
+            # which is invisible in `when_result` and fatal to any planner that learns.
+            if rule.derived_metrics or rule.required_metrics:
                 try:
                     derived_sample = {
                         m: _to_scalar(working_df[m].iloc[0]) if m in working_df.columns else None
-                        for m in rule.derived_metrics
+                        for m in list(rule.derived_metrics or ()) + list(rule.required_metrics or ())
                     }
                 except Exception:
                     derived_sample = {}
