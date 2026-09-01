@@ -40,6 +40,11 @@ class AnalyzerPresetConfig:
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
+    # Path fragment -> category suffix, e.g. {"/p/lustre1/.../train": "_reader"}. This is what
+    # SPLITS POSIX operations by purpose, and layers like `reader_posix` are defined as
+    # `cat.str.contains("posix|stdio") & cat.str.contains("_reader")`. A preset with no purpose
+    # layers wants {} here; see the DL presets below, where this is MANDATORY.
+    file_purposes: Dict[str, str] = dc.field(default_factory=dict)
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=dict)
     size_layers: Optional[List[str]] = dc.field(default_factory=list)
     time_boundary_layer: str = MISSING
@@ -83,6 +88,20 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
+    # MANDATORY for every deep-learning preset, and inherited by DLIOAILogging, Stormer,
+    # StormerXLayer and Halo3d. There is deliberately NO default.
+    #
+    # It used to be a hardcoded {"/data": "_reader", "/checkpoint": "_checkpoint"} inside
+    # _fix_file_posix_category, which meant the entire reader_posix layer depended on the dataset
+    # happening to be stored under a directory called "data". A corpus at
+    # /l/ssd/izzet/foundation_data produced ZERO reader_posix rows -- "_data" is not "/data" -- so
+    # every reader_posix rule was structurally unable to fire, silently, no matter how many events
+    # reached the window. The era5 dataset matched only because "/datasets" contains "/data", which
+    # is luck rather than design.
+    #
+    # A default here cannot be right: only the caller knows where its data lives. Requiring the
+    # value converts a silent wrong answer into a startup error naming the field.
+    file_purposes: Dict[str, str] = MISSING
     async_layers: Optional[List[str]] = dc.field(
         default_factory=lambda: [
             'data_loader',
