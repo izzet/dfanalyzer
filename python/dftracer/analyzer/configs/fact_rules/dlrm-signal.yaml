@@ -1,0 +1,44 @@
+schema_version: analysisfact-rules.v1
+
+# DLRM input<->comm<->compute — THRESHOLD-FREE, same shape as dlio-signal, stormer-signal, halo3d.
+#
+# DLRM had no rule set at all: it ran an in-process CLBO over its own wall-clock timers and never
+# went through the analyzer, so there was nothing for a rule to describe. Now that it registers
+# knobs and drains plans like every other workload, it needs the same threshold-free diagnosis
+# input the others get.
+#
+# Three domains, because DLRM has real comm: read_threads relieves INPUT, accumulate_grad_batches
+# relieves COMM (it reduces the dense all_reduce cadence), and compute has no knob -- so when
+# compute dominates the planner correctly declines rather than moving something irrelevant.
+#
+# Requires DFOPTIMIZER_ALGO=clbo or cbandit: an unconditional finding paired with the default rule
+# Planner would actuate every window.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "1.0"
+
+rules:
+  - id: dlrm.threeway_signal.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: input_comm_compute_signal
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - compute_time_proc_max
+      - comm_time_proc_max
+    derived_metrics:
+      # wall = the exposed step: app-level fetch + comm + compute. Same definition as halo3d.yaml
+      # and stormer-signal.yaml, so active_time means the same thing across workloads.
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+    when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
+    severity_score: "1.0"
+    confidence: "1.0"
+    # Inert under clbo/cbandit -- the planner infers the domain from the knob->domain map -- but
+    # present so the registry can bind DLRM's two knobs to this finding.
+    opportunity_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+      - comm_pressure
