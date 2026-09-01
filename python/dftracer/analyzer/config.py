@@ -243,7 +243,12 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
-            'compute': 'cat == "compute"',
+            'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
+            # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
+            # region (compute.forward/backward) is added it silently double counts. Selecting
+            # the parent cannot double count at any depth. Requires the app to emit a region
+            # NAMED `compute` -- see liveflow_shm/ANNOTATION-SPEC.md sec 4: parents land
+            # BEFORE this narrowing, or compute_time_proc_max drops to 0 in silence.
             'data_loader': 'cat.isin(["data", "data_loader", "dataloader"])',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader" or func_name == "preprocess"',
