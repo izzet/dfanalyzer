@@ -400,9 +400,9 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
         default_factory=lambda: {
             'app': 'cat == "ai_root" & func_name == "ai_root"',
             'training': 'cat == "pipeline" & func_name == "train"',
-            'fetch_iter': 'cat == "dataloader"',                 # dataloader.fetch (app-level fetch)
+            'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',  # was bare `cat == "dataloader"`, which would also swallow fetch.block                 # dataloader.fetch (app-level fetch)
             'comm': 'cat == "comm"',                             # halo exchange (COMM domain)
-            'compute': 'cat == "compute"',                       # conv + backward (COMPUTE domain)
+            'compute': 'cat == "compute" & func_name == "compute"',  # PARENT only; halo3d emits a region named `compute`                       # conv + backward (COMPUTE domain)
             'posix': 'cat.str.contains("posix|stdio", case=False)',
             'reader_posix': 'cat.str.contains("posix|stdio", case=False) & func_name == "read"',  # STORAGE
             'reader_decode': 'cat == "data"',                    # data.decode (DECODE domain)
