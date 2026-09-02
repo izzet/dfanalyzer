@@ -1210,10 +1210,36 @@ class DFTracerAnalyzer(Analyzer):
     def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):
         # Ensure merge key dtypes match (file_hash/host_hash may be float64
         # when all values are NaN, e.g. AI-only events with POSIX disabled).
+        #
+        # USE THE NULLABLE "string" DTYPE, NOT `astype(str)`.
+        #
+        # `astype(str)` is version-dependent for missing values and it silently changed underneath
+        # us (diagnosed 2026-08-28):
+        #   pandas 2.x : NaN -> the LITERAL STRING 'nan'  (a real value: merges, groups, counts)
+        #   pandas 3.0 : NaN -> stays NA                  (does not match, excluded from nunique)
+        # This code was written for the 2.x behaviour -- forcing an all-NaN float column into a
+        # usable string merge key. Under 3.0 the column stayed NA, `unique_host_count` went 1 -> 0,
+        # and every host-scoped groupby produced zero groups, so the analyzer emitted a
+        # schema-valid metrics.json full of zeros while exiting 0. Same traces, same code, silent.
+        #
+        # The 2.x behaviour was ALSO wrong, just invisibly: it reported `unique_host_count=1` on a
+        # 16-node/64-rank job because it was counting the string 'nan' as one host. So NA must be
+        # preserved as NA -- a missing hash is missing, and must not masquerade as a value.
+        # `astype("string")` has stable NA semantics across pandas 1.x-3.x and merges correctly
+        # (NA keys simply do not match, which is the intended outcome for a left join).
+        #
+        # NOTE: this fixes the DTYPE HANDLING only. It does not explain why host_hash is NA on some
+        # corpora in the first place -- that is a separate, still-open defect that this coercion was
+        # masking. `_assert_metadata_resolved()` in analyzer.py now fails loudly on the outcome.
         if "file_hash" in records.columns:
-            records["file_hash"] = records["file_hash"].astype(str)
+            records["file_hash"] = records["file_hash"].astype("string")
         if "host_hash" in records.columns:
-            records["host_hash"] = records["host_hash"].astype(str)
+            records["host_hash"] = records["host_hash"].astype("string")
+        # Both sides of the merge must share the key dtype, or the join silently matches nothing.
+        file_hashes = file_hashes.copy()
+        host_hashes = host_hashes.copy()
+        file_hashes.index = file_hashes.index.astype("string")
+        host_hashes.index = host_hashes.index.astype("string")
         records = records.merge(
             file_hashes.rename(columns={"name": COL_FILE_NAME}),
             how="left",
