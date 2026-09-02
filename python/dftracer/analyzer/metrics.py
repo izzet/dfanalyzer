@@ -331,7 +331,68 @@ def set_cross_layer_metrics(
             df = df.drop(columns=overlapping_cols)
         df = pd.concat([df.copy(), x_layer_metrics_df], axis=1)
 
+    df = set_window_decomposition_metrics(df, is_view_process_based)
+
     return df.sort_index(axis=1)
+
+
+def set_window_decomposition_metrics(
+    df: pd.DataFrame,
+    is_view_process_based: bool,
+) -> pd.DataFrame:
+    """Publish a signed per-window closure residual when wall is available.
+
+    ``window_wall`` comes from the duration-bearing ``window.stop`` event and
+    is independent of the domain annotations.  A positive residual therefore
+    exposes time which input, decode, communication, and compute did not name.
+    A negative residual exposes overlap or double counting.  Keeping the sign
+    is important because clipping would hide the latter failure mode.
+
+    Exposure metrics, when present, are selected by key presence rather than
+    truthiness.  A real zero exposure is therefore different from an absent
+    instrument.  The planner records the same distinction when it applies its
+    fallback domain mapping.
+    """
+    time_metric = "time_sum" if is_view_process_based else "time_proc_max"
+    wall_col = f"window_wall_{time_metric}"
+    if wall_col not in df.columns:
+        return df
+
+    def values(name: str) -> pd.Series:
+        if name not in df.columns:
+            return pd.Series(0.0, index=df.index, dtype="Float64")
+        return pd.to_numeric(df[name], errors="coerce").fillna(0).astype("Float64")
+
+    fetch = values(f"fetch_iter_{time_metric}")
+    comm = values(f"comm_{time_metric}")
+    compute_total = values(f"compute_{time_metric}")
+    storage_exposure_col = f"stall_storage_{time_metric}"
+    decode_exposure_col = f"stall_decode_{time_metric}"
+    exposure_present = storage_exposure_col in df.columns and decode_exposure_col in df.columns
+
+    if exposure_present:
+        input_time = values(storage_exposure_col)
+        decode_time = values(decode_exposure_col)
+    else:
+        decode_time = values(f"reader_decode_{time_metric}")
+        input_time = (fetch - decode_time).clip(lower=0)
+
+    compute_time = (compute_total - comm).clip(lower=0)
+    wall = values(wall_col)
+    residual = wall - (input_time + decode_time + comm + compute_time)
+
+    additions = pd.DataFrame(
+        {
+            f"domain_input_{time_metric}": input_time,
+            f"domain_decode_{time_metric}": decode_time,
+            f"domain_comm_{time_metric}": comm,
+            f"domain_compute_{time_metric}": compute_time,
+            f"residual_{time_metric}": residual,
+            "domain_exposure_present": float(exposure_present),
+        },
+        index=df.index,
+    ).astype("Float64")
+    return pd.concat([df.drop(columns=[c for c in additions if c in df.columns]), additions], axis=1)
 
 
 def set_quantile_metrics(df: pd.DataFrame):

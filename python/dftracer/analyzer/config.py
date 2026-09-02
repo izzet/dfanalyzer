@@ -120,6 +120,7 @@ class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
             'app': {},
             'training': {},
             'epoch': {},
+            'window_wall': {},
             'compute': {},
             'fetch_data': {},
             'checkpoint': {},
@@ -241,6 +242,11 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'app': 'cat == "ai_root" & func_name == "ai_root"',
             'training': 'cat == "pipeline" & func_name == "train"',
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
+            # One duration-bearing window.stop event per analysis window.  This
+            # is the measured wall objective.  It must not be reconstructed as
+            # the sum of domain layers because that makes the residual zero by
+            # definition and hides missing attribution.
+            'window_wall': 'cat == "window" & func_name == "window.stop"',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
@@ -263,6 +269,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'app': None,
             'training': 'app',
             'epoch': 'training',
+            'window_wall': None,
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
             'compute': 'fetch_block',
@@ -294,6 +301,7 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
             'app': 'cat == "ai_root" & func_name == "ai_root"',
             'training': 'cat == "pipeline" & func_name == "train"',
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
+            'window_wall': 'cat == "window" & func_name == "window.stop"',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
             'compute': 'cat == "compute" & func_name == "compute"',
@@ -313,6 +321,7 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
             'app': None,
             'training': 'app',
             'epoch': 'training',
+            'window_wall': None,
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
             'compute': 'fetch_block',

@@ -50,12 +50,17 @@ rules:
       # the reader_posix layer, which requires the preset's file_purposes to be set correctly --
       # get that wrong and this metric is silently absent rather than wrong.
       - fetch_iter_time_proc_max
+      - fetch_block_time_proc_max
       - reader_posix_time_proc_max
       - compute_time_proc_max
+      - window_wall_time_proc_max
+      - residual_time_proc_max
     derived_metrics:
-      # wall = the exposed step: app-level fetch + compute. Matches the halo3d definition minus the
-      # comm term that DLIO does not have.
-      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+      # The objective is the duration-bearing window.stop event, independent
+      # of the domains.  residual_time_proc_max is computed by metrics.py as
+      # wall - (input + decode + comm + compute), so missing attribution is no
+      # longer forced to zero by defining wall as the sum of those domains.
+      active_time: "fillna0(window_wall_time_proc_max)"
     when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
     severity_score: "1.0"
     confidence: "1.0"
