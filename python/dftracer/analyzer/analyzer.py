@@ -6,6 +6,8 @@ import dask.dataframe as dd
 import hashlib
 import itertools as it
 import json
+import gzip
+import zlib
 import math
 import numpy as np
 import os
@@ -715,6 +717,20 @@ class Analyzer(abc.ABC):
                 if isinstance(data, list):
                     data = b"".join(data)
                 if isinstance(data, (bytes, bytearray)) and len(data) > 0:
+                    # dftracer gzips the batch unless DFTRACER_TRACE_COMPRESSION=0. Decoding a
+                    # gzip stream as UTF-8 with errors="replace" does not raise -- it yields
+                    # replacement characters, every json.loads below hits JSONDecodeError, and the
+                    # `continue` swallows it. The result is a window that drains for its full grace
+                    # period and closes EMPTY, with a ring that is provably full (151,787 events)
+                    # and not one log line saying anything was discarded. Detect the magic and
+                    # decompress rather than trusting callers to unset the env var.
+                    if data[:2] == b"\x1f\x8b":
+                        try:
+                            data = gzip.decompress(bytes(data))
+                        except (OSError, EOFError, zlib.error) as exc:
+                            logger.warning("trace.batch.gunzip_failed", error=str(exc),
+                                           nbytes=len(data))
+                            return results
                     text = data.decode("utf-8", errors="replace")
                     for line in text.split("\n"):
                         line = line.strip()
@@ -951,6 +967,79 @@ class Analyzer(abc.ABC):
                                     window_index=completed_window.window_index,
                                     start_counts=start_counts,
                                 )
+
+                        # SWEEP EVENTS THE TARGETS CANNOT ACCOUNT FOR.
+                        #
+                        # `target_counts` is built from the boundary's events_written_by_pid, and a
+                        # boundary is only ever emitted by the process that calls window.start/stop
+                        # -- the training loop. Forked DataLoader workers never call it, so their
+                        # pids can NEVER appear in target_counts. The loop above therefore stops the
+                        # instant the main pid's count is reached, which it already is, and every
+                        # worker event stays queued in pending_trace_events and is carried forward
+                        # forever. Measured on a 1-node DLIO run: windows closed with event_count
+                        # 1-3 (FileStorage.get_uri, opendir, __xstat64), seen_counts EXACTLY equal
+                        # to target_counts, drain_elapsed 0.1-1.9 ms -- while the ring held 151,787
+                        # events, 99,944 of them POSIX reads. analysis_facts was 0 every window,
+                        # because the rules key on read latency and not one read ever entered a
+                        # window. The pipeline looked alive and was measuring almost nothing.
+                        #
+                        # The timestamp branch below already drains pending up to the boundary; this
+                        # is that same sweep, which the counted branch was missing.
+                        #
+                        # Sweeping `pending` alone is not enough: worker batches that have not been
+                        # PULLED yet are still sitting in the ring, and the counted loop above stops
+                        # pulling the moment the main pid's target is met. So first drain whatever
+                        # the consumer can hand over right now, up to the boundary timestamp.
+                        # `break` on an empty pull rather than `continue`: the records are already
+                        # buffered by the time the boundary arrives, so there is nothing to wait
+                        # for, and waiting out the full grace on every window would add ~30 s each.
+                        past_boundary = False
+                        while not past_boundary:
+                            remaining_ms = int(
+                                max(
+                                    0.0,
+                                    min(
+                                        float(trace_drain_timeout_ms),
+                                        (drain_deadline - time.monotonic()) * 1000.0,
+                                    ),
+                                )
+                            )
+                            if remaining_ms <= 0:
+                                break
+                            trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                            if trace_mofka_event is None:
+                                break
+                            unpacked = _normalize_trace_event(trace_mofka_event)
+                            trace_future = trace_consumer.pull()
+                            for normalized_event, event_ts, event_pid in unpacked:
+                                if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                    pending_trace_events.append(
+                                        (normalized_event, event_ts, event_pid)
+                                    )
+                                    past_boundary = True
+                                    continue
+                                _record_trace_event(
+                                    normalized_event,
+                                    event_pid,
+                                    pulled_events,
+                                    window_index=completed_window.window_index,
+                                    start_counts=start_counts,
+                                )
+
+                        carried_events = deque()
+                        while pending_trace_events:
+                            normalized_event, event_ts, event_pid = pending_trace_events.popleft()
+                            if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                carried_events.append((normalized_event, event_ts, event_pid))
+                                continue
+                            _record_trace_event(
+                                normalized_event,
+                                event_pid,
+                                pulled_events,
+                                window_index=completed_window.window_index,
+                                start_counts=start_counts,
+                            )
+                        pending_trace_events.extend(carried_events)
                     else:
                         can_drain_trace_stream = True
                         drain_deadline = (

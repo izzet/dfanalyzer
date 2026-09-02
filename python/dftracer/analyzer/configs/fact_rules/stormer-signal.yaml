@@ -1,0 +1,50 @@
+schema_version: analysisfact-rules.v1
+
+# StorMer storage<->decode<->comm<->compute — THRESHOLD-FREE. Replaces stormer.yaml.
+#
+# stormer.yaml is where the magic numbers that reviewers R1/R3/R4 objected to actually live:
+# fetch_frac >= 0.20, comm_frac >= 0.30, compute_frac < 0.85, and eight more across its 11 rules.
+# halo3d_gated.yaml documents what they cost, and deliberately carries THESE values to make the
+# point that they were transplanted across workloads without retuning:
+#   "delayed onset (a gate must be crossed before anything is emitted), mis-targeting (a domain
+#    below its threshold is invisible even when it is the largest term), and severity-driven
+#    evidence selection."
+#
+# This file emits ONE per-window finding with the raw per-domain times and lets the planner decide.
+# Identical in shape to halo3d.yaml and dlio-signal.yaml; only the metric set differs, because the
+# StorMer preset is the one that has all four domains.
+#
+# REQUIRES a planner that can decide from raw metrics and can choose to do nothing:
+# DFOPTIMIZER_ALGO=clbo or cbandit. The default rule Planner acts on every finding it receives, so
+# pairing it with an unconditional finding means actuating every window.
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "1.0"
+
+rules:
+  - id: stormer.fourway_signal.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: fourway_signal
+    required_metrics:
+      - fetch_iter_time_proc_max
+      - reader_posix_time_proc_max
+      - reader_decode_time_proc_max
+      - comm_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      # wall = the exposed step. Same definition as halo3d.yaml.
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+    when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
+    severity_score: "1.0"
+    confidence: "1.0"
+    # Inert under clbo/cbandit: the planner infers the domain from the knob->domain map and decides
+    # from the measured times. Present so the knob registry can bind knobs to this finding.
+    opportunity_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+      - decode_parallelism
+      - comm_pressure

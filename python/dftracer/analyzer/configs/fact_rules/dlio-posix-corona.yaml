@@ -36,6 +36,20 @@ rules:
     opportunity_tags:
       - reader_parallelism
       - dataloader_prefetch
+      # storage_starved is carried by the SAME fact rather than by a rule that tries to tell
+      # "not enough readers" from "the shared path is saturated". POSIX per-window metrics cannot
+      # distinguish those: both look like low per-proc bandwidth with data time dominant.
+      #
+      # It does not need to. Both tags fire, and the planner's cost ranking resolves it: read_threads
+      # (0.206 s) and prefetch (0.206 s) go first, data_source=local (465 s) is deferred. If more
+      # readers actually help, the finding weakens and the expensive action is never reached. If they
+      # do not -- which is what we measured at 32 nodes, where extra readers bought +3.9% throughput
+      # for +278% p50 latency -- the effectiveness and cooldown gates stop them re-firing and
+      # data_source becomes the cheapest surviving candidate on a later window.
+      #
+      # So escalation comes out of evidence rather than out of a rule guessing the regime, and the
+      # cheap actuator is always tried first at a cost of 0.2 s.
+      - storage_starved
 
   # Rule 2: Per-process read bandwidth is already in the saturated regime for
   # this workload on Corona. A POSIX-only controller cannot infer whether I/O

@@ -1,0 +1,68 @@
+schema_version: analysisfact-rules.v1
+
+# DLIO input<->compute — THRESHOLD-FREE by design. Replaces dlio-posix-corona.yaml.
+#
+# WHY. SC pap685 reviewers R1/R3/R4 all attacked the hand-set thresholds. The rebuttal argued they
+# were "conservative critical-path criteria, not tuned values", backed it with an offline
+# sensitivity analysis, and conceded that learning them was future work. The scores did not move.
+# The argument does not survive contact with a reviewer, so the thresholds go rather than get
+# defended again.
+#
+# WHAT dlio-posix-corona.yaml ENCODED, and why each number was indefensible:
+#   reader_posix_data_time_proc_frac_parent > 0.90    a guess at "data-dominated"
+#   reader_posix_metadata_time_proc_frac_parent < 0.10 a guess at "not metadata-bound"
+#   reader_posix_read_bw_proc_mean < 600000000        600 MB/s, a guess at Corona's saturated regime
+#   reader_posix_time_proc_max > 20                   20 s, doing double duty as "is this material"
+#                                                     AND "is the window long enough", the second of
+#                                                     which was never intended and silently couples
+#                                                     the rule to window cadence and scale
+#
+# This file emits ONE per-window finding carrying the RAW per-domain times and lets the planner own
+# every decision. Same shape as halo3d.yaml, which already did this for the three-way workload.
+#
+# READ THIS BEFORE USING IT. A rule that fires every window is only safe with a planner that can
+# decide from raw metrics and can choose to DO NOTHING. The default rule `Planner` acts on every
+# finding it receives, so pairing it with this file means actuating constantly. This file commits
+# the workload to DFOPTIMIZER_ALGO=clbo or (preferably) cbandit, whose acceptance test
+# (clbo.accept_decision, Welch + effect floor) is what supplies the "is this worth acting on"
+# judgement that the thresholds used to supply badly.
+#
+# WHAT IS NOT CLAIMED. This has no magic numbers; it does not have no constants. The planner still
+# carries alpha (significance) and effect_floor (minimum interesting effect). Those are standard
+# statistical parameters whose meaning transfers across workloads, which is a different kind of
+# object from "600 MB/s on Corona".
+
+defaults:
+  rule_version: "1.0.0"
+  emit_mode: window
+  confidence: "1.0"
+
+rules:
+  - id: dlio.input_compute_signal.v1
+    priority: 100
+    source_view: epoch
+    emit_mode: window
+    fact_type: input_compute_signal
+    required_metrics:
+      # The two actionable domains DLIO exposes, plus the app-level fetch that bounds input.
+      # There is no comm layer in the DLIO preset and no separate decode layer, so unlike halo3d
+      # this is a TWO-domain signal. reader_posix_time_proc_max is the storage-side time and needs
+      # the reader_posix layer, which requires the preset's file_purposes to be set correctly --
+      # get that wrong and this metric is silently absent rather than wrong.
+      - fetch_iter_time_proc_max
+      - reader_posix_time_proc_max
+      - compute_time_proc_max
+    derived_metrics:
+      # wall = the exposed step: app-level fetch + compute. Matches the halo3d definition minus the
+      # comm term that DLIO does not have.
+      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(compute_time_proc_max)"
+    when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
+    severity_score: "1.0"
+    confidence: "1.0"
+    # Tags exist so the knob registry can bind knobs to this finding. Under clbo/cbandit they are
+    # inert: the planner infers the domain from the knob->domain map and decides from the measured
+    # per-domain times, which is what keeps this path free of magic numbers.
+    opportunity_tags:
+      - reader_parallelism
+      - dataloader_prefetch
+      - storage_starved

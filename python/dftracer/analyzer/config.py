@@ -40,6 +40,11 @@ class AnalyzerPresetConfig:
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=dict)
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(default_factory=dict)
     name: str = MISSING
+    # Path fragment -> category suffix, e.g. {"/p/lustre1/.../train": "_reader"}. This is what
+    # SPLITS POSIX operations by purpose, and layers like `reader_posix` are defined as
+    # `cat.str.contains("posix|stdio") & cat.str.contains("_reader")`. A preset with no purpose
+    # layers wants {} here; see the DL presets below, where this is MANDATORY.
+    file_purposes: Dict[str, str] = dc.field(default_factory=dict)
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=dict)
     size_layers: Optional[List[str]] = dc.field(default_factory=list)
     time_boundary_layer: str = MISSING
@@ -83,6 +88,20 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
 
 @dc.dataclass
 class AnalyzerPresetConfigDLIO(AnalyzerPresetConfig):
+    # MANDATORY for every deep-learning preset, and inherited by DLIOAILogging, Stormer,
+    # StormerXLayer and Halo3d. There is deliberately NO default.
+    #
+    # It used to be a hardcoded {"/data": "_reader", "/checkpoint": "_checkpoint"} inside
+    # _fix_file_posix_category, which meant the entire reader_posix layer depended on the dataset
+    # happening to be stored under a directory called "data". A corpus at
+    # /l/ssd/izzet/foundation_data produced ZERO reader_posix rows -- "_data" is not "/data" -- so
+    # every reader_posix rule was structurally unable to fire, silently, no matter how many events
+    # reached the window. The era5 dataset matched only because "/datasets" contains "/data", which
+    # is luck rather than design.
+    #
+    # A default here cannot be right: only the caller knows where its data lives. Requiring the
+    # value converts a silent wrong answer into a startup error naming the field.
+    file_purposes: Dict[str, str] = MISSING
     async_layers: Optional[List[str]] = dc.field(
         default_factory=lambda: [
             'data_loader',
@@ -224,7 +243,12 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
-            'compute': 'cat == "compute"',
+            'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
+            # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
+            # region (compute.forward/backward) is added it silently double counts. Selecting
+            # the parent cannot double count at any depth. Requires the app to emit a region
+            # NAMED `compute` -- see liveflow_shm/ANNOTATION-SPEC.md sec 4: parents land
+            # BEFORE this narrowing, or compute_time_proc_max drops to 0 in silence.
             'data_loader': 'cat.isin(["data", "data_loader", "dataloader"])',
             'data_loader_fork': 'cat == "posix" & func_name == "fork"',
             'reader': 'cat == "reader" or func_name == "preprocess"',
@@ -376,9 +400,9 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
         default_factory=lambda: {
             'app': 'cat == "ai_root" & func_name == "ai_root"',
             'training': 'cat == "pipeline" & func_name == "train"',
-            'fetch_iter': 'cat == "dataloader"',                 # dataloader.fetch (app-level fetch)
+            'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',  # was bare `cat == "dataloader"`, which would also swallow fetch.block                 # dataloader.fetch (app-level fetch)
             'comm': 'cat == "comm"',                             # halo exchange (COMM domain)
-            'compute': 'cat == "compute"',                       # conv + backward (COMPUTE domain)
+            'compute': 'cat == "compute" & func_name == "compute"',  # PARENT only; halo3d emits a region named `compute`                       # conv + backward (COMPUTE domain)
             'posix': 'cat.str.contains("posix|stdio", case=False)',
             'reader_posix': 'cat.str.contains("posix|stdio", case=False) & func_name == "read"',  # STORAGE
             'reader_decode': 'cat == "data"',                    # data.decode (DECODE domain)

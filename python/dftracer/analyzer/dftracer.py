@@ -8,6 +8,7 @@ import numpy as np
 import os
 import pandas as pd
 import portion as I
+import re
 import structlog
 # dftracer-utils >=0.0.12 renamed Reader -> TraceReader. Support BOTH rather than pinning:
 # pinning to 0.0.5 forces a SOURCE build, which fails on this cluster at the cpplogger
@@ -45,6 +46,10 @@ from .types import ReadTraceResult, ViewType
 from .utils.log_utils import log_block
 
 logger = structlog.get_logger()
+
+# Warn once per process, not once per dask partition: the condition is a whole-run
+# configuration mistake, and repeating it per partition would bury it.
+_PURPOSE_MATCH_WARNED = False
 
 CAT_POSIX = "POSIX"
 CAT_STDIO = "STDIO"
@@ -707,12 +712,12 @@ class DFTracerAnalyzer(Analyzer):
         if is_dask:
             traces = (
                 traces.map_partitions(self._set_proc_names)
-                .map_partitions(self._fix_file_posix_category)
+                .map_partitions(self._fix_file_posix_category, self._file_purposes())
                 .map_partitions(self._sanitize_size)
             )
         else:
             traces = self._set_proc_names(traces)
-            traces = self._fix_file_posix_category(traces)
+            traces = self._fix_file_posix_category(traces, self._file_purposes())
             traces = self._sanitize_size(traces)
 
         return traces
@@ -786,7 +791,7 @@ class DFTracerAnalyzer(Analyzer):
                 time_resolution=self.time_resolution,
             )
             if not p.empty:
-                p = self._fix_file_posix_category(p)
+                p = self._fix_file_posix_category(p, self._file_purposes())
                 p = self._sanitize_size_offset(p)
                 # Coalesce: collapse duplicate counter rows per canonical bucket
                 coalesce_agg = {
@@ -831,16 +836,68 @@ class DFTracerAnalyzer(Analyzer):
     def get_unique_process_count(self, traces: dd.DataFrame):
         return traces["pid"].nunique()
 
+    def _file_purposes(self) -> Dict[str, str]:
+        """The preset's path-fragment -> category-suffix map, or a clear error if it was not set.
+
+        The DL presets declare `file_purposes` as MISSING, so omegaconf raises on access when the
+        caller forgot it. That exception names the config key but not the consequence, and the
+        consequence is what matters: no purpose suffixes means the reader_posix layer is empty and
+        every rule keyed on it is silently false. Say that here, once, at startup, instead of
+        letting it surface as an unexplained zero six steps downstream.
+        """
+        try:
+            purposes = self.preset.file_purposes
+        except Exception as exc:  # omegaconf MissingMandatoryValue, among others
+            raise ValueError(
+                f"preset {getattr(self.preset, 'name', '?')!r} requires `file_purposes`, a map of "
+                "path fragment -> category suffix such as "
+                '{"/p/lustre1/me/dataset/train": "_reader", "/p/lustre1/me/ckpt": "_checkpoint"}. '
+                "It has no default because only you know where this run's data lives, and a wrong "
+                "guess empties the reader_posix layer without any error. Pass the run's actual "
+                "data and checkpoint folders."
+            ) from exc
+        return dict(purposes) if purposes else {}
+
     @staticmethod
-    def _fix_file_posix_category(df: pd.DataFrame):
+    def _fix_file_posix_category(df: pd.DataFrame, file_purposes: Dict[str, str]):
         base_condition = df["cat"].str.contains("posix|stdio") & ~df["file_name"].isna()
 
-        # Step 1: Map file purpose suffixes first
-        purpose_updates = {"/data": "_reader", "/checkpoint": "_checkpoint"}
-
-        for path, suffix in purpose_updates.items():
-            mask = base_condition & df["file_name"].str.contains(path)
+        # Step 1: Map file purpose suffixes first.
+        #
+        # `file_purposes` comes from the preset and is MANDATORY for the DL presets. It used to be
+        # hardcoded here as {"/data": "_reader", "/checkpoint": "_checkpoint"}, which silently tied
+        # the whole reader_posix layer to a dataset happening to live under a directory named
+        # "data". See AnalyzerPresetConfigDLIO.file_purposes for the failure this caused.
+        for path, suffix in (file_purposes or {}).items():
+            mask = base_condition & df["file_name"].str.contains(path, regex=False)
             df.loc[mask, "cat"] = df.loc[mask, "cat"] + suffix
+
+        # A partition full of POSIX operations where NOT ONE matched a purpose is the exact shape
+        # of the silent failure above: the layer is not wrong, it is empty, and every rule keyed on
+        # it evaluates to false without a single log line. Say so, once per process.
+        global _PURPOSE_MATCH_WARNED
+        if not _PURPOSE_MATCH_WARNED and file_purposes:
+            posix_rows = int(base_condition.sum())
+            if posix_rows > 0:
+                matched = int(
+                    (
+                        base_condition
+                        & df["file_name"].str.contains(
+                            "|".join(re.escape(p) for p in file_purposes), regex=True
+                        )
+                    ).sum()
+                )
+                if matched == 0:
+                    _PURPOSE_MATCH_WARNED = True
+                    logger.warning(
+                        "posix.file_purpose.no_match",
+                        posix_rows=posix_rows,
+                        file_purposes=dict(file_purposes),
+                        example_file=str(df.loc[base_condition, "file_name"].iloc[0]),
+                        hint="no POSIX op matched any file_purposes path, so purpose layers such "
+                        "as reader_posix will be EMPTY and every rule keyed on them will be "
+                        "silently false. Check the paths passed for data/checkpoint folders.",
+                    )
 
         # Step 2: Map filesystem suffixes
         filesystem_updates = {"/lustre": "_lustre", "/ssd": "_ssd"}
@@ -877,7 +934,9 @@ class DFTracerAnalyzer(Analyzer):
             time_resolution=self.time_resolution,
             meta=PROFILE_OUTPUT_COLUMNS,
         )
-        profiles = profiles.map_partitions(self._fix_file_posix_category).map_partitions(self._sanitize_size_offset)
+        profiles = profiles.map_partitions(
+            self._fix_file_posix_category, self._file_purposes()
+        ).map_partitions(self._sanitize_size_offset)
         return self._coalesce_profiles(profiles)
 
     def _coalesce_profiles(self, profiles: dd.DataFrame) -> dd.DataFrame:
