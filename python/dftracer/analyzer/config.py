@@ -220,6 +220,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'compute': {},
             'fetch_iter': {},
             'fetch_block': {},
+            'stall_storage': {},
             'data_loader': {
                 'init': 'func_name.str.contains("init")',
                 'item': 'func_name.str.contains("item")',
@@ -249,6 +250,8 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'window_wall': 'cat == "window" & func_name == "window.stop"',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
+            # Children only. DLIO emits no parent `stall` region.
+            'stall_storage': 'cat == "stall" & func_name == "stall.storage"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
@@ -272,6 +275,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'window_wall': None,
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
+            'stall_storage': 'fetch_iter',
             'compute': 'fetch_block',
             'data_loader': 'fetch_iter',
             'data_loader_fork': 'fetch_iter',

@@ -368,7 +368,9 @@ def set_window_decomposition_metrics(
     compute_total = values(f"compute_{time_metric}")
     storage_exposure_col = f"stall_storage_{time_metric}"
     decode_exposure_col = f"stall_decode_{time_metric}"
-    exposure_present = storage_exposure_col in df.columns and decode_exposure_col in df.columns
+    # DLIO has an aggregate consumer-side storage exposure but no separately measurable decode
+    # stage. Storage-key presence is the contract. A present zero remains distinct from absence.
+    exposure_present = storage_exposure_col in df.columns
 
     if exposure_present:
         input_time = values(storage_exposure_col)

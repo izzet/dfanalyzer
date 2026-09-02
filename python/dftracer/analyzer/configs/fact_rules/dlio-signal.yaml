@@ -51,6 +51,7 @@ rules:
       # get that wrong and this metric is silently absent rather than wrong.
       - fetch_iter_time_proc_max
       - fetch_block_time_proc_max
+      - stall_storage_time_proc_max
       - reader_posix_time_proc_max
       - compute_time_proc_max
       - window_wall_time_proc_max
