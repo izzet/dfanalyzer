@@ -163,6 +163,11 @@ def init_with_hydra(hydra_overrides: List[str]):
         )
 
     # Setup instance
+    # Analyzer debug artifacts must follow Hydra's run directory.  The node agent composes a
+    # second Hydra application after this one, so retain this value on the analyzer instead of
+    # consulting HydraConfig later, when it may refer to the diagnoser's configuration.
+    analyzer.debug_output_dir = hydra_config.hydra.runtime.output_dir
+
     return DFAnalyzerInstance(
         analyzer=analyzer,
         client=client,

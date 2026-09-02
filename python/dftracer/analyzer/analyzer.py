@@ -24,6 +24,68 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 # Module-level shutdown flag set by SIGTERM handler.
 _shutdown_requested = False
 
+HORIZON_SOURCE_FIELDS = (
+    "epoch_index",
+    "epochs_total",
+    "window_index",
+    "windows_per_epoch",
+)
+
+
+def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = None) -> Dict[str, int]:
+    """Return the declared and remaining horizon for one completed window.
+
+    New writers may copy the fields into boundary metadata.  Existing writers
+    retain them only on the duration-bearing window.stop trace record, so both
+    locations are accepted.  No value is synthesized when the four-field
+    contract is incomplete.
+    """
+    candidates = []
+    if isinstance(control_event, dict):
+        candidates.append(control_event)
+    candidates.extend(
+        event for event in events
+        if isinstance(event, dict) and event.get("name") == "window.stop"
+    )
+
+    complete = []
+    for candidate in candidates:
+        try:
+            values = {name: int(candidate[name]) for name in HORIZON_SOURCE_FIELDS}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if values["epoch_index"] < 1 or values["epochs_total"] < 1:
+            continue
+        if values["window_index"] < 1 or values["windows_per_epoch"] < 1:
+            continue
+        complete.append(values)
+
+    if not complete:
+        return {}
+    first = complete[0]
+    if any(values != first for values in complete[1:]):
+        logger.warning("window.horizon.mismatch", candidates=complete)
+        return {}
+
+    metrics = dict(first)
+    metrics["epochs_remaining"] = max(first["epochs_total"] - first["epoch_index"], 0)
+    metrics["windows_remaining"] = max(
+        first["epochs_total"] * first["windows_per_epoch"] - first["window_index"],
+        0,
+    )
+    return metrics
+
+
+def attach_window_horizon(result, metrics: Dict[str, int]) -> None:
+    """Attach horizon passthrough metrics to flat views and every emitted fact."""
+    if not metrics:
+        return
+    for flat_view in result.flat_views.values():
+        for name, value in metrics.items():
+            flat_view[name] = value
+    for _view_key, fact in result.iter_analysis_facts():
+        fact.evidence.setdefault("metrics", {}).update(metrics)
+
 
 def _ack_event(event) -> None:
     """Acknowledge a Mofka event -- disabled by default. See LIVEFLOW-STATUS sec 60.
@@ -684,6 +746,15 @@ class Analyzer(abc.ABC):
                 extra_columns=normalized_extra_columns,
                 extra_columns_fn=extra_columns_fn,
             )
+            # The writer's boundary metadata historically kept only epoch and
+            # step.  Preserve the horizon contract from the window trace
+            # record so the completed-window path can forward it even before
+            # every writer implementation learns the new fields.
+            args = trace_event.get("args", {})
+            if isinstance(normalized_event, dict) and isinstance(args, dict):
+                for field in HORIZON_SOURCE_FIELDS:
+                    if field in args:
+                        normalized_event[field] = args[field]
             event_ts = None
             event_pid = None
             try:
@@ -1141,6 +1212,23 @@ class Analyzer(abc.ABC):
                             system_metrics=system_metrics,
                         )
                         result.window_index = completed_window.window_index
+                        horizon_metrics = window_horizon_metrics(
+                            pulled_events,
+                            control_event=control_event,
+                        )
+                        if horizon_metrics:
+                            attach_window_horizon(result, horizon_metrics)
+                            logger.info(
+                                "window.horizon.published",
+                                window=completed_window.window_index,
+                                **horizon_metrics,
+                            )
+                        else:
+                            logger.warning(
+                                "window.horizon.missing",
+                                window=completed_window.window_index,
+                                required_fields=HORIZON_SOURCE_FIELDS,
+                            )
                     except KeyError as exc:
                         trace_columns = list(traces.columns) if hasattr(traces, "columns") else []
                         logger.warning(
@@ -2278,7 +2366,9 @@ class Analyzer(abc.ABC):
             with log_block("compute_time_boundaries"):
                 metric_boundaries.update(self.compute_time_boundaries(flat_views))
                 if self.debug:
-                    with open("metric_boundaries.json", "w") as f:
+                    debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+                    os.makedirs(debug_dir, exist_ok=True)
+                    with open(os.path.join(debug_dir, "metric_boundaries.json"), "w") as f:
                         json.dump(
                             metric_boundaries,
                             f,
@@ -2297,7 +2387,12 @@ class Analyzer(abc.ABC):
                         system_metrics=system_metrics,
                     )
                     if self.debug:
-                        flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
+                        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+                        os.makedirs(debug_dir, exist_ok=True)
+                        flat_views[view_key].to_csv(
+                            os.path.join(debug_dir, f"flat_view_{'_'.join(view_key)}.csv"),
+                            index=False,
+                        )
 
         # Checkpoint flat views if enabled
         if self.checkpoint:

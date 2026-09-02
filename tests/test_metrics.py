@@ -7,6 +7,7 @@ from dftracer.analyzer.metrics import (
     set_main_metrics,
     set_quantile_metrics,
     set_view_metrics,
+    set_window_decomposition_metrics,
 )
 
 
@@ -20,6 +21,43 @@ def _assert_no_infinities(df: pd.DataFrame):
         if pd.api.types.is_numeric_dtype(s):
             coerced = pd.to_numeric(s, errors="coerce")
             assert not np.isinf(coerced.to_numpy()).any(), f"Infinite values found in column {col}"
+
+
+def test_window_decomposition_publishes_signed_residual_from_independent_wall():
+    events = pd.DataFrame({
+        "window_wall_time_proc_max": [0.045, 0.040],
+        "fetch_iter_time_proc_max": [0.010, 0.012],
+        "reader_decode_time_proc_max": [0.002, 0.003],
+        "comm_time_proc_max": [0.004, 0.004],
+        # Compute is a parent which contains communication.
+        "compute_time_proc_max": [0.024, 0.026],
+    })
+
+    out = set_window_decomposition_metrics(events, is_view_process_based=False)
+
+    assert out["domain_input_time_proc_max"].tolist() == pytest.approx([0.008, 0.009])
+    assert out["domain_decode_time_proc_max"].tolist() == pytest.approx([0.002, 0.003])
+    assert out["domain_comm_time_proc_max"].tolist() == pytest.approx([0.004, 0.004])
+    assert out["domain_compute_time_proc_max"].tolist() == pytest.approx([0.020, 0.022])
+    assert out["residual_time_proc_max"].tolist() == pytest.approx([0.011, 0.002])
+    assert out["domain_exposure_present"].tolist() == [0.0, 0.0]
+
+
+def test_window_decomposition_distinguishes_zero_exposure_from_absent_exposure():
+    events = pd.DataFrame({
+        "window_wall_time_proc_max": [0.020],
+        "fetch_iter_time_proc_max": [0.010],
+        "stall_storage_time_proc_max": [0.0],
+        "stall_decode_time_proc_max": [0.0],
+        "compute_time_proc_max": [0.006],
+    })
+
+    out = set_window_decomposition_metrics(events, is_view_process_based=False)
+
+    assert out.loc[0, "domain_exposure_present"] == 1.0
+    assert out.loc[0, "domain_input_time_proc_max"] == 0.0
+    assert out.loc[0, "domain_decode_time_proc_max"] == 0.0
+    assert out.loc[0, "residual_time_proc_max"] == pytest.approx(0.014)
 
 
 def test_set_main_metrics_basic_single_metric():
