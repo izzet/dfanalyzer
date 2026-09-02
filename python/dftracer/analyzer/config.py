@@ -218,6 +218,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'training': {},
             'epoch': {},
             'compute': {},
+            'comm': {},
             'fetch_iter': {},
             'fetch_block': {},
             'data_loader': {
@@ -249,6 +250,20 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'window_wall': 'cat == "window" & func_name == "window.stop"',
             'fetch_iter': 'cat == "dataloader" & func_name == "fetch.iter"',
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
+            # comm is CHILDREN-ONLY against a BROAD selector, per ANNOTATION-SPEC sec 1: no
+            # workload emits a bare `comm` parent (StorMer emits comm.all_reduce, DLRM
+            # comm.all_reduce and comm.all_to_all, halo3d comm.halo), so summing the children is
+            # the correct read and adding a parent would break it.
+            #
+            # DEFINED EVEN THOUGH DLIO EMITS NO COMM TODAY. A preset declares the layers of the
+            # contract. Whether a given run populates one is the workload's business. Leaving it
+            # undefined meant comm_time_proc_max could never appear under this preset, so any rule
+            # requiring it was SKIPPED rather than evaluated with comm at zero, which reports
+            # nothing and is indistinguishable from a workload that did nothing. That is exactly
+            # how preset_contract.sh's default dlio arm failed on 2026-09-01 while the halo3d and
+            # stormer arms passed on the same emitter. A DDP DLIO run that does emit comm now has
+            # it attributed instead of dropped.
+            'comm': 'cat == "comm"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
@@ -272,6 +287,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'window_wall': None,
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
+            'comm': 'epoch',
             'compute': 'fetch_block',
             'data_loader': 'fetch_iter',
             'data_loader_fork': 'fetch_iter',
@@ -339,6 +355,24 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
     name: str = "stormer"
 
 
+# EXPOSURE layers (liveflow_shm/EXPOSURE-PORT-DESIGN.md E3). The workload emits ONE event per
+# domain per window per rank, from the main thread, carrying the accumulated milliseconds the
+# CONSUMER stalled on that stage. That is a critical-path quantity, unlike every other time layer
+# here, which is per-operation service time summed by dur_sum.
+#
+# It matters because service time moves the WRONG WAY: decode_threads 1 -> 8 raised the halo3d
+# decode p90 11.5% while wall fell 29% (n=5, 2026-08-29). A metric that rises when its own domain
+# is relieved cannot pick a bottleneck.
+#
+# One event per window per rank means dur_sum has nothing to sum, so the concurrency double count
+# cannot reach these two metrics. Each layer names exactly one child of a conceptual `stall`
+# parent; NO parent region is emitted and none must be, or the sum double counts.
+_STALL_LAYER_DEFS = {
+    'stall_storage': 'cat == "stall" & func_name == "stall.storage"',
+    'stall_decode': 'cat == "stall" & func_name == "stall.decode"',
+}
+
+
 @dc.dataclass
 class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
     """StorMer with the DECODE domain exposed (LIVEFLOW-STATUS.md sec 36/37).
@@ -366,7 +400,7 @@ class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
     layer_defs: Dict[str, Optional[str]] = dc.field(
         default_factory=lambda: dict(
             AnalyzerPresetConfigStormer().layer_defs,
-            **{'reader_decode': 'cat == "data" & func_name == "decode"'}
+            **dict(_STALL_LAYER_DEFS, **{'reader_decode': 'cat == "data" & func_name == "decode"'})
         )
     )
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
@@ -374,7 +408,10 @@ class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
             AnalyzerPresetConfigStormer().layer_deps,
             # decode runs in the forked workers and overlaps the main-process fetch wait through
             # the prefetch queue -> child of fetch_iter AND async (see async_layers below).
-            **{'reader_decode': 'fetch_iter'}
+            **{'reader_decode': 'fetch_iter',
+               # A decomposition of the app-level fetch wait, like reader_decode, but MAIN THREAD
+               # and on the critical path, so NOT listed in async_layers.
+               'stall_storage': 'fetch_iter', 'stall_decode': 'fetch_iter'}
         )
     )
     async_layers: List[str] = dc.field(
@@ -382,7 +419,8 @@ class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
     )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: dict(
-            AnalyzerPresetConfigStormer().derived_metrics or {}, **{'reader_decode': {}}
+            AnalyzerPresetConfigStormer().derived_metrics or {},
+            **{'reader_decode': {}, 'stall_storage': {}, 'stall_decode': {}}
         )
     )
     name: str = "stormer_xlayer"
@@ -415,6 +453,7 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
             'posix': 'cat.str.contains("posix|stdio", case=False)',
             'reader_posix': 'cat.str.contains("posix|stdio", case=False) & func_name == "read"',  # STORAGE
             'reader_decode': 'cat == "data"',                    # data.decode (DECODE domain)
+            **_STALL_LAYER_DEFS,
         }
     )
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
@@ -427,6 +466,9 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
             'posix': None,
             'reader_posix': 'fetch_iter',    # reader-domain, overlaps fetch via the prefetch queue
             'reader_decode': 'fetch_iter',
+            # Exposure decomposes the same app-level fetch, but from the consumer side.
+            'stall_storage': 'fetch_iter',
+            'stall_decode': 'fetch_iter',
         }
     )
     # Async (overlapping) reader-domain layers -- MUST only name layers defined above.
@@ -437,7 +479,8 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: {k: {} for k in
                                  ['app', 'training', 'fetch_iter', 'comm', 'compute',
-                                  'posix', 'reader_posix', 'reader_decode']})
+                                  'posix', 'reader_posix', 'reader_decode',
+                                  'stall_storage', 'stall_decode']})
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=lambda: {})
     name: str = "halo3d"
 
