@@ -2185,7 +2185,9 @@ class Analyzer(abc.ABC):
             with log_block("compute_time_boundaries"):
                 metric_boundaries.update(self.compute_time_boundaries(flat_views))
                 if self.debug:
-                    with open("metric_boundaries.json", "w") as f:
+                    debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+                    os.makedirs(debug_dir, exist_ok=True)
+                    with open(os.path.join(debug_dir, "metric_boundaries.json"), "w") as f:
                         json.dump(
                             metric_boundaries,
                             f,
@@ -2204,7 +2206,12 @@ class Analyzer(abc.ABC):
                         system_metrics=system_metrics,
                     )
                     if self.debug:
-                        flat_views[view_key].to_csv(f"flat_view_{'_'.join(view_key)}.csv", index=False)
+                        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+                        os.makedirs(debug_dir, exist_ok=True)
+                        flat_views[view_key].to_csv(
+                            os.path.join(debug_dir, f"flat_view_{'_'.join(view_key)}.csv"),
+                            index=False,
+                        )
 
         # Checkpoint flat views if enabled
         if self.checkpoint:
