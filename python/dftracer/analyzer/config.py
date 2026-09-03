@@ -218,6 +218,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'training': {},
             'epoch': {},
             'compute': {},
+            'comm': {},
             'fetch_iter': {},
             'fetch_block': {},
             'stall_storage': {},
@@ -252,6 +253,14 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'fetch_block': 'cat == "dataloader" & func_name == "fetch.block"',
             # Children only. DLIO emits no parent `stall` region.
             'stall_storage': 'cat == "stall" & func_name == "stall.storage"',
+            # Children only, broad definition, exactly as StorMer, DLRM and halo3d do it: DLIO
+            # emits `comm.all_reduce` around the per-step barrier and no bare `comm` parent, so a
+            # narrow definition here would select nothing and silently report 0. Before this layer
+            # existed the dlio preset had NO comm entry at all, so `comm_time_proc_max` was absent,
+            # `domains_from_metrics` read it as 0.0, and the barrier -- 73.9% of the step at 32
+            # nodes -- was reported as `unattributed`. See T3-0-SHM-LOOP-CORONA.md section 4l.
+            'comm': 'cat == "comm"',
+            'comm_all_reduce': 'cat == "comm" & func_name == "all_reduce"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
@@ -277,6 +286,8 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'fetch_block': 'epoch',
             'stall_storage': 'fetch_iter',
             'compute': 'fetch_block',
+            'comm': 'compute',
+            'comm_all_reduce': 'comm',
             'data_loader': 'fetch_iter',
             'data_loader_fork': 'fetch_iter',
             'reader': 'data_loader',
