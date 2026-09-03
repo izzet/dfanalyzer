@@ -60,6 +60,22 @@ def test_window_decomposition_distinguishes_zero_exposure_from_absent_exposure()
     assert out.loc[0, "residual_time_proc_max"] == pytest.approx(0.014)
 
 
+def test_window_decomposition_uses_dlio_storage_only_exposure():
+    events = pd.DataFrame({
+        "window_wall_time_proc_max": [0.081],
+        "fetch_iter_time_proc_max": [0.001],
+        "stall_storage_time_proc_max": [0.057],
+        "compute_time_proc_max": [0.019],
+    })
+
+    out = set_window_decomposition_metrics(events, is_view_process_based=False)
+
+    assert out.loc[0, "domain_exposure_present"] == 1.0
+    assert out.loc[0, "domain_input_time_proc_max"] == pytest.approx(0.057)
+    assert out.loc[0, "domain_decode_time_proc_max"] == 0.0
+    assert out.loc[0, "residual_time_proc_max"] == pytest.approx(0.005)
+
+
 def test_set_main_metrics_basic_single_metric():
     # Single set of size/time/count
     df = pd.DataFrame(

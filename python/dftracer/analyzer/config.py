@@ -221,6 +221,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'comm': {},
             'fetch_iter': {},
             'fetch_block': {},
+            'stall_storage': {},
             'data_loader': {
                 'init': 'func_name.str.contains("init")',
                 'item': 'func_name.str.contains("item")',
@@ -264,6 +265,8 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             # stormer arms passed on the same emitter. A DDP DLIO run that does emit comm now has
             # it attributed instead of dropped.
             'comm': 'cat == "comm"',
+            # Children only. DLIO emits no parent `stall` region.
+            'stall_storage': 'cat == "stall" & func_name == "stall.storage"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
@@ -288,6 +291,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
             'comm': 'epoch',
+            'stall_storage': 'fetch_iter',
             'compute': 'fetch_block',
             'data_loader': 'fetch_iter',
             'data_loader_fork': 'fetch_iter',
