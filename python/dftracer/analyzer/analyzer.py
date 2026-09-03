@@ -32,6 +32,49 @@ HORIZON_SOURCE_FIELDS = (
 )
 
 
+def _drained_window_span_ms(events: List[dict]) -> Optional[float]:
+    """Wall-clock span of the events a window drained, in milliseconds.
+
+    Used for the release check that per-window analysis is faster than the window it describes
+    (`T3-0-SHM-LOOP-CORONA.md` section 4j condition 4). Derived from the events themselves rather
+    than from the boundary timestamps so it stays correct when a window closes on a timeout.
+    """
+    first = None
+    last = None
+    for event in events:
+        ts = event.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        end = ts + (event.get("dur") or 0)
+        if first is None or ts < first:
+            first = ts
+        if last is None or end > last:
+            last = end
+    if first is None or last is None:
+        return None
+    return round((last - first) / 1000.0, 1)
+
+
+def _lane_occupancy() -> Optional[dict]:
+    """Ring lane fill and drop counters, when the liveflow transport is the one in use.
+
+    Section 4j found 37.6% of trace and 98.6% of control records dropped once the analyzer fell
+    behind, and none of it was visible until the run was over. Sampling at window close puts the
+    drop counters next to the analysis time that causes them.
+    """
+    try:
+        from .streaming import transport
+    except Exception:
+        return None
+    stats = getattr(transport, "lane_occupancy", None)
+    if stats is None:
+        return None
+    try:
+        return stats()
+    except Exception:
+        return None
+
+
 def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = None) -> Dict[str, int]:
     """Return the declared and remaining horizon for one completed window.
 
@@ -1114,15 +1157,28 @@ class Analyzer(abc.ABC):
                         traces_mb=round(_traces_bytes / 1024 / 1024, 1),
                     )
                     try:
-                        result = self._analyze_trace(
+                        # The fast path serves the threshold-free *-signal rule sets directly
+                        # from the traces frame and declines anything else, so a rule set it
+                        # cannot serve is slow, never wrong.  Section 4j: the full path costs
+                        # 8.7 s for an 82 ms window at 32 nodes, which is what made the agent
+                        # sample 1 window in 350 and the ring lanes overflow behind it.
+                        result = self._analyze_trace_fast(
                             traces=traces,
                             proc_view_types=proc_view_types,
-                            logical_view_types=logical_view_types,
-                            raw_stats={},
                             metric_boundaries=metric_boundaries,
-                            profiles=profiles,
-                            system_metrics=system_metrics,
+                            raw_stats={},
                         )
+                        _fastpath_used = result is not None
+                        if result is None:
+                            result = self._analyze_trace(
+                                traces=traces,
+                                proc_view_types=proc_view_types,
+                                logical_view_types=logical_view_types,
+                                raw_stats={},
+                                metric_boundaries=metric_boundaries,
+                                profiles=profiles,
+                                system_metrics=system_metrics,
+                            )
                         result.window_index = completed_window.window_index
                         horizon_metrics = window_horizon_metrics(
                             pulled_events,
@@ -1153,13 +1209,20 @@ class Analyzer(abc.ABC):
                         )
                         continue
                     _analysis_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
+                    # The release rule of section 4j: analysis_elapsed_ms must be below the
+                    # window's own wall-clock span, else the agent is sampling rather than
+                    # observing. Report both on the same line so the check needs no join.
+                    _window_span_ms = _drained_window_span_ms(pulled_events)
                     logger.info(
                         "mofka.window.analysis_complete",
                         window=completed_window.window_index,
                         analysis_elapsed_ms=_analysis_elapsed_ms,
                         drain_elapsed_ms=_drain_elapsed_ms,
+                        window_span_ms=_window_span_ms,
+                        fastpath=_fastpath_used,
                         event_count=len(pulled_events),
                         num_ranks=num_ranks,
+                        lane_occupancy=_lane_occupancy(),
                         flat_views=len(result.flat_views),
                         analysis_facts=len(result.analysis_facts),
                     )
@@ -2372,6 +2435,83 @@ class Analyzer(abc.ABC):
             raw_stats=raw_stats,
             view_types=proc_view_types,
             views=views,
+        )
+
+    # ------------------------------------------------------------------ live fast path
+    def _fastpath_mode(self) -> str:
+        """`auto` (default), `1`/`on` to force, `0`/`off` to disable.
+
+        `auto` uses the fast path only when the loaded rule set is one it can serve exactly
+        (see fastpath.FastPathPlan.build); `1` makes an unservable rule set an error rather than
+        a silent fall back to the 6-second path, which is what a scale run wants.
+        """
+        value = os.environ.get("LIVEFLOW_ANALYZER_FASTPATH", "auto").strip().lower()
+        if value in ("0", "off", "false", "no"):
+            return "off"
+        if value in ("1", "on", "true", "yes", "force"):
+            return "force"
+        return "auto"
+
+    def _get_fastpath_plan(self, proc_view_types: List[ViewType]):
+        """Resolve the plan once per analyzer, not once per window."""
+        mode = self._fastpath_mode()
+        if mode == "off":
+            return None
+        cached = getattr(self, "_fastpath_plan_cache", None)
+        key = tuple(proc_view_types)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        from .fastpath import FastPathPlan
+
+        plan = FastPathPlan.build(
+            preset=self.preset,
+            view_types=list(proc_view_types),
+            layers=self.layers,
+            fact_engine=self.fact_engine,
+        )
+        if plan is None and mode == "force":
+            raise RuntimeError(
+                "LIVEFLOW_ANALYZER_FASTPATH=1 but the loaded rule set needs metrics the fast "
+                "path does not produce; see the analyzer.fastpath.declined log line."
+            )
+        self._fastpath_plan_cache = (key, plan)
+        return plan
+
+    def _analyze_trace_fast(
+        self,
+        traces: DataFrameType,
+        proc_view_types: List[ViewType],
+        metric_boundaries: ViewMetricBoundaries,
+        raw_stats: RawStats,
+    ) -> Optional[AnalysisResult]:
+        """Per-window analysis restricted to what the *-signal rule sets read.
+
+        Returns None when the fast path cannot serve the loaded rules, so the caller runs the
+        full path.  Never returns a partial answer.
+        """
+        plan = self._get_fastpath_plan(proc_view_types)
+        if plan is None:
+            return None
+        flat_views = plan.flat_views(traces)
+        if not flat_views:
+            return None
+        analysis_facts = self._evaluate_analysis_facts(flat_views=flat_views, raw_stats=raw_stats)
+        output_flat_views, output_analysis_facts = self._materialize_output_artifacts(
+            flat_views=flat_views,
+            analysis_facts=analysis_facts,
+        )
+        return AnalysisResult(
+            _hlms={},
+            _main_views={},
+            _metric_boundaries=metric_boundaries,
+            additional_metrics={},
+            analysis_facts=output_analysis_facts,
+            checkpoint_dir=self.checkpoint_dir,
+            flat_views=output_flat_views,
+            layers=self.layers,
+            raw_stats=raw_stats,
+            view_types=list(proc_view_types),
+            views={},
         )
 
     def _analyze_trace(

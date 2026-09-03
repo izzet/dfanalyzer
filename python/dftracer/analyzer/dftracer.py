@@ -1200,13 +1200,28 @@ class DFTracerAnalyzer(Analyzer):
 
     def _handle_metadata(self, raw_traces: dd.DataFrame, hash_tables=None) -> Tuple[dd.DataFrame, dd.DataFrame, dd.DataFrame]:
         is_dask = isinstance(raw_traces, dd.DataFrame)
-        traces = raw_traces.query(f"type == {TYPE_EVENT}")
-        profile_events = raw_traces.query(f"type == {TYPE_PROFILE}")
-        system_events = raw_traces.query(f"type == {TYPE_SYSTEM}")
-        file_hashes = raw_traces.query(f"type == {TYPE_FILE_HASH}")[["name", "hash"]].groupby("hash").first()
-        host_hashes = raw_traces.query(f"type == {TYPE_HOST_HASH}")[["name", "hash"]].groupby("hash").first()
-        string_hashes = raw_traces.query(f"type == {TYPE_STRING_HASH}")[["name", "hash"]].groupby("hash").first()
-        metadata = raw_traces.query(f"type == {TYPE_METADATA}")[["name", "value"]]
+
+        # `DataFrame.query` rebuilds the frame's column resolvers on every call -- about 10 ms
+        # against this ~30-column frame -- and this method makes SEVEN of them on the same column.
+        # On the streaming path that is ~50 ms of every window spent parsing seven expressions
+        # whose answer is one integer comparison. The dask path keeps query, where the expression
+        # is compiled once into the graph rather than per call.
+        if is_dask:
+            def _of_type(type_id):
+                return raw_traces.query(f"type == {type_id}")
+        else:
+            _types = raw_traces["type"]
+
+            def _of_type(type_id):
+                return raw_traces[(_types == type_id).fillna(False).to_numpy()]
+
+        traces = _of_type(TYPE_EVENT)
+        profile_events = _of_type(TYPE_PROFILE)
+        system_events = _of_type(TYPE_SYSTEM)
+        file_hashes = _of_type(TYPE_FILE_HASH)[["name", "hash"]].groupby("hash").first()
+        host_hashes = _of_type(TYPE_HOST_HASH)[["name", "hash"]].groupby("hash").first()
+        string_hashes = _of_type(TYPE_STRING_HASH)[["name", "hash"]].groupby("hash").first()
+        metadata = _of_type(TYPE_METADATA)[["name", "value"]]
         file_hashes.index = file_hashes.index.astype(str)
         host_hashes.index = host_hashes.index.astype(str)
         string_hashes.index = string_hashes.index.astype(str)

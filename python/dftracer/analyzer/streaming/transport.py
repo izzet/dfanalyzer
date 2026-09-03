@@ -22,6 +22,10 @@ _BACKEND = os.environ.get("LIVEFLOW_TRANSPORT", "mofka").strip().lower()
 
 if _BACKEND == "mofka":
     from .mofka_io import open_consumer, open_producer  # noqa: F401
+
+    def lane_occupancy():
+        """No rings on the mofka backend, so there is nothing to report."""
+        return None
     try:
         from .mofka_io import ack_event  # noqa: F401
     except ImportError:
@@ -34,5 +38,10 @@ else:
     if _p and _p not in _sys.path:
         _sys.path.insert(0, _p)
     from liveflow_transport import open_consumer, open_producer, ack_event  # noqa: F401
+    try:
+        from liveflow_transport import lane_occupancy  # noqa: F401
+    except ImportError:
+        def lane_occupancy():  # noqa: D103
+            return None
 
-__all__ = ["open_consumer", "open_producer", "ack_event"]
+__all__ = ["open_consumer", "open_producer", "ack_event", "lane_occupancy"]
