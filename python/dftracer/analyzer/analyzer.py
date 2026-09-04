@@ -253,6 +253,94 @@ DataFrameType = Union[dd.DataFrame, pd.DataFrame]
 logger = structlog.get_logger()
 
 
+class UnresolvedTraceMetadataError(RuntimeError):
+    """Trace metadata (host/file hashes) did not resolve, so every view would be empty."""
+
+
+def _raw_stats_as_dict(raw_stats) -> dict:
+    """Normalise RawStats (dataclass) or a plain dict to a dict, for the guard below."""
+    if dc.is_dataclass(raw_stats) and not isinstance(raw_stats, type):
+        return dc.asdict(raw_stats)
+    return dict(raw_stats) if isinstance(raw_stats, dict) else {}
+
+
+def _assert_metadata_resolved(raw_stats_data: dict) -> None:
+    """FAIL LOUDLY when metadata resolution collapsed, instead of emitting schema-valid zeros.
+
+    THE FAILURE THIS CATCHES (measured 2026-08-28). On a 16-node/64-rank StorMer corpus, an offline
+    run produced `unique_host_count=0` while parsing perfectly: identical `total_event_count`
+    (1,213,709), identical `unique_process_count` (192), identical `job_time_s` to a known-good run
+    on the SAME traces. `get_unique_host_count()` is `traces["host_hash"].nunique()`, which returns 0
+    only when the column is ENTIRELY NA -- so host metadata had silently failed to attach. Every
+    host-involving groupby then yields zero groups and all views collapse to 0.0.
+
+    The run exited 0 and wrote a schema-valid metrics.json full of zeros. That is the dangerous
+    shape: an analysis that reports nothing is indistinguishable from a workload that did nothing,
+    and this project has already mistaken one for the other repeatedly (a dead env var, a stale
+    regex matching zero rows, a `_noop` optimizer context). Reporting `Total Nodes 0` against a
+    64-rank job is not a result, it is a broken read.
+
+    Known trigger class, not yet root-caused: a dftracer-utils version newer than the pinned 0.0.5
+    (0.0.12 renamed Reader->TraceReader and flattened the `args` dict). Shims exist for both
+    (`dftracer.py:12-18`, `_unflatten_args`), so the exact defeating mechanism is still open. This
+    guard is deliberately independent of that root cause -- it asserts the OUTCOME, so it keeps
+    working whatever the next incompatibility turns out to be.
+
+    Set DFANALYZER_ALLOW_UNRESOLVED_METADATA=1 to downgrade to a warning (e.g. a genuinely
+    single-host corpus with metadata intentionally stripped).
+    """
+    def _concrete(value):
+        """Return an int, or None if the value is lazy/absent.
+
+        MUST NOT use truthiness or `or` on these: at this call site the values may still be lazy
+        dask Scalars, and `bool(dask_scalar)` RAISES TypeError ("cannot be converted to a boolean
+        value"). An earlier version of this guard did `raw_stats_data.get(...) or 0` and crashed
+        every offline run at `read_stats`. Skipping lazily-valued calls is correct: the assertion
+        is a safety net, not a computation trigger, and forcing `.compute()` here would change the
+        analyzer's execution shape just to run a check.
+        """
+        if value is None or hasattr(value, "compute") or hasattr(value, "dask"):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    events = _concrete(raw_stats_data.get("total_event_count"))
+    if events is None or events <= 0:
+        return  # lazy, absent, or genuinely no events -- all different problems, none ours
+
+    broken = []
+    for name in ("unique_host_count", "unique_process_count"):
+        value = _concrete(raw_stats_data.get(name))
+        if value is not None and value <= 0:
+            broken.append(name)
+    if not broken:
+        return
+
+    detail = ", ".join("%s=0" % n for n in broken)
+    if os.environ.get("DFANALYZER_ALLOW_UNRESOLVED_METADATA", "0") == "1":
+        logger.warning("analyzer.metadata.unresolved", broken=detail, total_event_count=events,
+                       note="continuing because DFANALYZER_ALLOW_UNRESOLVED_METADATA=1")
+        return
+    raise UnresolvedTraceMetadataError(
+        "trace metadata did not resolve (%s) despite %d parsed events -- every view would be empty "
+        "and the output would be schema-valid zeros.\n"
+        "  Known cause (2026-08-28, still OPEN): host metadata does not propagate from the few "
+        "records that carry `args.hhash` (metadata/HH records) to the vast majority that do not. "
+        "Measured on a 64-rank corpus: 49 of 18,462 records carried an hhash; the rest stayed NA, "
+        "so `traces['host_hash'].nunique()` returned 0.\n"
+        "  NOT the cause, though both were suspected and eliminated: (a) a dftracer-utils version "
+        "mismatch -- `Reader` is used ONLY by load_indexed_gzip_files, the GZIP path, so plain .pfw "
+        "corpora never touch it; (b) pandas `astype(str)` on NaN -- that was MASKING this defect by "
+        "turning NA into the literal string 'nan' (which is why older runs reported "
+        "unique_host_count=1 on a 16-node job), and is now fixed to `astype(\"string\")`.\n"
+        "  Set DFANALYZER_ALLOW_UNRESOLVED_METADATA=1 to downgrade this to a warning if a zero "
+        "really is expected (e.g. a corpus with metadata deliberately stripped)."
+        % (detail, events)
+    )
+
+
 class Analyzer(abc.ABC):
     def __init__(
         self,
@@ -1565,6 +1653,7 @@ class Analyzer(abc.ABC):
                 raw_stats_data["trace_event_count"] + raw_stats_data["profile_event_count"]
             )
         raw_stats = RawStats(**raw_stats_data)
+        _assert_metadata_resolved(raw_stats_data)
         return raw_stats
 
     @abc.abstractmethod
@@ -2381,6 +2470,10 @@ class Analyzer(abc.ABC):
         if is_dask:
             with log_block("compute_views_and_raw_stats"):
                 (views, raw_stats) = dask.compute(views, raw_stats)
+            # ASSERT HERE, not at read_stats. This is the first point where raw_stats hold concrete
+            # ints; at construction time they are lazy dask Scalars and the guard silently skipped
+            # every one of them, so it never fired on the very corpus that motivated it.
+            _assert_metadata_resolved(_raw_stats_as_dict(raw_stats))
 
         # Restore checkpointed flat views if available
         checkpointed_flat_views = {}
