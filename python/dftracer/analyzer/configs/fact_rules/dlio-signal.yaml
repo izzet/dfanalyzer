@@ -44,16 +44,27 @@ rules:
     emit_mode: window
     fact_type: input_compute_signal
     required_metrics:
-      # The two actionable domains DLIO exposes, plus the app-level fetch that bounds input.
-      # There is no comm layer in the DLIO preset and no separate decode layer, so unlike halo3d
-      # this is a TWO-domain signal. reader_posix_time_proc_max is the storage-side time and needs
-      # the reader_posix layer, which requires the preset's file_purposes to be set correctly --
-      # get that wrong and this metric is silently absent rather than wrong.
+      # The actionable domains DLIO exposes, plus the app-level fetch that bounds input.
+      # reader_posix_time_proc_max is the storage-side time and needs the reader_posix layer, which
+      # requires the preset's file_purposes to be set correctly -- get that wrong and this metric
+      # is silently absent rather than wrong.
+      #
+      # comm_time_proc_max is here because THIS LIST IS THE WIRE. The fact engine builds a fact's
+      # evidence_metrics from required_metrics plus derived_metrics and nothing else, the diagnoser
+      # forwards those as key_metrics, and the planner reads
+      # `float(m.get("comm_time_proc_max", 0.0) or 0.0)` out of them. A metric the analyzer computes
+      # perfectly and this list omits reaches the planner as a measured ZERO, which is exactly what
+      # t4l_commgate measured: the barrier was annotated, the preset had the layer, both analyzer
+      # paths produced the column, and comm still arrived as 0.0000 s in all 125 decisions while the
+      # time sat in compute. Adding it is what makes the annotation reach a decision.
+      # It is also now safe as a PRESENCE requirement: the dlio preset defines the comm layer
+      # unconditionally, so the column exists whether or not a given window contains a comm region.
       - fetch_iter_time_proc_max
       - fetch_block_time_proc_max
       - stall_storage_time_proc_max
       - reader_posix_time_proc_max
       - compute_time_proc_max
+      - comm_time_proc_max
       - window_wall_time_proc_max
       - residual_time_proc_max
     derived_metrics:
