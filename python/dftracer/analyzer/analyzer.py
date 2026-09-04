@@ -32,6 +32,78 @@ HORIZON_SOURCE_FIELDS = (
 )
 
 
+class _PendingTraceEvents(deque):
+    """The drain's carry-forward queue, with a population count per pid.
+
+    `_pop_pending_event_for_window` asks this queue one question on EVERY iteration of the counted
+    drain loop: is there an event here whose pid has not yet reached its target? It answered by
+    walking itself end to end, moving every over-target event into a side deque and putting all of
+    it back, which costs O(len) per call and returns None exactly when the walk was pointless.
+
+    That is quadratic in the queue against the number of pulls, and it is what the drain's tail
+    actually is. Measured at 2 nodes with every_n=2: five windows of 62 ran out the 4 s drain grace
+    with 3.6 to 3.9 s of it inside that walk, at 347 to 1121 pulls, while the JSON decode for the
+    same windows was 110 to 408 ms. The queue fills because a batch carries the next window's
+    events too: once a rank reaches its target the rest of its events are parked here, and with
+    8 ranks and a thousand events a window that is several thousand parked events.
+
+    A count per pid answers the question in O(ranks) and leaves the walk for the case where it will
+    actually find something.
+    """
+
+    def __init__(self, iterable=()):
+        super().__init__()
+        self._counts = Counter()
+        for item in iterable:
+            self.append(item)
+
+    @staticmethod
+    def _pid(item):
+        return item[2] if isinstance(item, tuple) and len(item) > 2 else None
+
+    def _drop(self, item):
+        pid = self._pid(item)
+        remaining = self._counts.get(pid, 0)
+        if remaining <= 1:
+            self._counts.pop(pid, None)
+        else:
+            self._counts[pid] = remaining - 1
+
+    def append(self, item):
+        self._counts[self._pid(item)] += 1
+        super().append(item)
+
+    def appendleft(self, item):
+        self._counts[self._pid(item)] += 1
+        super().appendleft(item)
+
+    def extend(self, iterable):
+        for item in iterable:
+            self.append(item)
+
+    def extendleft(self, iterable):
+        for item in iterable:
+            self.appendleft(item)
+
+    def popleft(self):
+        item = super().popleft()
+        self._drop(item)
+        return item
+
+    def pop(self):
+        item = super().pop()
+        self._drop(item)
+        return item
+
+    def clear(self):
+        super().clear()
+        self._counts.clear()
+
+    def pids(self):
+        """The distinct pids currently parked here. At most one per rank plus its workers."""
+        return list(self._counts)
+
+
 def drain_settle_ms(targets_satisfied: bool, timeout_ms: int, override: Optional[int] = None) -> int:
     """How long the drain's sweep may block once the counted loop has finished.
 
@@ -929,7 +1001,7 @@ class Analyzer(abc.ABC):
             sink_events.append(event_with_window)
 
         trace_events_seen_by_pid = defaultdict(int)
-        pending_trace_events = deque()
+        pending_trace_events = _PendingTraceEvents()
 
         def _targets_satisfied(target_counts: Dict[int, int]) -> bool:
             if not target_counts:
@@ -962,6 +1034,13 @@ class Analyzer(abc.ABC):
 
         def _pop_pending_event_for_window(target_counts: Dict[int, int]):
             if not pending_trace_events:
+                return None
+            # O(ranks). If every pid parked here is already at its target the walk below can only
+            # put back exactly what it took, so it is skipped rather than paid once per pull.
+            if all(
+                _event_exceeds_target(pid, target_counts)
+                for pid in pending_trace_events.pids()
+            ):
                 return None
             skipped_events = deque()
             selected_event = None
