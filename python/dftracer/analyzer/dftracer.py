@@ -777,6 +777,14 @@ class DFTracerAnalyzer(Analyzer):
         traces = self._rename_columns(traces)
         traces = set_size_bins(traces)
         traces = self.postread_trace(traces=traces, view_types=view_types)
+        # THIS SUBCLASS OVERRIDES handle_stream_events, so the base class's call to
+        # assign_window_epochs never ran and every POSIX read stayed epoch-less. Measured on
+        # t4m_storagegate2: node_read_bytes and node_read_busy_s arrived at the planner on all 124
+        # decisions and every one of them was 0.0, which is the same shape as the metric being
+        # absent and is exactly the failure mode the whole barrier-attribution wire was audited
+        # for. The call belongs on both paths into the frame, not on the one the streaming agent
+        # does not take.
+        traces = self.assign_window_epochs(traces)
 
         # Standardize profiles (same pipeline as batch _standardize_profiles,
         # but calling each step directly on pandas instead of map_partitions).
