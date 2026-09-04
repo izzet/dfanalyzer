@@ -1036,6 +1036,28 @@ class Analyzer(abc.ABC):
         ) -> None:
             if not isinstance(normalized_event, dict):
                 return
+            # METADATA IS NOT WINDOW-SCOPED, and treating it as if it were is what emptied the
+            # reader_posix layer for the whole of this project's streaming history.
+            #
+            # dftracer emits an FH record once, when a file is first opened. For DLIO that is
+            # during loader construction, BEFORE the first window.start, so `current_window` is
+            # None for every one of them and the `return` below dropped all 504 of a lane's file
+            # hashes. Every pread afterwards then carried a `file_hash` that resolved to nothing,
+            # `file_name` stayed NA, `_fix_file_posix_category` could not tag a single row, and
+            # `reader_posix` was empty in every window of every run. Fed the same events with the
+            # FH records present, the identical frame code resolves all 2001 preads of a sample and
+            # categorises them `posix_reader_lustre`, so nothing downstream was ever wrong.
+            #
+            # A hash-to-name mapping belongs to the RUN, not to a window, so it is kept aside and
+            # replayed into every window. Deduplicated by (type, hash, name): the tables hold one
+            # row per file, host and string, bounded by the corpus rather than by the run.
+            _etype = normalized_event.get("type")
+            if _etype is not None and int(_etype) != 0:      # 0 == TYPE_EVENT
+                stream_metadata_events.setdefault(
+                    (int(_etype), normalized_event.get("hash"), normalized_event.get("name")),
+                    dict(normalized_event),
+                )
+                return
             event_pid = normalized_event.get(process_key)
             if event_pid is None:
                 logger.warning("mofka.trace_event.missing_pid", name=normalized_event.get("name"))
@@ -1059,6 +1081,9 @@ class Analyzer(abc.ABC):
 
         trace_events_seen_by_pid = defaultdict(int)
         pending_trace_events = _PendingTraceEvents()
+        # Hash tables seen so far in this run, replayed into every window drain. See the note in
+        # _append_trace_event_to_window for why they cannot be window-scoped.
+        stream_metadata_events: Dict[tuple, dict] = {}
 
         def _targets_satisfied(target_counts: Dict[int, int]) -> bool:
             if not target_counts:
@@ -1442,8 +1467,13 @@ class Analyzer(abc.ABC):
                         top_names=dict(name_sample.most_common(10)),
                     )
 
+                    # Replay the run's hash tables into this window. They are not events and
+                    # carry no window, but without them every file_hash in the window resolves to
+                    # nothing. Prepended rather than appended so the frame's first rows establish
+                    # the string dtypes for the merge keys.
                     traces, profiles, system_metrics = self.handle_stream_events(
-                        events=pulled_events,
+                        events=(list(stream_metadata_events.values()) + pulled_events
+                                if stream_metadata_events else pulled_events),
                         view_types=proc_view_types,
                         extra_columns=extra_columns,
                     )
