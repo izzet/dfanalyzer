@@ -32,6 +32,20 @@ HORIZON_SOURCE_FIELDS = (
 )
 
 
+def drain_settle_ms(targets_satisfied: bool, timeout_ms: int, override: Optional[int] = None) -> int:
+    """How long the drain's sweep may block once the counted loop has finished.
+
+    The sweep drains what the consumer can hand over right now. Blocking for it can only end two
+    ways: a batch arrives whose first event is past the window boundary and is pushed straight back
+    onto pending, or nothing arrives. Neither adds an event to this window, so when every rank's
+    target is already met the wait is dead time paid once per window. When the counted loop instead
+    ran out of grace with targets unmet, records really are still in flight and waiting is correct.
+    """
+    if override is not None:
+        return max(0, override)
+    return 0 if targets_satisfied else max(0, timeout_ms)
+
+
 def _drained_window_span_ms(events: List[dict]) -> Optional[float]:
     """Wall-clock span of the events a window drained, in milliseconds.
 
@@ -680,6 +694,26 @@ class Analyzer(abc.ABC):
 
         control_wait_timeout_ms = 1000
         trace_drain_timeout_ms = 100
+        # HOW LONG THE SWEEP MAY BLOCK ONCE EVERY RANK'S TARGET IS ALREADY MET.
+        #
+        # The sweep's job, in its own comment below, is "drain whatever the consumer can hand over
+        # right now". It was blocking for up to trace_drain_timeout_ms to do it, and that wait can
+        # only ever end one of two ways: a batch arrives whose first event is past the boundary and
+        # is immediately pushed back onto pending, or nothing arrives and the loop breaks. Neither
+        # outcome adds an event to this window. So whenever the counted loop finished because every
+        # target was met -- which is the normal case, since the writer publishes each trace record
+        # BEFORE the boundary that counts it -- the wait is dead time, paid once per window.
+        #
+        # When the counted loop instead ran out of grace with targets UNMET, records really are
+        # still in flight and waiting is the right thing, so the timeout stays in force there.
+        # LIVEFLOW_DRAIN_SETTLE_MS forces a value either way, which is what the ablation arm uses.
+        drain_settle_ms_override = os.environ.get("LIVEFLOW_DRAIN_SETTLE_MS")
+        try:
+            drain_settle_ms_override = (
+                int(drain_settle_ms_override) if drain_settle_ms_override is not None else None
+            )
+        except ValueError:
+            drain_settle_ms_override = None
         # pending_trace_events deque holds buffered events from batch splits
         # (used by both target_counts and timestamp-based drain paths)
 
@@ -922,6 +956,15 @@ class Analyzer(abc.ABC):
 
                 for completed_window in completed_windows:
                     _window_wall_start = time.perf_counter()
+                    # Where the drain's time goes, split into the four things it can be doing.
+                    # `drain_elapsed_ms` alone cannot say whether the analyzer was waiting for a
+                    # rank that had not written yet, waiting out a poll timeout for a batch that
+                    # was never coming, or decoding JSON it already had.
+                    _dstat = {
+                        "counted_ms": 0.0, "sweep_ms": 0.0, "carry_ms": 0.0, "decode_ms": 0.0,
+                        "polls_data": 0, "polls_empty": 0, "empty_wait_ms": 0.0,
+                        "settle_ms": -1,
+                    }
                     logger.info(
                         "mofka.window.block",
                         window=completed_window.window_index,
@@ -977,10 +1020,18 @@ class Analyzer(abc.ABC):
                                 remaining_ms = min(remaining_ms, trace_drain_timeout_ms)
                             if remaining_ms <= 0:
                                 break
+                            _t0 = time.perf_counter()
                             trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                            _waited = (time.perf_counter() - _t0) * 1000.0
+                            _dstat["counted_ms"] += _waited
                             if trace_mofka_event is None:
+                                _dstat["polls_empty"] += 1
+                                _dstat["empty_wait_ms"] += _waited
                                 continue
+                            _dstat["polls_data"] += 1
+                            _t0 = time.perf_counter()
                             unpacked = _normalize_trace_event(trace_mofka_event)
+                            _dstat["decode_ms"] += (time.perf_counter() - _t0) * 1000.0
                             trace_future = trace_consumer.pull()
                             for normalized_event, event_ts, event_pid in unpacked:
                                 if _event_exceeds_target(event_pid, target_counts):
@@ -1019,23 +1070,41 @@ class Analyzer(abc.ABC):
                         # `break` on an empty pull rather than `continue`: the records are already
                         # buffered by the time the boundary arrives, so there is nothing to wait
                         # for, and waiting out the full grace on every window would add ~30 s each.
+                        settle_ms = drain_settle_ms(
+                            targets_satisfied=_targets_satisfied(target_counts),
+                            timeout_ms=trace_drain_timeout_ms,
+                            override=drain_settle_ms_override,
+                        )
+                        _dstat["settle_ms"] = settle_ms
                         past_boundary = False
                         while not past_boundary:
                             remaining_ms = int(
                                 max(
                                     0.0,
                                     min(
-                                        float(trace_drain_timeout_ms),
+                                        float(settle_ms),
                                         (drain_deadline - time.monotonic()) * 1000.0,
                                     ),
                                 )
                             )
-                            if remaining_ms <= 0:
+                            # A zero settle still DRAINS: shm_io.Consumer._next reads every lane
+                            # into its buffer before it consults the deadline, so a non-blocking
+                            # pull returns everything already in the ring and only then None.
+                            # Breaking on remaining_ms <= 0 would skip that drain entirely.
+                            if settle_ms > 0 and remaining_ms <= 0:
                                 break
+                            _t0 = time.perf_counter()
                             trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                            _waited = (time.perf_counter() - _t0) * 1000.0
+                            _dstat["sweep_ms"] += _waited
                             if trace_mofka_event is None:
+                                _dstat["polls_empty"] += 1
+                                _dstat["empty_wait_ms"] += _waited
                                 break
+                            _dstat["polls_data"] += 1
+                            _t0 = time.perf_counter()
                             unpacked = _normalize_trace_event(trace_mofka_event)
+                            _dstat["decode_ms"] += (time.perf_counter() - _t0) * 1000.0
                             trace_future = trace_consumer.pull()
                             for normalized_event, event_ts, event_pid in unpacked:
                                 if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
@@ -1052,6 +1121,7 @@ class Analyzer(abc.ABC):
                                     start_counts=start_counts,
                                 )
 
+                        _t0 = time.perf_counter()
                         carried_events = deque()
                         while pending_trace_events:
                             normalized_event, event_ts, event_pid = pending_trace_events.popleft()
@@ -1066,6 +1136,7 @@ class Analyzer(abc.ABC):
                                 start_counts=start_counts,
                             )
                         pending_trace_events.extend(carried_events)
+                        _dstat["carry_ms"] = (time.perf_counter() - _t0) * 1000.0
                     else:
                         can_drain_trace_stream = True
                         drain_deadline = (
@@ -1132,10 +1203,27 @@ class Analyzer(abc.ABC):
                     cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
                     name_sample = Counter(e.get("name", "?") for e in pulled_events)
                     _drain_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
+                    # True skew at window close, on the application's own clock: the spread of
+                    # the ranks' own window.stop timestamps. This is the part of the wait that is
+                    # the workload's and cannot be engineered away from here.
+                    _by_pid = completed_window.boundary_ts_ns_by_pid or {}
+                    _skew_ms = (
+                        round((max(_by_pid.values()) - min(_by_pid.values())) / 1e6, 2)
+                        if len(_by_pid) > 1 else None
+                    )
                     logger.info(
                         "mofka.window.drain_summary",
                         window=completed_window.window_index,
                         drain_elapsed_ms=_drain_elapsed_ms,
+                        rank_skew_ms=_skew_ms,
+                        counted_ms=round(_dstat["counted_ms"], 1),
+                        sweep_ms=round(_dstat["sweep_ms"], 1),
+                        carry_ms=round(_dstat["carry_ms"], 1),
+                        decode_ms=round(_dstat["decode_ms"], 1),
+                        polls_data=_dstat["polls_data"],
+                        polls_empty=_dstat["polls_empty"],
+                        empty_wait_ms=round(_dstat["empty_wait_ms"], 1),
+                        settle_ms=_dstat["settle_ms"],
                         event_count=len(pulled_events),
                         target_counts=target_counts,
                         seen_counts={pid: trace_events_seen_by_pid.get(pid, 0) for pid in sorted(target_counts)},

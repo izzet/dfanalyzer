@@ -93,6 +93,12 @@ class CompletedWindowBoundary:
     ranks_received: int
     events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
     start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    # Each rank's own close timestamp, on the APPLICATION clock. The spread across ranks is the
+    # real skew at window close. It cannot be recovered from when the analyzer logged each
+    # boundary, because the analyzer processes boundaries one at a time on the same thread that
+    # runs the drain and the analysis, so a slow window makes the next window's boundaries appear
+    # to arrive in a burst that has nothing to do with the application.
+    boundary_ts_ns_by_pid: Dict[int, int] = dc.field(default_factory=dict)
 
 
 @dc.dataclass
@@ -102,6 +108,7 @@ class _PendingWindowBoundary:
     ranks_seen: Set[int] = dc.field(default_factory=set)
     events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
     start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    boundary_ts_ns_by_pid: Dict[int, int] = dc.field(default_factory=dict)
 
 
 class WindowTracker:
@@ -206,6 +213,8 @@ class WindowTracker:
             pending.ranks_seen.add(pid)
         if boundary_ts_ns > pending.boundary_ts_ns:
             pending.boundary_ts_ns = boundary_ts_ns
+        if boundary_ts_ns > 0:
+            pending.boundary_ts_ns_by_pid[pid] = boundary_ts_ns
         if events_written is not None and events_written > 0:
             pending.events_written_by_pid[pid] = events_written
 
@@ -221,6 +230,7 @@ class WindowTracker:
                     ranks_received=len(next_pending.ranks_seen),
                     events_written_by_pid=dict(next_pending.events_written_by_pid),
                     start_events_written_by_pid=dict(next_pending.start_events_written_by_pid),
+                    boundary_ts_ns_by_pid=dict(next_pending.boundary_ts_ns_by_pid),
                 )
             )
             self.pending_by_window.pop(self.next_window_to_emit, None)
