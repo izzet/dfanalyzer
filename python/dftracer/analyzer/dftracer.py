@@ -1278,6 +1278,24 @@ class DFTracerAnalyzer(Analyzer):
             file_hashes = _prefer_index(file_hashes, idx_file, "file")
             host_hashes = _prefer_index(host_hashes, idx_host, "host")
             string_hashes = _prefer_index(string_hashes, idx_string, "string")
+        # THE HASH TABLES MUST SURVIVE THE WINDOW, on the streaming path only.
+        #
+        # dftracer emits an FH record ONCE, when a file is first touched. Measured on
+        # t4m_storagegate4: all 504 FH records of a lane arrive in the first 7179 lines and the
+        # remaining 342,252 preads carry only a hash. A per-window drain is therefore a frame full
+        # of reads whose file_hash resolves to nothing, `file_name` stays NA, and
+        # `_fix_file_posix_category` cannot tag a single row -- so `reader_posix` is EMPTY in every
+        # window after the first, which is why node_read_bytes reached the planner as 0.0 on all
+        # 125 windows of that run while the broad `posix` layer carried 11.56 GB per window.
+        #
+        # The batch path never saw this because it reads the whole trace at once. Accumulating is
+        # the minimum that makes a window-at-a-time reader equivalent to it. The tables are small
+        # (one row per file, per host, per string) and bounded by the corpus, not by the run.
+        if not is_dask:
+            file_hashes = self._merge_seen_hashes("_seen_file_hashes", file_hashes)
+            host_hashes = self._merge_seen_hashes("_seen_host_hashes", host_hashes)
+            string_hashes = self._merge_seen_hashes("_seen_string_hashes", string_hashes)
+
         traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
         profile_events = self._attach_metadata(profile_events, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes
@@ -1287,6 +1305,25 @@ class DFTracerAnalyzer(Analyzer):
         self._profile_events = profile_events
         self._system_events = system_events
         return traces, profile_events, system_events
+
+    def _merge_seen_hashes(self, attr: str, table):
+        """Union this window's hash table with every one seen before, newest winning.
+
+        Streaming only. A hash maps to one name for the life of a run, so a union cannot conflict;
+        the new table is preferred on a collision purely so a re-registered hash takes the fresher
+        name. Kept per analyzer instance, which is per node agent, which is the same lifetime as
+        the run it is watching.
+        """
+        prev = getattr(self, attr, None)
+        if table is None or not len(getattr(table, "index", ())):
+            merged = prev if prev is not None else table
+        elif prev is None or not len(prev.index):
+            merged = table
+        else:
+            extra = prev[~prev.index.isin(table.index)]
+            merged = pd.concat([table, extra]) if len(extra.index) else table
+        setattr(self, attr, merged)
+        return merged
 
     @staticmethod
     def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):
