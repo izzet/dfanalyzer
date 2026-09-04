@@ -324,8 +324,10 @@ from .analysis_utils import (
 )
 from .config import CHECKPOINT_VIEWS, HASH_CHECKPOINT_NAMES, AnalyzerPresetConfig, FactsConfig
 from .constants import (
+    COL_CATEGORY,
     COL_COUNT,
     COL_FILE_NAME,
+    COL_FUNC_NAME,
     COL_HOST_NAME,
     COL_PROC_NAME,
     COL_TIME_END,
@@ -1841,6 +1843,72 @@ class Analyzer(abc.ABC):
     ) -> dict:
         return event
 
+    @staticmethod
+    def assign_window_epochs(traces: pd.DataFrame) -> pd.DataFrame:
+        """Give epoch-less rows the epoch of the window they fall inside, by TIMESTAMP RANGE.
+
+        THE PROBLEM. The high-level views group by every view type at once and pandas drops a row
+        whose key is NA in any of them, so a row carrying no `epoch` is absent from EVERY view. The
+        rows that carry no epoch are exactly the ones that matter for storage: POSIX reads are
+        emitted by the tracer's syscall interception on reader threads and forked DataLoader
+        workers, which never call `dft_ai.update(epoch=...)`, so `reader_posix_*` came out NA and
+        the planner had no measurement of what the storage layer was doing. That is
+        ANALYZER-FASTPATH.md section 4, and it is the metric the barrier-attribution rule (T3-0
+        section 4m, user decision option 1) needs in order to compare a node's read bandwidth
+        against its measured Lustre ceiling.
+
+        THE FIX, and why it is a range and not a tag. The application cannot tag a syscall it does
+        not make. But every window is bracketed by `window.start` and `window.stop` events which DO
+        carry the epoch, on the same pid, and the `window.stop` event is duration-bearing, so its
+        [time_start, time_end] IS the window's span on the application's own clock. A row of that
+        pid whose start falls inside that span belongs to that window, whatever thread emitted it.
+
+        DELIBERATELY DIFFERENT FROM `_set_epochs`, which exists on the batch path and cannot be
+        reused here. That one begins `df["epoch"] = pd.NA` and rebuilds every epoch from the
+        `pipeline`/`epoch*` REGIONS. Those regions are emitted at epoch start and stop, so a single
+        window drain contains none of them, and running it here would blank the epoch on every row
+        instead of filling the missing ones. This never overwrites an epoch the application set: it
+        only fills where the value is absent, so an application tag always wins.
+
+        No-op, at the cost of two column checks, when there are no window rows or nothing is
+        missing.
+        """
+        if traces is None or getattr(traces, "empty", True):
+            return traces
+        cols = traces.columns
+        needed = (COL_CATEGORY, COL_FUNC_NAME, COL_TIME_START, COL_TIME_END, "pid", "epoch")
+        if any(c not in cols for c in needed):
+            return traces
+
+        missing = traces["epoch"].isna()
+        if not missing.any():
+            return traces
+
+        stops = traces[
+            (traces[COL_CATEGORY] == "window")
+            & (traces[COL_FUNC_NAME] == "window.stop")
+            & traces["epoch"].notna()
+        ]
+        if stops.empty:
+            return traces
+
+        # At most one row per rank per window, so this loop is over ranks-per-node and not over
+        # events. Vectorised inside, which is what keeps it inside the fast path's budget.
+        time_start = traces[COL_TIME_START]
+        pids = traces["pid"]
+        filled = 0
+        for pid, start, end, epoch in zip(
+            stops["pid"], stops[COL_TIME_START], stops[COL_TIME_END], stops["epoch"]
+        ):
+            mask = missing & (pids == pid) & (time_start >= start) & (time_start <= end)
+            if mask.any():
+                traces.loc[mask, "epoch"] = epoch
+                missing = missing & ~mask
+                filled += int(mask.sum())
+        if filled:
+            logger.debug("analyzer.window.epoch_assigned", rows=filled, windows=len(stops))
+        return traces
+
     def handle_stream_events(
         self,
         events: List[dict],
@@ -1849,7 +1917,11 @@ class Analyzer(abc.ABC):
     ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """Split and standardize stream events into (traces, profiles, system_metrics)."""
         traces = pd.DataFrame(events)
-        return self.postread_trace(traces=traces, view_types=view_types), None, None
+        traces = self.postread_trace(traces=traces, view_types=view_types)
+        # Before either analysis path sees the frame, so the fast path and the full path get the
+        # same rows and neither has to know about this.
+        traces = self.assign_window_epochs(traces)
+        return traces, None, None
 
     def compute_job_time(self, traces: dd.DataFrame) -> float:
         """Computes the total job execution time from the traces.
