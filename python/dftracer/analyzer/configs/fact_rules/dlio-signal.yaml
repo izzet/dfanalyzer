@@ -92,6 +92,19 @@ rules:
       # than as a bandwidth of zero.
       node_read_bytes: "fillna0(reader_posix_read_size_sum)"
       node_read_busy_s: "fillna0(reader_posix_read_time_proc_max)"
+      # DIAGNOSTIC, and it discriminates between the only two remaining explanations for
+      # node_read_bytes arriving as 0.0 on every window of t4m_storagegate2 and _3.
+      #
+      #   If the WINDOW-EPOCH FILL is not working, every POSIX row is still dropped from the
+      #   epoch-keyed view and BOTH of these are zero.
+      #   If the fill works and the READER CATEGORISATION is the problem -- `reader_posix` needs
+      #   `_reader` in the cat, which `_fix_file_posix_category` only writes when the file's path
+      #   matches a configured purpose, and on the streaming path file names may still be hashes --
+      #   then the broad `posix` layer is NON-ZERO while `reader_posix` is zero.
+      #
+      # One run separates them. Remove once the answer is recorded in T3-0 section 4m.
+      node_read_bytes_any: "fillna0(posix_read_size_sum)"
+      node_read_busy_s_any: "fillna0(posix_read_time_proc_max)"
     when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
     severity_score: "1.0"
     confidence: "1.0"
