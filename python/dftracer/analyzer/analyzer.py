@@ -32,50 +32,77 @@ HORIZON_SOURCE_FIELDS = (
 )
 
 
-class _PendingTraceEvents(deque):
-    """The drain's carry-forward queue, with a population count per pid.
+class _PendingTraceEvents:
+    """The drain's carry-forward queue, bucketed per pid.
 
-    `_pop_pending_event_for_window` asks this queue one question on EVERY iteration of the counted
-    drain loop: is there an event here whose pid has not yet reached its target? It answered by
-    walking itself end to end, moving every over-target event into a side deque and putting all of
-    it back, which costs O(len) per call and returns None exactly when the walk was pointless.
+    WHAT IT IS FOR. A pulled trace batch carries the next window's events as well as this one's, so
+    once a rank reaches its `events_written` target the rest of its events are parked here and
+    handed to the window that claims them. `_pop_pending_event_for_window` asks for the oldest
+    parked event whose pid has NOT yet reached its target, once per iteration of the counted loop.
 
-    That is quadratic in the queue against the number of pulls, and it is what the drain's tail
-    actually is. Measured at 2 nodes with every_n=2: five windows of 62 ran out the 4 s drain grace
-    with 3.6 to 3.9 s of it inside that walk, at 347 to 1121 pulls, while the JSON decode for the
-    same windows was 110 to 408 ms. The queue fills because a batch carries the next window's
-    events too: once a rank reaches its target the rest of its events are parked here, and with
-    8 ranks and a thousand events a window that is several thousand parked events.
+    WHY IT IS NOT A PLAIN DEQUE. That question used to be answered by walking a single deque end to
+    end, moving every over-target event into a side deque and putting all of it back. Two ways that
+    is quadratic, and both were measured at 2 nodes:
 
-    A count per pid answers the question in O(ranks) and leaves the walk for the case where it will
-    actually find something.
+      the walk returns None       every pull pays O(len) to learn nothing. Five windows of 62 at
+                                  every_n=2 ran out the whole 4 s drain grace this way, 3.6 to
+                                  3.9 s of it in the walk, at 347 to 1121 pulls.
+      the walk returns an event   if the eligible pid's events sit behind thousands of over-target
+                                  ones, every single pop walks past all of them. Windows with
+                                  ZERO pulls and ZERO decode took 12.1 s to assemble 4147 events,
+                                  which is that and nothing else.
+
+    Fixing only the first left the second, so this fixes the shape instead. One deque per pid, each
+    item stamped with a sequence number, and selection is a scan over the PIDS rather than over the
+    events: at most one bucket per rank plus its workers. Insertion order across pids is preserved
+    by the stamp, so the event handed back is the same one the walk would have chosen.
     """
 
+    __slots__ = ("_by_pid", "_len", "_next_seq", "_next_left_seq")
+
     def __init__(self, iterable=()):
-        super().__init__()
-        self._counts = Counter()
+        self._by_pid = {}
+        self._len = 0
+        self._next_seq = 0
+        self._next_left_seq = -1
         for item in iterable:
             self.append(item)
+
+    # -- deque surface the drain already uses ---------------------------------------------
+    def __len__(self):
+        return self._len
+
+    def __bool__(self):
+        return self._len > 0
+
+    def __iter__(self):
+        """In insertion order across pids, so a caller can compare against a plain deque."""
+        merged = []
+        for bucket in self._by_pid.values():
+            merged.extend(bucket)
+        merged.sort(key=lambda entry: entry[0])
+        return iter(item for _seq, item in merged)
 
     @staticmethod
     def _pid(item):
         return item[2] if isinstance(item, tuple) and len(item) > 2 else None
 
-    def _drop(self, item):
-        pid = self._pid(item)
-        remaining = self._counts.get(pid, 0)
-        if remaining <= 1:
-            self._counts.pop(pid, None)
-        else:
-            self._counts[pid] = remaining - 1
+    def _bucket(self, pid):
+        bucket = self._by_pid.get(pid)
+        if bucket is None:
+            bucket = deque()
+            self._by_pid[pid] = bucket
+        return bucket
 
     def append(self, item):
-        self._counts[self._pid(item)] += 1
-        super().append(item)
+        self._bucket(self._pid(item)).append((self._next_seq, item))
+        self._next_seq += 1
+        self._len += 1
 
     def appendleft(self, item):
-        self._counts[self._pid(item)] += 1
-        super().appendleft(item)
+        self._bucket(self._pid(item)).appendleft((self._next_left_seq, item))
+        self._next_left_seq -= 1
+        self._len += 1
 
     def extend(self, iterable):
         for item in iterable:
@@ -85,23 +112,51 @@ class _PendingTraceEvents(deque):
         for item in iterable:
             self.appendleft(item)
 
+    def clear(self):
+        self._by_pid.clear()
+        self._len = 0
+
+    def _take(self, pid, from_left):
+        bucket = self._by_pid[pid]
+        entry = bucket.popleft() if from_left else bucket.pop()
+        if not bucket:
+            del self._by_pid[pid]
+        self._len -= 1
+        return entry[1]
+
     def popleft(self):
-        item = super().popleft()
-        self._drop(item)
-        return item
+        if not self._len:
+            raise IndexError("pop from an empty _PendingTraceEvents")
+        pid = min(self._by_pid, key=lambda key: self._by_pid[key][0][0])
+        return self._take(pid, from_left=True)
 
     def pop(self):
-        item = super().pop()
-        self._drop(item)
-        return item
+        if not self._len:
+            raise IndexError("pop from an empty _PendingTraceEvents")
+        pid = max(self._by_pid, key=lambda key: self._by_pid[key][-1][0])
+        return self._take(pid, from_left=False)
 
-    def clear(self):
-        super().clear()
-        self._counts.clear()
-
+    # -- what the drain actually wants ----------------------------------------------------
     def pids(self):
-        """The distinct pids currently parked here. At most one per rank plus its workers."""
-        return list(self._counts)
+        """The distinct pids currently parked. At most one per rank plus its workers."""
+        return list(self._by_pid)
+
+    def pop_first_under_target(self, is_over_target):
+        """The oldest parked event whose pid is not yet at its target, or None.
+
+        O(pids), not O(events). This is the whole reason the class exists.
+        """
+        best_pid = None
+        best_seq = None
+        for pid, bucket in self._by_pid.items():
+            if is_over_target(pid):
+                continue
+            seq = bucket[0][0]
+            if best_seq is None or seq < best_seq:
+                best_pid, best_seq = pid, seq
+        if best_pid is None:
+            return None
+        return self._take(best_pid, from_left=True)
 
 
 def drain_settle_ms(targets_satisfied: bool, timeout_ms: int, override: Optional[int] = None) -> int:
@@ -1033,28 +1088,15 @@ class Analyzer(abc.ABC):
             )
 
         def _pop_pending_event_for_window(target_counts: Dict[int, int]):
-            if not pending_trace_events:
-                return None
-            # O(ranks). If every pid parked here is already at its target the walk below can only
-            # put back exactly what it took, so it is skipped rather than paid once per pull.
-            if all(
-                _event_exceeds_target(pid, target_counts)
-                for pid in pending_trace_events.pids()
-            ):
-                return None
-            skipped_events = deque()
-            selected_event = None
-            while pending_trace_events:
-                candidate = pending_trace_events.popleft()
-                _, _, event_pid = candidate
-                if _event_exceeds_target(event_pid, target_counts):
-                    skipped_events.append(candidate)
-                    continue
-                selected_event = candidate
-                break
-            while skipped_events:
-                pending_trace_events.appendleft(skipped_events.pop())
-            return selected_event
+            """The oldest parked event whose pid is still under its target, or None.
+
+            The queue answers this in O(pids). It used to be a walk over the events, which is
+            what made a window of 4147 parked events take 12.1 s to assemble with zero pulls and
+            zero decode.
+            """
+            return pending_trace_events.pop_first_under_target(
+                lambda event_pid: _event_exceeds_target(event_pid, target_counts)
+            )
 
         try:
             control_future = control_consumer.pull()
