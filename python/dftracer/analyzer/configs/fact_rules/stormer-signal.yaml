@@ -30,14 +30,38 @@ rules:
     emit_mode: window
     fact_type: fourway_signal
     required_metrics:
+      # THIS LIST IS THE WIRE (dlio-signal.yaml says why at length). Evidence metrics are built
+      # from required_metrics plus derived_metrics and nothing else, so a metric the analyzer
+      # computes perfectly and this list omits reaches the planner as ABSENT.
+      #
+      # stall_storage was exactly that on `stcz2_loop_r1` (T3-0 4s.41, 4s.42): the workload emits
+      # `stall.storage` at every window boundary, the preset defines the layer, the diagnoser's own
+      # flat views carry the column with real values -- 1.9 to 5.3 s in the windows holding the
+      # periodic stall against 0.013 s in the others -- and the planner logged
+      # `domain_exposure_fallback` on all 14 windows and priced the input domain from `fetch_iter`
+      # at a median 0.041 s instead. Four of fourteen windows reached a candidate, and none moved.
       - fetch_iter_time_proc_max
+      - stall_storage_time_proc_max
+      - stall_decode_time_proc_max
       - reader_posix_time_proc_max
       - reader_decode_time_proc_max
       - comm_time_proc_max
       - compute_time_proc_max
+      - window_wall_time_proc_max
     derived_metrics:
-      # wall = the exposed step. Same definition as halo3d.yaml.
-      active_time: "fillna0(fetch_iter_time_proc_max) + fillna0(comm_time_proc_max) + fillna0(compute_time_proc_max)"
+      # THE WALL IS THE WALL, not the sum of the domains (T3-0 4s.41).
+      #
+      # `fetch + comm + compute` looks like a decomposition and is not one on this preset:
+      # `compute_time_proc_max` INCLUDES comm, which is why `domains_from_metrics` returns
+      # `compute - comm`, so that sum counts comm twice. The planner's residual is
+      # `wall - sum(domains)` = `(fetch + comm + compute) - (fetch + compute)` = comm EXACTLY, and
+      # the record shows it to four decimals in all 14 windows of `stcz2_loop_r1`. comm then won
+      # the argmax as `unattributed`, which owns no knob, and ten of the fourteen windows declined
+      # for a reason that was arithmetic rather than measured.
+      #
+      # dlio-signal.yaml has used the real wall since the same defect was found there; this is the
+      # same fix, and it makes the residual an honest measure of what is not attributed.
+      active_time: "fillna0(window_wall_time_proc_max)"
     when: "active_time > 0"      # trivially true (a window ran) -> NOT a domain gate.
     severity_score: "1.0"
     confidence: "1.0"
