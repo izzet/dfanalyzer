@@ -377,7 +377,17 @@ DOMAIN_VECTOR_COLUMNS = tuple(
     for suffix in DOMAIN_VECTOR_SUFFIXES
     for name in ("domain_input", "domain_decode", "domain_comm", "domain_compute",
                  "domain_device", "residual", "window_wall")
-) + ("domain_coherent", "domain_input_spread_time_proc", "domain_procs_active")
+) + ("domain_coherent", "domain_input_spread_time_proc", "domain_procs_active",
+     # ORDER STATISTICS OF THE PER-PROCESS INPUT EXPOSURE, in seconds, over the processes that ran
+     # the window. The scalar spread cannot tell TWO starved ranks from a genuinely input-bound
+     # run, and that distinction decided whether the 2026-09-08 StorMer candidate was a workload
+     # property or our own oversubscription: on `stgi_capacity_gate1` the same two of eight ranks
+     # carry 5 to 23 s per window while the other six sit at 0.3 s, so `p1` and `p2` are large and
+     # `med` is not. Published because the judge verdict of 2026-09-08 requires the sorted per-rank
+     # vector wherever an input domain is claimed, and because `p1 - p2` is the planner's payoff
+     # bound when it relieves the critical rank.
+     "domain_input_time_proc_p1", "domain_input_time_proc_p2",
+     "domain_input_time_proc_med", "domain_input_time_proc_min")
 
 
 def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -451,6 +461,28 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
         out["domain_input_spread_time_proc"] = np.nan_to_num(
             np.nanmax(spread, axis=1) - np.nanmin(spread, axis=1), nan=0.0)
     out["domain_procs_active"] = n_active
+    # The sorted per-process input exposure, reported as four order statistics. See the note on
+    # DOMAIN_VECTOR_COLUMNS. `p1` is the critical rank's own exposure and equals crit's
+    # input+decode; `med` is the typical rank's and equals typ's; `p2` is what makes the shape of
+    # the distribution legible, because `p1` large with `med` small and `p2` large is a small set
+    # of starved ranks, while `p1` close to `med` is a workload whose ranks all wait.
+    p1 = np.zeros(n_groups)
+    p2 = np.zeros(n_groups)
+    med = np.zeros(n_groups)
+    lo = np.zeros(n_groups)
+    for g in range(n_groups):
+        vals = np.sort(order[g][np.flatnonzero(active[g])]) if active[g].any() \
+            else np.sort(order[g])
+        if vals.size == 0:
+            continue
+        p1[g] = vals[-1]
+        p2[g] = vals[-2] if vals.size > 1 else vals[-1]
+        med[g] = vals[(vals.size - 1) // 2]
+        lo[g] = vals[0]
+    out["domain_input_time_proc_p1"] = p1
+    out["domain_input_time_proc_p2"] = p2
+    out["domain_input_time_proc_med"] = med
+    out["domain_input_time_proc_min"] = lo
     out["domain_coherent"] = np.ones(n_groups, dtype=float)
     return out
 
@@ -534,6 +566,8 @@ def set_window_decomposition_metrics(
         columns["domain_input_spread_time_proc"] = 0.0
         columns["domain_procs_active"] = 1.0
         columns["domain_coherent"] = 1.0
+        for name in ("p1", "p2", "med", "min"):
+            columns["domain_input_time_proc_%s" % name] = input_time + decode_time
     else:
         # No per-process matrices reached us (the full analysis path, which builds each view from
         # already-aggregated per-layer maxima). Publish the columns so the wire contract is the
@@ -552,6 +586,8 @@ def set_window_decomposition_metrics(
         columns["domain_input_spread_time_proc"] = 0.0
         columns["domain_procs_active"] = 0.0
         columns["domain_coherent"] = 0.0
+        for name in ("p1", "p2", "med", "min"):
+            columns["domain_input_time_proc_%s" % name] = input_time + decode_time
 
     additions = pd.DataFrame(columns, index=df.index).astype("Float64")
     return pd.concat([df.drop(columns=[c for c in additions if c in df.columns]), additions], axis=1)

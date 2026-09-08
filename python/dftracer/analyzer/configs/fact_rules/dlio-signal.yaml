@@ -86,6 +86,16 @@ rules:
       - domain_compute_time_proc_typ
       - residual_time_proc_typ
       - domain_input_spread_time_proc
+      # THE SORTED PER-RANK INPUT EXPOSURE, as four order statistics in seconds. The scalar
+      # spread cannot tell TWO starved ranks from a workload whose ranks all wait for data,
+      # and that distinction is what decided whether the 2026-09-08 StorMer candidate was a
+      # property of the workload or of our own oversubscription (judge verdict
+      # JUDGE-VERDICT-CRIT-TYP-2026-09-08.md section 3). `p1 - p2` is also the planner's
+      # payoff bound when it relieves the critical rank.
+      - domain_input_time_proc_p1
+      - domain_input_time_proc_p2
+      - domain_input_time_proc_med
+      - domain_input_time_proc_min
       - domain_procs_active
       - domain_coherent
       # The storage layer's own two numbers, for the barrier-attribution rule (T3-0 section 4m,

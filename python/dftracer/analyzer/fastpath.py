@@ -273,6 +273,31 @@ class FastPathPlan:
             size_values = np.zeros(len(traces), dtype=float)
         proc_codes, proc_uniques = pd.factorize(traces[COL_PROC_NAME])
         n_proc = max(len(proc_uniques), 1)
+        # THE COHERENT VECTORS DECOMPOSE A PROCESS, AND `proc_name` IS PER THREAD.
+        # `_set_proc_names` builds `app#<host>#<pid>#<tid>`, so two threads of one rank are two
+        # different "processes" here. That is right for the per-layer `time_proc_max` columns,
+        # which have always meant per-thread and are left exactly as they were. It is WRONG for
+        # the domain matrices, because a domain that a rank pays on a helper thread then lands on
+        # a row whose `window_wall` is zero, and `coherent_domain_vectors` drops that row as a
+        # process that did not run the window.
+        #
+        # Measured on `stgi_capacity_gate1` (StorMer, Corona, 1 node, 8 ranks), window 8 of 24:
+        # every rank emits `window.stop`, `stall.storage` and `compute` on its main thread and
+        # every one of its `comm.all_reduce` regions on a DDP helper thread, 28.6 s of a 34.8 s
+        # window on rank 0. Grouped per thread the comm domain is zero in EVERY window of EVERY
+        # StorMer run and that time is absorbed into compute, in both `crit` and `typ`. DLIO emits
+        # its barrier on the main thread and is unaffected, which is why the DLIO half of
+        # STATUS-ATTRIBUTION-FIX-2026-09-08 validated on this path while the StorMer half
+        # validated through `make_domain_fixture.py`, which groups by PID.
+        #
+        # So the domain matrices are grouped by pid, which is what "per process" means and what
+        # the fixture behind `test_domain_attribution.py` has always used. Falls back to
+        # `proc_name` where there is no pid column, so nothing that lacks one changes behaviour.
+        if "pid" in traces.columns:
+            dproc_codes, dproc_uniques = pd.factorize(traces["pid"])
+        else:
+            dproc_codes, dproc_uniques = proc_codes, proc_uniques
+        n_dproc = max(len(dproc_uniques), 1)
 
         for view_type in self.view_types:
             if view_type not in traces.columns:
@@ -289,6 +314,9 @@ class FastPathPlan:
             else:
                 pair_codes = group_codes * n_proc + proc_codes
                 n_pairs = n_groups * n_proc
+            # The (window, PID) pairing the domain matrices use; see the note above n_dproc.
+            dpair_codes = group_codes * n_dproc + dproc_codes
+            n_dpairs = n_groups * n_dproc
 
             # One preallocated float64 block for the whole view. Assembling the frame column by
             # column and converting at the end cost more than every bincount put together: a
@@ -316,7 +344,7 @@ class FastPathPlan:
                         # -- the same distinction set_window_decomposition_metrics makes on the
                         # column, and the reason a run whose loader kept up does not silently take
                         # the fetch-minus-decode fallback.
-                        domain_mats[prefix] = np.zeros((n_groups, n_proc))
+                        domain_mats[prefix] = np.zeros((n_groups, n_dproc))
                     _emit("%s_time_sum" % prefix, empty)
                     _emit("%s_time_proc_max" % prefix, empty)
                     _emit("%s_count_sum" % prefix, empty)
@@ -330,7 +358,11 @@ class FastPathPlan:
                 else:
                     per_pair = per_pair.reshape(n_groups, n_proc)
                     if prefix in _DOMAIN_LAYERS:
-                        domain_mats[prefix] = per_pair
+                        # Re-binned by pid rather than reshaped from the per-thread pairing: a
+                        # thread's time must land on ITS RANK's row, not on a row of its own.
+                        domain_mats[prefix] = np.bincount(
+                            dpair_codes[mask], weights=time_values[mask],
+                            minlength=n_dpairs).reshape(n_groups, n_dproc)
                     time_sum = per_pair.sum(axis=1)
                     time_proc_max = per_pair.max(axis=1)
                 _emit("%s_time_sum" % prefix, time_sum)
