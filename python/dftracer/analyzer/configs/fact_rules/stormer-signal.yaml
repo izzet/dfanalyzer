@@ -48,6 +48,34 @@ rules:
       - comm_time_proc_max
       - compute_time_proc_max
       - window_wall_time_proc_max
+      # THE COHERENT VECTORS (2026-09-08, STATUS-ATTRIBUTION-FIX-2026-09-08.md). Every metric above
+      # is a maximum over processes taken SEPARATELY per layer, so on a run with rank skew the
+      # input maximum and the comm maximum come from opposite ranks and the four do not decompose
+      # any process's timeline: on `stgi_capacity_gate1` they sum to between 96 and 139 percent of
+      # the window while every one of the eight ranks closes to 99.5 percent of it. These are the
+      # whole vector of ONE process -- `crit` the critical path through the data pipeline, which is
+      # what the planner prices a knob against, `typ` the median rank, which is what a rank-0
+      # workload instrument such as COMM_TIMING reports and therefore what the agreement test
+      # asserts. `domain_coherent` says whether the analyzer path could build them; the planner
+      # falls back to the metrics above when it says no.
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      # Host to device staging. Folded into the compute domain (see metrics.py) and reported
+      # separately so a run where it grows is visible instead of hidden inside compute.
+      - device_transfer_time_proc_max
+      - domain_device_time_proc_crit
+      - domain_device_time_proc_typ
+      - window_wall_time_proc_crit
+      - residual_time_proc_crit
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_compute_time_proc_typ
+      - residual_time_proc_typ
+      - domain_input_spread_time_proc
+      - domain_procs_active
+      - domain_coherent
     derived_metrics:
       # THE WALL IS THE WALL, not the sum of the domains (T3-0 4s.41).
       #

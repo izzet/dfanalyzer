@@ -336,9 +336,129 @@ def set_cross_layer_metrics(
     return df.sort_index(axis=1)
 
 
+# --- rank-coherent domain decomposition ---------------------------------------------------------
+#
+# The four domains PARTITION the window. Per process, per window, on `stgi_capacity_gate1`
+# (StorMer, Corona, 1 node, 8 ranks, the shipped default), every one of the eight ranks closes
+#
+#     stall_storage + comm + (compute - comm)  =  window_wall - 0.16 s
+#
+# in 99.4 to 99.6 percent of the wall, in every interior window of the run. `comm` is NESTED inside
+# `compute` (the DDP all_reduce fires during backward) which is why compute is reported net of it,
+# and `stall_decode` is nested inside the same consumer-side exposure total as `stall_storage`, so
+# the two split one quantity rather than adding to it. A share of the window is therefore the right
+# statistic and the planner's use of it is not the bug.
+#
+# WHAT WAS THE BUG. `<layer>_time_proc_max` is the maximum over processes taken SEPARATELY for
+# every layer. In a lockstep collective a rank starved of input waits in `stall` while the ranks
+# waiting for it at the barrier wait in `comm`, so the input maximum and the comm maximum come from
+# OPPOSITE ranks by construction. The four numbers are then not a decomposition of any process's
+# timeline, and their sum is not bounded by the window: on the same run they sum to between 96 and
+# 139 percent of it while every individual rank closes to 99.5. The error is largest exactly where
+# the rank skew, which is the phenomenon, is largest.
+#
+# The fix is to decompose PER PROCESS first and then take a vector WHOLE from one real process.
+# Two are published, because they answer different questions and both are needed:
+#
+#   crit  the process with the largest input+decode exposure, i.e. the critical path through the
+#         data pipeline. Every other rank's comm is inflated by this rank's stall, so this is the
+#         vector an input knob must be priced against, and it is what the planner reads.
+#   typ   the process at the median of the same ordering. This is the typical rank, and it is the
+#         one comparable to a workload instrument that prints from rank 0 only -- StorMer's
+#         COMM_TIMING and DLIO's STEP_DIRECT/FETCH_DIRECT both do -- so it is what
+#         `liveflow_shm/tests/test_domain_attribution.py` validates against ground truth.
+#
+# Both are taken from a single process, so both close on the wall by construction and their
+# residual is a measurement of what the annotations did not name rather than an aggregation error.
+
+DOMAIN_VECTOR_SUFFIXES = ("crit", "typ")
+DOMAIN_VECTOR_COLUMNS = tuple(
+    "%s_time_proc_%s" % (name, suffix)
+    for suffix in DOMAIN_VECTOR_SUFFIXES
+    for name in ("domain_input", "domain_decode", "domain_comm", "domain_compute",
+                 "domain_device", "residual", "window_wall")
+) + ("domain_coherent", "domain_input_spread_time_proc", "domain_procs_active")
+
+
+def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Per-window domain vectors taken whole from one process each.
+
+    `mats` maps a layer prefix to a (n_groups, n_proc) array of that layer's summed time for that
+    (window group, process) pair. `window_wall`, `comm` and `compute` are required; the rest
+    default to zero. Exposure-key PRESENCE selects the input definition, exactly as
+    `set_window_decomposition_metrics` does, so a measured zero exposure stays distinct from an
+    absent instrument.
+    """
+    wall = mats["window_wall"]
+    n_groups, n_proc = wall.shape
+    zeros = np.zeros_like(wall)
+
+    def m(name):
+        return mats.get(name, zeros)
+
+    exposure_present = "stall_storage" in mats
+    if exposure_present:
+        input_t = m("stall_storage")
+        decode_t = m("stall_decode")
+    else:
+        decode_t = m("reader_decode")
+        input_t = np.clip(m("fetch_iter") - decode_t, 0.0, None)
+    comm_t = m("comm")
+    device_t = m("device_transfer")
+    # HOST TO DEVICE STAGING. It is annotated, it is on the critical path between the fetch and the
+    # step, and until 2026-09-08 it belonged to no domain, so it sat in the residual: on
+    # `stgi_capacity_gate1` the residual equals it to within 0.04 s in every interior window.
+    # It is folded into compute rather than made a fifth domain because the workload's own
+    # instrument counts it inside `step` (COMM_TIMING's `other`), so this is what makes the two
+    # commensurable, and because neither compute nor a device domain owns a registered knob today,
+    # so no decision changes. It is published separately as `domain_device_*` so a run where it
+    # grows is visible rather than hidden inside compute -- and if the GLANCED-IO transfer-size
+    # knob is ever registered, that is the knob which owns it and it must become its own domain.
+    compute_t = np.clip(m("compute") - comm_t, 0.0, None) + device_t
+
+    # A process with no window wall did not run this window. DataLoader worker processes are in
+    # the same frame and would otherwise be selectable as a row of zeros, which would report a
+    # perfectly empty window and a residual equal to the whole wall.
+    active = wall > 0
+    order = input_t + decode_t
+
+    crit = np.zeros(n_groups, dtype=int)
+    typ = np.zeros(n_groups, dtype=int)
+    n_active = np.zeros(n_groups, dtype=float)
+    for g in range(n_groups):
+        idx = np.flatnonzero(active[g])
+        if idx.size == 0:
+            idx = np.arange(n_proc)
+        n_active[g] = float(idx.size)
+        ranked = idx[np.argsort(order[g][idx], kind="stable")]
+        crit[g] = ranked[-1]
+        typ[g] = ranked[(ranked.size - 1) // 2]
+
+    out = {}
+    rows = np.arange(n_groups)
+    for suffix, sel in (("crit", crit), ("typ", typ)):
+        i, d, c, k, w = (input_t[rows, sel], decode_t[rows, sel], comm_t[rows, sel],
+                         compute_t[rows, sel], wall[rows, sel])
+        out["domain_input_time_proc_%s" % suffix] = i
+        out["domain_decode_time_proc_%s" % suffix] = d
+        out["domain_comm_time_proc_%s" % suffix] = c
+        out["domain_compute_time_proc_%s" % suffix] = k
+        out["domain_device_time_proc_%s" % suffix] = device_t[rows, sel]
+        out["window_wall_time_proc_%s" % suffix] = w
+        out["residual_time_proc_%s" % suffix] = w - (i + d + c + k)
+    spread = np.where(active, order, np.nan)
+    with np.errstate(invalid="ignore"):
+        out["domain_input_spread_time_proc"] = np.nan_to_num(
+            np.nanmax(spread, axis=1) - np.nanmin(spread, axis=1), nan=0.0)
+    out["domain_procs_active"] = n_active
+    out["domain_coherent"] = np.ones(n_groups, dtype=float)
+    return out
+
+
 def set_window_decomposition_metrics(
     df: pd.DataFrame,
     is_view_process_based: bool,
+    coherent: Optional[Dict[str, np.ndarray]] = None,
 ) -> pd.DataFrame:
     """Publish a signed per-window closure residual when wall is available.
 
@@ -379,21 +499,61 @@ def set_window_decomposition_metrics(
         decode_time = values(f"reader_decode_{time_metric}")
         input_time = (fetch - decode_time).clip(lower=0)
 
-    compute_time = (compute_total - comm).clip(lower=0)
+    device_time = values(f"device_transfer_{time_metric}")
+    compute_time = (compute_total - comm).clip(lower=0) + device_time
     wall = values(wall_col)
     residual = wall - (input_time + decode_time + comm + compute_time)
 
-    additions = pd.DataFrame(
-        {
-            f"domain_input_{time_metric}": input_time,
-            f"domain_decode_{time_metric}": decode_time,
-            f"domain_comm_{time_metric}": comm,
-            f"domain_compute_{time_metric}": compute_time,
-            f"residual_{time_metric}": residual,
-            "domain_exposure_present": float(exposure_present),
-        },
-        index=df.index,
-    ).astype("Float64")
+    columns = {
+        f"domain_input_{time_metric}": input_time,
+        f"domain_decode_{time_metric}": decode_time,
+        f"domain_comm_{time_metric}": comm,
+        f"domain_compute_{time_metric}": compute_time,
+        f"domain_device_{time_metric}": device_time,
+        f"residual_{time_metric}": residual,
+        "domain_exposure_present": float(exposure_present),
+    }
+
+    # THE COHERENT VECTORS. See the comment above `coherent_domain_vectors`. The columns above stay
+    # exactly as they were, because other rules read them and because a metric whose meaning
+    # changes silently is the defect this project keeps catching; the crit/typ family is new and
+    # named for what it is.
+    if coherent is not None:
+        for name, arr in coherent.items():
+            columns[name] = pd.Series(np.asarray(arr, dtype=float), index=df.index)
+    elif is_view_process_based:
+        # One row per process already: the row IS a coherent vector, so crit and typ are itself.
+        for suffix in DOMAIN_VECTOR_SUFFIXES:
+            columns[f"domain_input_time_proc_{suffix}"] = input_time
+            columns[f"domain_decode_time_proc_{suffix}"] = decode_time
+            columns[f"domain_comm_time_proc_{suffix}"] = comm
+            columns[f"domain_compute_time_proc_{suffix}"] = compute_time
+            columns[f"domain_device_time_proc_{suffix}"] = device_time
+            columns[f"window_wall_time_proc_{suffix}"] = wall
+            columns[f"residual_time_proc_{suffix}"] = residual
+        columns["domain_input_spread_time_proc"] = 0.0
+        columns["domain_procs_active"] = 1.0
+        columns["domain_coherent"] = 1.0
+    else:
+        # No per-process matrices reached us (the full analysis path, which builds each view from
+        # already-aggregated per-layer maxima). Publish the columns so the wire contract is the
+        # same on both paths, and mark them INCOHERENT so the planner declines to price them and
+        # falls back to the metrics it has always used. Filling them with the per-domain maxima
+        # would hand a decomposition that does not close on the wall to a planner that has no way
+        # to tell.
+        for suffix in DOMAIN_VECTOR_SUFFIXES:
+            columns[f"domain_input_time_proc_{suffix}"] = input_time
+            columns[f"domain_decode_time_proc_{suffix}"] = decode_time
+            columns[f"domain_comm_time_proc_{suffix}"] = comm
+            columns[f"domain_compute_time_proc_{suffix}"] = compute_time
+            columns[f"domain_device_time_proc_{suffix}"] = device_time
+            columns[f"window_wall_time_proc_{suffix}"] = wall
+            columns[f"residual_time_proc_{suffix}"] = residual
+        columns["domain_input_spread_time_proc"] = 0.0
+        columns["domain_procs_active"] = 0.0
+        columns["domain_coherent"] = 0.0
+
+    additions = pd.DataFrame(columns, index=df.index).astype("Float64")
     return pd.concat([df.drop(columns=[c for c in additions if c in df.columns]), additions], axis=1)
 
 

@@ -61,9 +61,21 @@ from .constants import (
     COL_SIZE,
     COL_TIME,
 )
-from .metrics import set_window_decomposition_metrics
+from .metrics import (
+    DOMAIN_VECTOR_COLUMNS,
+    coherent_domain_vectors,
+    set_window_decomposition_metrics,
+)
 
 logger = structlog.get_logger()
+
+# The layers whose per-(group, process) matrices the coherent decomposition needs. Everything else
+# is still reduced straight to a sum and a per-layer max, so this costs one extra reshape per
+# layer in this list per window and nothing else.
+_DOMAIN_LAYERS = (
+    "window_wall", "comm", "compute", "device_transfer", "stall_storage", "stall_decode",
+    "fetch_iter", "reader_decode",
+)
 
 # Columns a layer or derived-metric condition may use and still be evaluated on the DEDUPLICATED
 # key table rather than row by row.  These are the low-cardinality identity columns; a condition
@@ -145,9 +157,11 @@ class FastPathPlan:
                 self.produced_columns.add("%s_size_sum" % prefix)
         # set_window_decomposition_metrics adds these on top, for both time metrics.
         for metric in ("time_sum", "time_proc_max"):
-            for name in ("domain_input", "domain_decode", "domain_comm", "domain_compute", "residual"):
+            for name in ("domain_input", "domain_decode", "domain_comm", "domain_compute",
+                         "domain_device", "residual"):
                 self.produced_columns.add("%s_%s" % (name, metric))
         self.produced_columns.add("domain_exposure_present")
+        self.produced_columns.update(DOMAIN_VECTOR_COLUMNS)
         self._mask_cache: Dict[tuple, Dict[str, np.ndarray]] = {}
 
     # -- gate ------------------------------------------------------------------------------
@@ -281,6 +295,10 @@ class FastPathPlan:
             # 171-column `astype` is ~40 ms, which is half an 82 ms window budget on its own.
             names: List[str] = []
             blocks: List[np.ndarray] = []
+            # (n_groups, n_proc) time matrices for the domain layers, kept so the decomposition can
+            # be taken from ONE process rather than assembled out of per-layer maxima that come
+            # from different ones. See metrics.coherent_domain_vectors.
+            domain_mats: Dict[str, np.ndarray] = {}
 
             def _emit(name: str, values: np.ndarray) -> None:
                 names.append(name)
@@ -292,6 +310,13 @@ class FastPathPlan:
                 mask = masks[prefix] & valid
                 if not mask.any():
                     empty = np.zeros(n_groups)
+                    if prefix in _DOMAIN_LAYERS and not is_process_based:
+                        # PRESENCE, not truthiness. The layer is declared by the preset, so the
+                        # decomposition must see a measured zero here and not an absent instrument
+                        # -- the same distinction set_window_decomposition_metrics makes on the
+                        # column, and the reason a run whose loader kept up does not silently take
+                        # the fetch-minus-decode fallback.
+                        domain_mats[prefix] = np.zeros((n_groups, n_proc))
                     _emit("%s_time_sum" % prefix, empty)
                     _emit("%s_time_proc_max" % prefix, empty)
                     _emit("%s_count_sum" % prefix, empty)
@@ -304,6 +329,8 @@ class FastPathPlan:
                     time_proc_max = per_pair
                 else:
                     per_pair = per_pair.reshape(n_groups, n_proc)
+                    if prefix in _DOMAIN_LAYERS:
+                        domain_mats[prefix] = per_pair
                     time_sum = per_pair.sum(axis=1)
                     time_proc_max = per_pair.max(axis=1)
                 _emit("%s_time_sum" % prefix, time_sum)
@@ -316,6 +343,9 @@ class FastPathPlan:
 
             index = pd.Index(group_uniques, name=view_type)
             view = pd.DataFrame(np.column_stack(blocks), index=index, columns=names)
-            view = set_window_decomposition_metrics(view, is_process_based)
+            coherent = None
+            if not is_process_based and "window_wall" in domain_mats:
+                coherent = coherent_domain_vectors(domain_mats)
+            view = set_window_decomposition_metrics(view, is_process_based, coherent=coherent)
             views[(view_type,)] = view.sort_index(axis=1)
         return views

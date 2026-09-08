@@ -337,6 +337,13 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
             'compute': 'cat == "compute" & func_name == "compute"',
             'compute_forward': 'cat == "compute" & func_name == "forward"',
             'compute_backward': 'cat == "compute" & func_name == "backward"',
+            # HOST TO DEVICE STAGING, the last leg of the input path. It was annotated and
+            # measured and belonged to NO layer, so it landed in the window decomposition's
+            # residual: on `stgi_capacity_gate1` the residual equals this region to within 0.04 s
+            # in every interior window of the run, 0.10 to 1.37 s of a 26 to 43 s window
+            # (STATUS-ATTRIBUTION-FIX-2026-09-08.md section 5). Declaring the layer is what lets
+            # the decomposition close on the wall instead of carrying it as an unexplained gap.
+            'device_transfer': 'cat == "device" & func_name == "transfer"',
             'comm': 'cat == "comm"',
             'comm_all_reduce': 'cat == "comm" & func_name == "all_reduce"',
             'data_loader': 'cat == "data" & func_name.isin(["data.init", "item"])',
@@ -357,6 +364,9 @@ class AnalyzerPresetConfigStormer(AnalyzerPresetConfigDLIOAILogging):
             'compute': 'fetch_block',
             'compute_forward': 'compute',
             'compute_backward': 'compute',
+            # Sibling of compute, not a child: `send_to_device` runs BEFORE the compute region
+            # opens, so nesting it under compute would make compute's overhead term negative.
+            'device_transfer': 'fetch_block',
             'comm': 'compute_backward',
             'comm_all_reduce': 'comm',
             'data_loader': 'fetch_iter',
