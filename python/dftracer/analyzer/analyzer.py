@@ -538,7 +538,47 @@ class Analyzer(abc.ABC):
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
         self.verbose = verbose
+        # Set only around an online completed control window.  Offline analysis
+        # deliberately has no fabricated window/rank identity.
+        self._debug_window_provenance = None
         ensure_dir(self.checkpoint_dir)
+
+    def _debug_artifact_suffix(self) -> str:
+        provenance = self._debug_window_provenance or {}
+        window_index = provenance.get("window_index")
+        if window_index is None:
+            return ""
+        return f"_window_{int(window_index):06d}"
+
+    def _write_debug_flat_view(self, flat_view: pd.DataFrame, view_key: ViewKey) -> None:
+        """Write a debug view with its index and online-window provenance intact.
+
+        Flat-view indices are the view's join keys (for example epoch or
+        process).  Dropping them and overwriting a fixed filename made an online
+        snapshot impossible to associate with its completed control window.
+        These artifacts are debug/provenance evidence only; this does not alter
+        the emitted result, facts, or optimizer inputs.
+        """
+        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # Preserve every index level under reserved names, avoiding collisions
+        # with metrics that happen to share an index-level label.
+        index_values = flat_view.index.to_frame(index=False).reset_index(drop=True)
+        index_values.columns = [f"__dfanalyzer_index_{i}_{name or 'unnamed'}"
+                                for i, name in enumerate(flat_view.index.names)]
+        export = pd.concat([index_values, flat_view.reset_index(drop=True)], axis=1)
+
+        provenance = self._debug_window_provenance or {}
+        export.insert(0, "__dfanalyzer_view_key", json.dumps(list(view_key)))
+        if provenance:
+            export.insert(0, "__liveflow_window_index", provenance["window_index"])
+            export.insert(1, "__liveflow_rank_pids", json.dumps(provenance["rank_pids"]))
+            export.insert(2, "__liveflow_boundary_ts_ns_by_pid",
+                          json.dumps(provenance["boundary_ts_ns_by_pid"], sort_keys=True))
+
+        name = f"flat_view_{'_'.join(view_key)}{self._debug_artifact_suffix()}.csv"
+        export.to_csv(os.path.join(debug_dir, name), index=False)
 
     @staticmethod
     def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
@@ -1067,16 +1107,16 @@ class Analyzer(abc.ABC):
             if start_counts and event_pid in start_counts:
                 if trace_events_seen_by_pid.get(event_pid, 0) <= start_counts[event_pid]:
                     return
-            event_with_window = dict(normalized_event)
             current_window = window_index
             if current_window is None:
                 current_window = window_tracker.current_window(event_pid)
             if current_window is None:
                 return
-            event_with_window["window"] = current_window
-            # Keep the historical epoch field for downstream schema compatibility.
-            event_with_window["epoch"] = current_window
-            event_with_window["step"] = current_window
+            event_with_window = self._attach_stream_window(
+                normalized_event,
+                current_window,
+                native_window="window" in proc_view_types,
+            )
             sink_events.append(event_with_window)
 
         trace_events_seen_by_pid = defaultdict(int)
@@ -1188,9 +1228,17 @@ class Analyzer(abc.ABC):
                     pid=pid,
                     boundary_ts_ns=boundary_ts_ns,
                     events_written=events_written,
+                    discard=bool(_parse_control_int(control_event, "discard") or 0),
                 )
 
                 for completed_window in completed_windows:
+                    _discard_values = list(completed_window.discard_by_pid.values())
+                    _all_discarded = (
+                        len(_discard_values) == num_ranks and all(_discard_values)
+                    )
+                    _mixed_discard = bool(_discard_values) and not (
+                        all(_discard_values) or not any(_discard_values)
+                    )
                     _window_wall_start = time.perf_counter()
                     # Where the drain's time goes, split into the four things it can be doing.
                     # `drain_elapsed_ms` alone cannot say whether the analyzer was waiting for a
@@ -1435,6 +1483,23 @@ class Analyzer(abc.ABC):
                         )
                         continue
 
+                    # A boundary opened before next(loader) can discover end-of-input.  It must
+                    # be drained and completed above so the next epoch retains a valid tracker
+                    # identity, but it contains no completed workload step.  Never turn it (or a
+                    # mixed-rank report) into analysis, a fact, an optimizer observation, or a
+                    # horizon input.  The explicit application flag is authoritative; incidental
+                    # trace activity and zero/positive wall time are not eligibility heuristics.
+                    if _all_discarded or _mixed_discard:
+                        logger.info(
+                            "mofka.window.control_excluded",
+                            window=completed_window.window_index,
+                            reason=("all_ranks_discarded" if _all_discarded
+                                    else "mixed_rank_discard"),
+                            discard_by_pid=completed_window.discard_by_pid,
+                            event_count=len(pulled_events),
+                        )
+                        continue
+
                     # Log event category breakdown for debugging
                     cat_counts = Counter(e.get("cat", "?") for e in pulled_events)
                     name_sample = Counter(e.get("name", "?") for e in pulled_events)
@@ -1485,6 +1550,43 @@ class Analyzer(abc.ABC):
                         traces_bytes=_traces_bytes,
                         traces_mb=round(_traces_bytes / 1024 / 1024, 1),
                     )
+                    # This is provenance for the streaming epoch contract, not a repair.  The
+                    # control tracker assigned this completed window's identity before the frame
+                    # was standardised; record whether that identity survived into the analyzer
+                    # frame and whether the duration-bearing wall events retained it.  A later
+                    # domain/slope result is invalid if either count is zero, and the compact
+                    # counts let a smoke distinguish an emitter failure from a dataframe-path
+                    # loss without dumping workload traces into the agent log.
+                    if {"epoch", "cat", "func_name"}.issubset(traces.columns):
+                        _epoch_present = int(traces["epoch"].notna().sum())
+                        _wall_mask = (
+                            (traces["cat"] == "window")
+                            & (traces["func_name"] == "window.stop")
+                        )
+                        _wall_total = int(_wall_mask.sum())
+                        _wall_epoch_present = int(
+                            (traces.loc[_wall_mask, "epoch"].notna()).sum()
+                        )
+                    else:
+                        _epoch_present = _wall_total = _wall_epoch_present = 0
+                    logger.info(
+                        "mofka.window.epoch_provenance",
+                        window=completed_window.window_index,
+                        traces_rows=len(traces),
+                        epoch_rows=_epoch_present,
+                        wall_rows=_wall_total,
+                        wall_epoch_rows=_wall_epoch_present,
+                    )
+                    # `_analyze_trace()` writes debug flat views internally.  Make the
+                    # completed control-window identity available before entering it so those
+                    # artifacts remain joinable to the ring/control evidence after the run.
+                    # Do not infer a rank from a row: the control tracker is the authority for
+                    # the complete rank set and boundary times.
+                    self._debug_window_provenance = {
+                        "window_index": completed_window.window_index,
+                        "rank_pids": sorted(completed_window.boundary_ts_ns_by_pid or {}),
+                        "boundary_ts_ns_by_pid": completed_window.boundary_ts_ns_by_pid or {},
+                    }
                     try:
                         # The fast path serves the threshold-free *-signal rule sets directly
                         # from the traces frame and declines anything else, so a rule set it
@@ -1537,6 +1639,9 @@ class Analyzer(abc.ABC):
                             target_counts=target_counts,
                         )
                         continue
+                    finally:
+                        # A later offline call must not inherit a stale online-window identity.
+                        self._debug_window_provenance = None
                     _analysis_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
                     # The release rule of section 4j: analysis_elapsed_ms must be below the
                     # window's own wall-clock span, else the agent is sampling rather than
@@ -1871,6 +1976,27 @@ class Analyzer(abc.ABC):
         extra_columns: Optional[Dict[str, str]] = None,
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
     ) -> dict:
+        return event
+
+    @staticmethod
+    def _attach_stream_window(
+        normalized_event: dict,
+        current_window: int,
+        *,
+        native_window: bool,
+    ) -> dict:
+        """Attach control-window membership without corrupting workload metadata.
+
+        The historical live grouping is keyed by ``epoch`` and uses the
+        completed control-window number as a compatibility alias for epoch and
+        step.  A native ``window`` view preserves genuine epoch/step values
+        parsed from the trace instead.
+        """
+        event = dict(normalized_event)
+        event["window"] = current_window
+        if not native_window:
+            event["epoch"] = current_window
+            event["step"] = current_window
         return event
 
     @staticmethod
@@ -2742,7 +2868,9 @@ class Analyzer(abc.ABC):
                 if self.debug:
                     debug_dir = getattr(self, "debug_output_dir", os.getcwd())
                     os.makedirs(debug_dir, exist_ok=True)
-                    with open(os.path.join(debug_dir, "metric_boundaries.json"), "w") as f:
+                    with open(os.path.join(
+                        debug_dir, f"metric_boundaries{self._debug_artifact_suffix()}.json"
+                    ), "w") as f:
                         json.dump(
                             metric_boundaries,
                             f,
@@ -2761,11 +2889,9 @@ class Analyzer(abc.ABC):
                         system_metrics=system_metrics,
                     )
                     if self.debug:
-                        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
-                        os.makedirs(debug_dir, exist_ok=True)
-                        flat_views[view_key].to_csv(
-                            os.path.join(debug_dir, f"flat_view_{'_'.join(view_key)}.csv"),
-                            index=False,
+                        self._write_debug_flat_view(
+                            flat_view=flat_views[view_key],
+                            view_key=view_key,
                         )
 
         # Checkpoint flat views if enabled
@@ -2899,6 +3025,14 @@ class Analyzer(abc.ABC):
         flat_views = plan.flat_views(traces)
         if not flat_views:
             return None
+        # The fast path is an analysis optimization, not a provenance opt-out.
+        # The normal path writes these per-completed-window CSVs while processing
+        # flat views.  Keep the same artifacts here so a signal-rule smoke can
+        # pass the established SHM validator and remain auditable after the
+        # node agent composes the diagnoser in the same process.
+        if self.debug:
+            for view_key, flat_view in flat_views.items():
+                self._write_debug_flat_view(flat_view=flat_view, view_key=view_key)
         analysis_facts = self._evaluate_analysis_facts(flat_views=flat_views, raw_stats=raw_stats)
         output_flat_views, output_analysis_facts = self._materialize_output_artifacts(
             flat_views=flat_views,

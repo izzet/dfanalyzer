@@ -25,7 +25,6 @@ SLOPE_BINS = [
     np.tan(np.deg2rad(75)),  # ~3.73
 ]
 
-
 def _find_metric_pairs(metrics: list[str], metric_type1: str, metric_type2: str):
     """
     Find pairs of metrics with a common prefix, one ending with metric_type1 and one with metric_type2.
@@ -148,7 +147,10 @@ def set_view_metrics(
     for count_frac_total_col, time_proc_frac_total_col in count_time_proc_frac_metric_pairs:
         ops_percentile_col = count_frac_total_col.replace('count_frac_total', 'ops_percentile')
         ops_slope_col = count_frac_total_col.replace('count_frac_total', 'ops_slope')
-        ops_slope = new_metrics[time_proc_frac_total_col] / new_metrics[count_frac_total_col]
+        # WiSIO orientation: operation-share / time-share.  The geometric
+        # 45-degree reference is tan(45)=1; values below it have a
+        # disproportionate time share within this operation family.
+        ops_slope = new_metrics[count_frac_total_col] / new_metrics[time_proc_frac_total_col]
         ops_slope = ops_slope.replace([np.inf, -np.inf], pd.NA)
         new_metrics[ops_percentile_col] = ops_slope.rank(pct=True)
         new_metrics[ops_slope_col] = ops_slope
@@ -438,7 +440,10 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     for g in range(n_groups):
         idx = np.flatnonzero(active[g])
         if idx.size == 0:
-            idx = np.arange(n_proc)
+            # There is no rank-local window to price.  Do not select an arbitrary
+            # zero-wall row merely to make a vector-shaped result: downstream must
+            # see this as explicitly incoherent and decline the window.
+            continue
         n_active[g] = float(idx.size)
         ranked = idx[np.argsort(order[g][idx], kind="stable")]
         crit[g] = ranked[-1]
@@ -456,10 +461,12 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
         out["domain_device_time_proc_%s" % suffix] = device_t[rows, sel]
         out["window_wall_time_proc_%s" % suffix] = w
         out["residual_time_proc_%s" % suffix] = w - (i + d + c + k)
-    spread = np.where(active, order, np.nan)
-    with np.errstate(invalid="ignore"):
-        out["domain_input_spread_time_proc"] = np.nan_to_num(
-            np.nanmax(spread, axis=1) - np.nanmin(spread, axis=1), nan=0.0)
+    spread = np.zeros(n_groups)
+    for g in range(n_groups):
+        vals = order[g][np.flatnonzero(active[g])]
+        if vals.size:
+            spread[g] = vals.max() - vals.min()
+    out["domain_input_spread_time_proc"] = spread
     out["domain_procs_active"] = n_active
     # The sorted per-process input exposure, reported as four order statistics. See the note on
     # DOMAIN_VECTOR_COLUMNS. `p1` is the critical rank's own exposure and equals crit's
@@ -471,8 +478,7 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     med = np.zeros(n_groups)
     lo = np.zeros(n_groups)
     for g in range(n_groups):
-        vals = np.sort(order[g][np.flatnonzero(active[g])]) if active[g].any() \
-            else np.sort(order[g])
+        vals = np.sort(order[g][np.flatnonzero(active[g])])
         if vals.size == 0:
             continue
         p1[g] = vals[-1]
@@ -483,7 +489,11 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     out["domain_input_time_proc_p2"] = p2
     out["domain_input_time_proc_med"] = med
     out["domain_input_time_proc_min"] = lo
-    out["domain_coherent"] = np.ones(n_groups, dtype=float)
+    # This is provenance, not a confidence score.  A zero says the analyzer
+    # received process matrices but no process ran this window; the optimizer
+    # must fail closed rather than reinterpret those same inputs as legacy
+    # aggregate metrics.
+    out["domain_coherent"] = (n_active > 0).astype(float)
     return out
 
 

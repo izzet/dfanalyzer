@@ -188,3 +188,51 @@ def test_window_boundary_tracker_advances_with_end_only_boundaries():
     assert completed[0].window_index == 2
     assert completed[0].ranks_received == 2
     assert completed[0].boundary_ts_ns == 220
+
+
+def test_window_boundary_tracker_preserves_discard_consensus_and_mixed_state():
+    """The caller can fail closed without breaking rank/window ordering."""
+    tracker = WindowTracker(num_ranks=2, require_explicit_start=True)
+    for pid in (1, 2):
+        tracker.observe_start_boundary(pid)
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=10, discard=True) == []
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=11, discard=True)
+    assert len(completed) == 1
+    assert completed[0].discard_by_pid == {1: True, 2: True}
+
+    for pid in (1, 2):
+        tracker.observe_start_boundary(pid)
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=20, discard=True) == []
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=21, discard=False)
+    assert len(completed) == 1
+    assert completed[0].discard_by_pid == {1: True, 2: False}
+
+
+def test_explicit_start_tracker_drops_late_end_and_waits_for_missing_rank():
+    """Live analysis requires starts: a late stop cannot become the next window.
+
+    This is an admission/coverage guard, not a claim that the tracker can
+    deduplicate an arbitrary duplicate start--stop pair.  Such a pair is
+    indistinguishable from a genuine next window at this interface and needs a
+    transport sequence/at-most-once contract.
+    """
+    tracker = WindowTracker(num_ranks=2, require_explicit_start=True)
+
+    assert tracker.observe_start_boundary(pid=1) == 1
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=100) == []
+    # The duplicate/late stop has no new start, so it must neither advance rank
+    # 1 nor make a partial next window eligible.
+    assert tracker.observe_end_boundary(pid=1, boundary_ts_ns=101) == []
+    assert tracker.current_window(1) is None
+
+    assert tracker.observe_start_boundary(pid=2) == 1
+    completed = tracker.observe_end_boundary(pid=2, boundary_ts_ns=110)
+    assert [(item.window_index, item.ranks_received) for item in completed] == [(1, 2)]
+
+    # A one-rank next window stays ineligible until the other rank supplies its
+    # own explicit start and stop.
+    assert tracker.observe_start_boundary(pid=2) == 2
+    assert tracker.observe_end_boundary(pid=2, boundary_ts_ns=210) == []
+    assert tracker.observe_start_boundary(pid=1) == 2
+    completed = tracker.observe_end_boundary(pid=1, boundary_ts_ns=220)
+    assert [(item.window_index, item.ranks_received) for item in completed] == [(2, 2)]

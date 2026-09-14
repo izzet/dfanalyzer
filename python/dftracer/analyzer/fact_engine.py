@@ -189,6 +189,27 @@ class FactEngine:
         for rule in self.rules:
             self.rules_by_view.setdefault(rule.source_view, []).append(rule)
 
+    def rebind_source_view(self, *, from_view: str, to_view: str) -> int:
+        """Explicitly retarget selected rules without changing their semantics.
+
+        This exists for the native control-window migration only.  Callers must
+        opt in; the historical rule file and its default epoch dispatch remain
+        untouched.  Frozen rules are replaced so dispatch and provenance stay
+        internally consistent.
+        """
+        rebound = [
+            dc.replace(rule, source_view=to_view) if rule.source_view == from_view else rule
+            for rule in self.rules
+        ]
+        count = sum(before is not after for before, after in zip(self.rules, rebound))
+        if count:
+            self.rules = rebound
+            self.rules_by_view = {}
+            for rule in self.rules:
+                self.rules_by_view.setdefault(rule.source_view, []).append(rule)
+            logger.info("facts.rules.source_view_rebound", from_view=from_view, to_view=to_view, count=count)
+        return count
+
     @classmethod
     def from_rule_file(
         cls,
@@ -387,10 +408,15 @@ class FactEngine:
                 for metric_name in rule.derived_metrics:
                     evidence_metrics[metric_name] = _to_scalar(row.get(metric_name))
 
+                window = None
                 epoch = None
                 step = None
                 t0_ns = None
                 t1_ns = None
+                if view_type == "window":
+                    window = _to_int_or_none(row_index)
+                elif "window" in row.index and row.get("window") is not None and not pd.isna(row.get("window")):
+                    window = _to_int_or_none(row.get("window"))
                 if view_type == "epoch":
                     epoch = _to_int_or_none(row_index)
                 elif "epoch" in row.index and row.get("epoch") is not None and not pd.isna(row.get("epoch")):
@@ -425,6 +451,7 @@ class FactEngine:
                     window=FactWindow(
                         run_id=run_id,
                         view_type=view_type,
+                        window=window,
                         epoch=epoch,
                         step=step,
                         t0_ns=t0_ns,

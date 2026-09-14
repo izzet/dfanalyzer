@@ -167,6 +167,7 @@
       "required": [
         "run_id",
         "view_type",
+        "window",
         "epoch",
         "step",
         "t0_ns",
@@ -183,6 +184,12 @@
         "view_type": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "window": {
+          "type": [
+            "integer",
             "null"
           ]
         },

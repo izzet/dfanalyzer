@@ -115,6 +115,7 @@ Views = Dict[ViewKey, View]
 class FactWindow:
     run_id: Optional[str] = None
     view_type: Optional[str] = None
+    window: Optional[int] = None
     epoch: Optional[int] = None
     step: Optional[int] = None
     t0_ns: Optional[int] = None
@@ -166,7 +167,7 @@ class AnalysisFact:
             return self.fact_id
         scope_key = f"{self.scope.layer}:{self.scope.entity}:{self.scope.rank_set}"
         window_key = (
-            f"{self.window.run_id}:{self.window.view_type}:{self.window.epoch}:{self.window.step}:"
+            f"{self.window.run_id}:{self.window.view_type}:{self.window.window}:{self.window.epoch}:{self.window.step}:"
             f"{self.window.t0_ns}:{self.window.t1_ns}"
         )
         fact_key = f"{self.schema_version}:{self.fact_type}:{window_key}:{scope_key}"

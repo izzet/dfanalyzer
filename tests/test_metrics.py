@@ -3,12 +3,15 @@ import pandas as pd
 import pytest
 
 from dftracer.analyzer.metrics import (
+    coherent_domain_vectors,
     set_cross_layer_metrics,
     set_main_metrics,
     set_quantile_metrics,
     set_view_metrics,
     set_window_decomposition_metrics,
 )
+from dftracer.analyzer.fact_engine import FactEngine
+from dftracer.analyzer.fact_rules import build_fact_rule
 
 
 # Ensure this module runs in both smoke and full CI modes
@@ -74,6 +77,139 @@ def test_window_decomposition_uses_dlio_storage_only_exposure():
     assert out.loc[0, "domain_input_time_proc_max"] == pytest.approx(0.057)
     assert out.loc[0, "domain_decode_time_proc_max"] == 0.0
     assert out.loc[0, "residual_time_proc_max"] == pytest.approx(0.005)
+
+
+def test_rank_coherent_domain_vectors_preserve_exposure_and_fact_evidence():
+    # Rank zero is input-critical while rank one is communication-critical.  The
+    # third column is a data-loader worker: it has measurements but no window wall
+    # and must not be selected for either coherent vector.
+    mats = {
+        "window_wall": np.array([[4.0, 7.0, 0.0]]),
+        "stall_storage": np.array([[4.0, 0.0, 1000.0]]),
+        "stall_decode": np.array([[0.0, 0.0, 1000.0]]),
+        "comm": np.array([[1.0, 6.0, 1000.0]]),
+        "compute": np.array([[1.0, 6.0, 1000.0]]),
+    }
+
+    coherent = coherent_domain_vectors(mats)
+
+    # Each vector comes intact from one active rank; it must not combine the
+    # input maximum from rank zero with the communication maximum from rank one.
+    assert coherent["domain_procs_active"] == pytest.approx([2.0])
+    assert coherent["domain_input_time_proc_crit"] == pytest.approx([4.0])
+    assert coherent["domain_comm_time_proc_crit"] == pytest.approx([1.0])
+    assert coherent["window_wall_time_proc_crit"] == pytest.approx([4.0])
+    assert coherent["residual_time_proc_crit"] == pytest.approx([-1.0])
+    assert coherent["domain_input_time_proc_typ"] == pytest.approx([0.0])
+    assert coherent["domain_comm_time_proc_typ"] == pytest.approx([6.0])
+    assert coherent["window_wall_time_proc_typ"] == pytest.approx([7.0])
+    assert coherent["residual_time_proc_typ"] == pytest.approx([1.0])
+
+    # Storage exposure is present even when the typical rank measured zero;
+    # absence instead uses the fetch-minus-decode fallback.
+    frame = pd.DataFrame(
+        {
+            "window_wall_time_proc_max": [7.0],
+            "stall_storage_time_proc_max": [4.0],
+            "stall_decode_time_proc_max": [0.0],
+            "comm_time_proc_max": [6.0],
+            "compute_time_proc_max": [6.0],
+        },
+        index=[9],
+    )
+    out = set_window_decomposition_metrics(frame, is_view_process_based=False, coherent=coherent)
+
+    assert out.loc[9, "domain_exposure_present"] == 1.0
+    assert out.loc[9, "domain_input_time_proc_typ"] == 0.0
+    assert out.loc[9, "residual_time_proc_crit"] == pytest.approx(-1.0)
+    fallback = set_window_decomposition_metrics(
+        pd.DataFrame(
+            {
+                "window_wall_time_proc_max": [5.0],
+                "fetch_iter_time_proc_max": [2.0],
+                "reader_decode_time_proc_max": [0.5],
+                "comm_time_proc_max": [1.0],
+                "compute_time_proc_max": [1.0],
+            }
+        ),
+        is_view_process_based=False,
+    )
+    assert fallback.loc[0, "domain_exposure_present"] == 0.0
+    assert fallback.loc[0, "domain_input_time_proc_max"] == pytest.approx(1.5)
+
+    # Slopes remain within their operation families.  They are deliberately
+    # unequal and only forwarded as evidence below: the rule's predicate and
+    # severity do not read either slope, so they cannot select a domain.
+    slope_rows = set_view_metrics(
+        pd.DataFrame(
+            {
+                "read_count_sum": [1.0, 9.0],
+                "read_size_sum": [1.0, 9.0],
+                "read_time_sum": [4.0, 6.0],
+                "write_count_sum": [8.0, 2.0],
+                "write_size_sum": [8.0, 2.0],
+                "write_time_sum": [2.0, 8.0],
+            }
+        ),
+        metric_boundaries={},
+        is_view_process_based=True,
+    )
+    assert slope_rows.loc[0, "read_ops_slope"] == pytest.approx(0.25)
+    assert slope_rows.loc[0, "write_ops_slope"] == pytest.approx(4.0)
+    out.loc[9, "read_ops_slope"] = slope_rows.loc[0, "read_ops_slope"]
+    out.loc[9, "write_ops_slope"] = slope_rows.loc[0, "write_ops_slope"]
+
+    rule = build_fact_rule(
+        raw_rule={
+            "id": "rule.coherent.domain.evidence",
+            "priority": 10,
+            "source_view": "epoch",
+            "fact_type": "coherent_domain_evidence",
+            "required_metrics": [
+                "domain_coherent",
+                "domain_exposure_present",
+                "domain_procs_active",
+                "domain_input_time_proc_crit",
+                "domain_comm_time_proc_crit",
+                "residual_time_proc_crit",
+                "domain_input_time_proc_typ",
+                "domain_comm_time_proc_typ",
+                "residual_time_proc_typ",
+                "read_ops_slope",
+                "write_ops_slope",
+            ],
+            "when": "domain_coherent == 1.0",
+            "severity_score": "0.8",
+        }
+    )
+    facts = FactEngine([rule]).evaluate({("epoch",): out}, raw_stats={"run_id": "rank-test"})
+
+    assert len(facts[("epoch",)]) == 1
+    evidence = facts[("epoch",)][0].evidence["metrics"]
+    assert evidence["domain_exposure_present"] == 1.0
+    assert evidence["domain_procs_active"] == 2.0
+    assert evidence["domain_input_time_proc_crit"] == pytest.approx(4.0)
+    assert evidence["domain_comm_time_proc_crit"] == pytest.approx(1.0)
+    assert evidence["residual_time_proc_crit"] == pytest.approx(-1.0)
+    assert evidence["domain_input_time_proc_typ"] == pytest.approx(0.0)
+    assert evidence["domain_comm_time_proc_typ"] == pytest.approx(6.0)
+    assert evidence["residual_time_proc_typ"] == pytest.approx(1.0)
+    assert evidence["read_ops_slope"] == pytest.approx(0.25)
+    assert evidence["write_ops_slope"] == pytest.approx(4.0)
+
+
+def test_rank_coherent_domain_vectors_mark_all_inactive_window_invalid():
+    mats = {
+        "window_wall": np.zeros((1, 2)),
+        "comm": np.zeros((1, 2)),
+        "compute": np.zeros((1, 2)),
+    }
+
+    coherent = coherent_domain_vectors(mats)
+
+    assert coherent["domain_procs_active"] == pytest.approx([0.0])
+    assert coherent["domain_coherent"] == pytest.approx([0.0])
+    assert coherent["window_wall_time_proc_crit"] == pytest.approx([0.0])
 
 
 def test_set_main_metrics_basic_single_metric():
@@ -200,7 +336,7 @@ def test_set_view_metrics_process_based_basic():
     # time_call_frac_total (same as proc when process-based, both from time_sum)
     assert pytest.approx(out.loc[0, "time_call_frac_total"], rel=1e-6) == 3.0 / 4.0
     assert pytest.approx(out.loc[1, "time_call_frac_total"], rel=1e-6) == 1.0 / 4.0
-    # ops slope = time_proc_frac_total / count_frac_total
+    # WiSIO-oriented ops slope = count_frac_total / time_proc_frac_total.
     assert pytest.approx(out.loc[0, "ops_slope"], rel=1e-6) == 1.0
     assert pytest.approx(out.loc[1, "ops_slope"], rel=1e-6) == 1.0
     # ops percentile ranks; equal slopes -> equal percentile
@@ -239,10 +375,31 @@ def test_set_view_metrics_non_process_based_basic():
     # size_call_frac_total (from size_sum)
     assert pytest.approx(out.loc[0, "size_call_frac_total"], rel=1e-6) == 300.0 / 400.0
     assert pytest.approx(out.loc[1, "size_call_frac_total"], rel=1e-6) == 100.0 / 400.0
-    # ops slope defined and finite
-    assert pytest.approx(out.loc[0, "ops_slope"], rel=1e-6) == (3 / 4) / (6 / 8)
-    assert pytest.approx(out.loc[1, "ops_slope"], rel=1e-6) == (1 / 4) / (2 / 8)
+    # 45-degree reference is one; lower means disproportionate time.
+    assert pytest.approx(out.loc[0, "ops_slope"], rel=1e-6) == (6 / 8) / (3 / 4)
+    assert pytest.approx(out.loc[1, "ops_slope"], rel=1e-6) == (2 / 8) / (1 / 4)
     _assert_no_infinities(out)
+
+
+def test_set_view_metrics_ops_slope_matches_wisio_operation_share_over_time_share_reference():
+    # Independent hand calculation of WiSIO's operation-family aggregation:
+    # row 0 owns 1/10 operations but 9/10 time, so its slope is 1/9 (< 1);
+    # row 1 is the reciprocal fast peer.  This is deliberately one operation
+    # family, not a cross-domain comparison.
+    out = set_view_metrics(
+        pd.DataFrame({
+            "read_count_sum": [1.0, 9.0],
+            "read_size_sum": [1.0, 9.0],
+            "read_time_sum": [9.0, 1.0],
+        }),
+        metric_boundaries={},
+        is_view_process_based=True,
+    )
+
+    wisio_golden = [(1.0 / 10.0) / (9.0 / 10.0), (9.0 / 10.0) / (1.0 / 10.0)]
+    assert out["read_ops_slope"].tolist() == pytest.approx(wisio_golden)
+    assert out.loc[0, "read_ops_slope"] < 1.0
+    assert out.loc[1, "read_ops_slope"] > 1.0
 
 
 def test_set_view_metrics_infinite_handling_zero_count():
@@ -258,8 +415,10 @@ def test_set_view_metrics_infinite_handling_zero_count():
 
     out = set_view_metrics(df.copy(), metric_boundaries=metric_boundaries, is_view_process_based=True)
 
-    # If slope is NA, percentile should also be NA
-    assert pd.isna(out.loc[0, "ops_slope"]) and pd.isna(out.loc[0, "ops_percentile"])
+    # Zero operation share over positive time is a valid zero slope, rather
+    # than an undefined denominator.
+    assert out.loc[0, "ops_slope"] == pytest.approx(0.0)
+    assert not pd.isna(out.loc[0, "ops_percentile"])
     assert not pd.isna(out.loc[1, "ops_slope"]) and not pd.isna(out.loc[1, "ops_percentile"])  # finite
     _assert_no_infinities(out)
 
@@ -343,6 +502,7 @@ def test_set_view_metrics_zero_time_denominator_safe_process_and_non():
     out_proc = set_view_metrics(df_proc.copy(), metric_boundaries={}, is_view_process_based=True)
     assert pd.isna(out_proc.loc[0, "time_proc_frac_total"]) and pd.isna(out_proc.loc[1, "time_proc_frac_total"])
     assert pd.isna(out_proc.loc[0, "time_call_frac_total"]) and pd.isna(out_proc.loc[1, "time_call_frac_total"])
+    assert pd.isna(out_proc.loc[0, "ops_slope"]) and pd.isna(out_proc.loc[1, "ops_slope"])
 
     df_non = pd.DataFrame(
         {

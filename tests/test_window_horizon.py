@@ -1,8 +1,18 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 
-from dftracer.analyzer.analyzer import attach_window_horizon, window_horizon_metrics
+# Match the node agent bootstrap: use this worktree's analyzer code while the
+# extension package itself remains installed in the supported venv.
+import dftracer
+
+_SOURCE_PACKAGE = Path(__file__).resolve().parents[1] / "python" / "dftracer"
+if str(_SOURCE_PACKAGE) not in dftracer.__path__:
+    dftracer.__path__.insert(0, str(_SOURCE_PACKAGE))
+
+from dftracer.analyzer.analyzer import Analyzer, attach_window_horizon, window_horizon_metrics
 from dftracer.analyzer.types import (
     AnalysisFact,
     FactProvenance,
@@ -56,3 +66,15 @@ def test_synthetic_window_event_publishes_remaining_horizon_to_fact_metrics():
 def test_incomplete_or_disagreeing_horizon_is_not_invented():
     assert window_horizon_metrics([_boundary(epochs_total=None)]) == {}
     assert window_horizon_metrics([_boundary(), _boundary(epoch_index=3)]) == {}
+
+
+def test_native_window_identity_preserves_workload_epoch_and_step():
+    original = {"epoch": 3, "step": 17, "pid": 42}
+
+    native = Analyzer._attach_stream_window(original, 9, native_window=True)
+    assert native == {"epoch": 3, "step": 17, "pid": 42, "window": 9}
+
+    # The non-native path is frozen only as a compatibility baseline for the
+    # forthcoming parity test; production defaults are not changed here.
+    legacy = Analyzer._attach_stream_window(original, 9, native_window=False)
+    assert legacy == {"epoch": 9, "step": 9, "pid": 42, "window": 9}

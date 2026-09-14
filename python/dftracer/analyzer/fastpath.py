@@ -248,14 +248,26 @@ class FastPathPlan:
         views: Dict[Tuple[str, ...], pd.DataFrame] = {}
         if traces is None or traces.empty:
             return views
-        # FIDELITY, NOT A CHOICE. The full path groups the HLM by every view type at once, and
-        # pandas groupby drops a row whose key is NA in ANY of them, so a row carrying no `epoch`
-        # -- every POSIX read from a DataLoader worker, and every window.stop, neither of which is
-        # annotated with one -- is absent from EVERY view, not only the epoch view. Dropping the
-        # same rows here keeps this a throughput change and nothing else. It also means
-        # `window_wall_time_proc_max` and `reader_posix_time_proc_max` come out NA on both paths
-        # for the DLIO preset; that gap is real, predates this module, and is written up in
-        # liveflow_shm/ANALYZER-FASTPATH.md rather than quietly fixed here.
+        # Legacy flat aggregates retain the full-path semantics: pandas groupby drops a row whose
+        # key is NA in ANY configured view.  Do not change those aggregates or their slopes here.
+        #
+        # The domain matrix has a stricter, separate association contract.  This method is called
+        # once for a completed control window, so that window is authoritative for membership.  An
+        # unkeyed row may join the *epoch domain matrix only* when all keyed rows in this completed
+        # window name exactly one epoch.  It is never copied into normal aggregates and is never
+        # guessed/broadcast over multiple epochs.  That admits the unannotated window.stop needed
+        # to establish an active rank while preserving the fail-closed outcome for ambiguity.
+        domain_traces = traces
+        domain_unkeyed_rows_included = 0
+        domain_epoch_association_unambiguous = 0
+        if "epoch" in self.view_types and "epoch" in traces.columns:
+            known_epochs = pd.unique(traces["epoch"].dropna())
+            unkeyed_epoch = traces["epoch"].isna()
+            if len(known_epochs) == 1 and unkeyed_epoch.any():
+                domain_traces = traces.copy()
+                domain_traces.loc[unkeyed_epoch, "epoch"] = known_epochs[0]
+                domain_unkeyed_rows_included = int(unkeyed_epoch.sum())
+                domain_epoch_association_unambiguous = 1
         keyed = np.ones(len(traces), dtype=bool)
         for key_view in self.view_types:
             if key_view in traces.columns:
@@ -271,6 +283,7 @@ class FastPathPlan:
             size_values = pd.to_numeric(traces[COL_SIZE], errors="coerce").fillna(0.0).to_numpy(dtype=float)
         else:
             size_values = np.zeros(len(traces), dtype=float)
+        domain_masks = self._term_masks(domain_traces)
         proc_codes, proc_uniques = pd.factorize(traces[COL_PROC_NAME])
         n_proc = max(len(proc_uniques), 1)
         # THE COHERENT VECTORS DECOMPOSE A PROCESS, AND `proc_name` IS PER THREAD.
@@ -293,12 +306,6 @@ class FastPathPlan:
         # So the domain matrices are grouped by pid, which is what "per process" means and what
         # the fixture behind `test_domain_attribution.py` has always used. Falls back to
         # `proc_name` where there is no pid column, so nothing that lacks one changes behaviour.
-        if "pid" in traces.columns:
-            dproc_codes, dproc_uniques = pd.factorize(traces["pid"])
-        else:
-            dproc_codes, dproc_uniques = proc_codes, proc_uniques
-        n_dproc = max(len(dproc_uniques), 1)
-
         for view_type in self.view_types:
             if view_type not in traces.columns:
                 continue
@@ -314,10 +321,6 @@ class FastPathPlan:
             else:
                 pair_codes = group_codes * n_proc + proc_codes
                 n_pairs = n_groups * n_proc
-            # The (window, PID) pairing the domain matrices use; see the note above n_dproc.
-            dpair_codes = group_codes * n_dproc + dproc_codes
-            n_dpairs = n_groups * n_dproc
-
             # One preallocated float64 block for the whole view. Assembling the frame column by
             # column and converting at the end cost more than every bincount put together: a
             # 171-column `astype` is ~40 ms, which is half an 82 ms window budget on its own.
@@ -328,6 +331,25 @@ class FastPathPlan:
             # from different ones. See metrics.coherent_domain_vectors.
             domain_mats: Dict[str, np.ndarray] = {}
 
+            # Only the epoch domain matrix may use the completed window's associated unkeyed
+            # rows. Other views continue to use their ordinary keyed source exactly as before.
+            matrix_traces = domain_traces if view_type == "epoch" else traces
+            matrix_masks = domain_masks if view_type == "epoch" else masks
+            if "pid" in matrix_traces.columns:
+                matrix_dproc_codes, matrix_dproc_uniques = pd.factorize(matrix_traces["pid"])
+            else:
+                matrix_dproc_codes, matrix_dproc_uniques = pd.factorize(matrix_traces[COL_PROC_NAME])
+            matrix_n_dproc = max(len(matrix_dproc_uniques), 1)
+            matrix_group_codes = pd.Categorical(
+                matrix_traces[view_type], categories=group_uniques
+            ).codes
+            matrix_valid = matrix_group_codes >= 0
+            matrix_pair_codes = matrix_group_codes * matrix_n_dproc + matrix_dproc_codes
+            matrix_n_pairs = n_groups * matrix_n_dproc
+            matrix_time_values = pd.to_numeric(
+                matrix_traces[COL_TIME], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=float)
+
             def _emit(name: str, values: np.ndarray) -> None:
                 names.append(name)
                 # The full path runs `.replace(0, pd.NA)` on the main view and on each view, so a
@@ -336,15 +358,17 @@ class FastPathPlan:
 
             for prefix, _condition, wants_size in self.terms:
                 mask = masks[prefix] & valid
+                if prefix in _DOMAIN_LAYERS and not is_process_based:
+                    matrix_mask = matrix_masks[prefix] & matrix_valid
+                    if matrix_mask.any():
+                        domain_mats[prefix] = np.bincount(
+                            matrix_pair_codes[matrix_mask], weights=matrix_time_values[matrix_mask],
+                            minlength=matrix_n_pairs,
+                        ).reshape(n_groups, matrix_n_dproc)
+                    else:
+                        domain_mats[prefix] = np.zeros((n_groups, matrix_n_dproc))
                 if not mask.any():
                     empty = np.zeros(n_groups)
-                    if prefix in _DOMAIN_LAYERS and not is_process_based:
-                        # PRESENCE, not truthiness. The layer is declared by the preset, so the
-                        # decomposition must see a measured zero here and not an absent instrument
-                        # -- the same distinction set_window_decomposition_metrics makes on the
-                        # column, and the reason a run whose loader kept up does not silently take
-                        # the fetch-minus-decode fallback.
-                        domain_mats[prefix] = np.zeros((n_groups, n_dproc))
                     _emit("%s_time_sum" % prefix, empty)
                     _emit("%s_time_proc_max" % prefix, empty)
                     _emit("%s_count_sum" % prefix, empty)
@@ -357,12 +381,6 @@ class FastPathPlan:
                     time_proc_max = per_pair
                 else:
                     per_pair = per_pair.reshape(n_groups, n_proc)
-                    if prefix in _DOMAIN_LAYERS:
-                        # Re-binned by pid rather than reshaped from the per-thread pairing: a
-                        # thread's time must land on ITS RANK's row, not on a row of its own.
-                        domain_mats[prefix] = np.bincount(
-                            dpair_codes[mask], weights=time_values[mask],
-                            minlength=n_dpairs).reshape(n_groups, n_dproc)
                     time_sum = per_pair.sum(axis=1)
                     time_proc_max = per_pair.max(axis=1)
                 _emit("%s_time_sum" % prefix, time_sum)
@@ -379,5 +397,8 @@ class FastPathPlan:
             if not is_process_based and "window_wall" in domain_mats:
                 coherent = coherent_domain_vectors(domain_mats)
             view = set_window_decomposition_metrics(view, is_process_based, coherent=coherent)
+            if view_type == "epoch" and not is_process_based:
+                view["domain_epoch_association_unambiguous"] = domain_epoch_association_unambiguous
+                view["domain_unkeyed_rows_included"] = domain_unkeyed_rows_included
             views[(view_type,)] = view.sort_index(axis=1)
         return views

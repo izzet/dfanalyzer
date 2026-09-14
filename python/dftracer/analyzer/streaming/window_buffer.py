@@ -99,6 +99,7 @@ class CompletedWindowBoundary:
     # runs the drain and the analysis, so a slow window makes the next window's boundaries appear
     # to arrive in a burst that has nothing to do with the application.
     boundary_ts_ns_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    discard_by_pid: Dict[int, bool] = dc.field(default_factory=dict)
 
 
 @dc.dataclass
@@ -109,6 +110,7 @@ class _PendingWindowBoundary:
     events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
     start_events_written_by_pid: Dict[int, int] = dc.field(default_factory=dict)
     boundary_ts_ns_by_pid: Dict[int, int] = dc.field(default_factory=dict)
+    discard_by_pid: Dict[int, bool] = dc.field(default_factory=dict)
 
 
 class WindowTracker:
@@ -174,6 +176,7 @@ class WindowTracker:
         pid: int,
         boundary_ts_ns: int,
         events_written: Optional[int] = None,
+        discard: bool = False,
     ) -> List[CompletedWindowBoundary]:
         window_index = self.active_window_by_pid.get(pid)
         if window_index is None:
@@ -217,6 +220,7 @@ class WindowTracker:
             pending.boundary_ts_ns_by_pid[pid] = boundary_ts_ns
         if events_written is not None and events_written > 0:
             pending.events_written_by_pid[pid] = events_written
+        pending.discard_by_pid[pid] = bool(discard)
 
         completed: List[CompletedWindowBoundary] = []
         while True:
@@ -231,6 +235,7 @@ class WindowTracker:
                     events_written_by_pid=dict(next_pending.events_written_by_pid),
                     start_events_written_by_pid=dict(next_pending.start_events_written_by_pid),
                     boundary_ts_ns_by_pid=dict(next_pending.boundary_ts_ns_by_pid),
+                    discard_by_pid=dict(next_pending.discard_by_pid),
                 )
             )
             self.pending_by_window.pop(self.next_window_to_emit, None)

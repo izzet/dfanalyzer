@@ -1151,6 +1151,7 @@ class DFTracerAnalyzer(Analyzer):
             "ts": "Int64",
             "te": "Int64",
             "dur": "Int64",
+            "window": "Int64",
             "epoch": "Int64",
             "step": "Int64",
             "tinterval": "Int64" if self.time_approximate else "string",

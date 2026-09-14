@@ -1,5 +1,16 @@
+import sys
+from pathlib import Path
+
 import pandas as pd
 import pytest
+
+# Match the node agent bootstrap: use this worktree's analyzer code while the
+# extension package itself remains installed in the supported venv.
+import dftracer
+
+_SOURCE_PACKAGE = Path(__file__).resolve().parents[1] / "python" / "dftracer"
+if str(_SOURCE_PACKAGE) not in dftracer.__path__:
+    dftracer.__path__.insert(0, str(_SOURCE_PACKAGE))
 
 from dftracer.analyzer.fact_engine import FactEngine
 from dftracer.analyzer.fact_rules import build_fact_rule
@@ -69,6 +80,43 @@ def test_fact_engine_emits_per_row_and_window_facts():
     assert proc_facts[0].scope.entity == "window"
     assert proc_facts[0].fact_type == "epoch_straggler"
     assert proc_facts[0].evidence["metrics"]["epoch_straggler_ratio"] == pytest.approx(10.0 / 3.0)
+
+
+def test_fact_engine_preserves_native_window_view_identity():
+    rule = build_fact_rule(
+        raw_rule={
+            "id": "rule.window.signal",
+            "priority": 1,
+            "source_view": "window",
+            "fact_type": "window_signal",
+            "required_metrics": ["active_time"],
+            "when": "active_time > 0",
+            "severity_score": "1.0",
+        }
+    )
+    facts = FactEngine([rule]).evaluate(
+        {("window",): pd.DataFrame({"active_time": [2.0]}, index=pd.Index([9], name="window"))},
+        raw_stats={"run_id": "native-window"},
+    )
+    fact = facts[("window",)][0]
+    assert fact.window.view_type == "window"
+    assert fact.window.window == 9
+    assert fact.window.epoch is None
+
+
+def test_fact_engine_explicitly_rebinds_epoch_rules_for_native_window_only():
+    rule = build_fact_rule({
+        "id": "native.rebind", "priority": 1, "source_view": "epoch",
+        "fact_type": "signal", "required_metrics": ["active_time"],
+        "when": "active_time > 0", "severity_score": "1.0",
+    })
+    engine = FactEngine([rule])
+    assert engine.rebind_source_view(from_view="epoch", to_view="window") == 1
+    assert engine.evaluate({("epoch",): pd.DataFrame({"active_time": [1.0]}, index=[9])}, raw_stats={}) == {}
+    facts = engine.evaluate({("window",): pd.DataFrame({"active_time": [1.0]}, index=[9])}, raw_stats={})
+    fact = facts[("window",)][0]
+    assert fact.window.view_type == "window"
+    assert fact.window.window == 9
 
 
 def test_fact_engine_skips_rule_with_unresolved_identifier():
