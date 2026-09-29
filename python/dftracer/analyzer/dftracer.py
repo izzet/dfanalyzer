@@ -1,11 +1,21 @@
-import dask.dataframe as dd
 import math
-import numpy as np
 import os
+from typing import Dict, List, Optional, Tuple
+
+import dask.dataframe as dd
+import numpy as np
 import pandas as pd
 import structlog
+from betterframe import BetterFrame
 from betterset import BetterSet
+from dask.distributed import Client, get_client
 from dftracer.utils import AggregationConfig, Indexer
+from dftracer.utils.dask import (
+    DaskTraceViewer,
+    ProgressAggregator,
+    assign_files_by_pid,
+    register_auto_thread_plugin,
+)
 from dftracer.utils.dfanalyzer import (
     DFAnalyzerAggregatedTraceViewer,
     HLMConfig,
@@ -17,21 +27,13 @@ from dftracer.utils.dfanalyzer import (
     ensure_index,
     finalize_view_partials,
     index_path_for,
+    merge_view_partials,
     normalize_arrow_dtypes,
     partial_arrow_view_groupby,
     resolve_trace_inputs,
     typed_group_keys,
 )
-from dftracer.utils.dask import (
-    DaskTraceViewer,
-    ProgressAggregator,
-    assign_files_by_pid,
-    register_auto_thread_plugin,
-)
-from dask.distributed import Client, get_client
-from typing import Dict, List, Optional, Tuple
 
-from .analyzer import Analyzer
 from .analysis_utils import (
     build_view_rename_map,
     derive_call_stats,
@@ -39,8 +41,7 @@ from .analysis_utils import (
     fix_std_cols,
     set_unique_counts,
 )
-from betterframe import BetterFrame
-
+from .analyzer import Analyzer
 from .constants import (
     COL_ACC_PAT,
     COL_COUNT,
@@ -332,17 +333,13 @@ class DFTracerAnalyzer(Analyzer):
             system_metrics=system_metrics,
         )
 
-    def read_trace_local(
-        self, trace_path, extra_columns=None, extra_columns_fn=None, group_by_file=True
-    ):
+    def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None, group_by_file=True):
         """In-process read: the same View-based path as read_trace, driven by a
         NullClient so the scan runs in this process instead of on cluster workers.
         One read path keeps the schema identical to the distributed read."""
         from .cluster import NullClient
 
-        return self.read_trace(
-            trace_path, extra_columns, extra_columns_fn, group_by_file, client=NullClient()
-        )
+        return self.read_trace(trace_path, extra_columns, extra_columns_fn, group_by_file, client=NullClient())
 
     def read_trace(
         self,
@@ -395,8 +392,7 @@ class DFTracerAnalyzer(Analyzer):
             if status.total_files == 0:
                 indexer.close()
                 raise FileNotFoundError(
-                    f"No .pfw or .pfw.gz files found directly in {trace_path} "
-                    "(subdirectories are not searched)."
+                    f"No .pfw or .pfw.gz files found directly in {trace_path} (subdirectories are not searched)."
                 )
 
         with log_block("query_file_info"):
@@ -512,8 +508,9 @@ class DFTracerAnalyzer(Analyzer):
         return self._view_hlm(view_types, profiles=True)
 
     def _compute_view(self, layer, records, view_key, view_type, view_types):
-        from .constants import VIEW_TYPES
         import itertools as it
+
+        from .constants import VIEW_TYPES
 
         # `records` is a Dask frame, or a pandas one when compute_views decided
         # the layer was small enough to materialise. The algorithm below is
@@ -604,23 +601,11 @@ class DFTracerAnalyzer(Analyzer):
             ),
         )
 
-        merge_aggs = {}
-        for c in full_cols:
-            merge_aggs[f"{c}_sum"] = "sum"
-            merge_aggs[f"{c}_count"] = "sum"
-            merge_aggs[f"{c}_sumsq"] = "sum"
-            merge_aggs[f"{c}_min"] = "min"
-            merge_aggs[f"{c}_max"] = "max"
-        for c in sum_cols:
-            merge_aggs[f"{c}_sum"] = "sum"
-        for c in min_cols:
-            merge_aggs[f"{c}_min"] = "min"
-        for c in max_cols:
-            merge_aggs[f"{c}_max"] = "max"
-        for c, _ in set_cols_items:
-            merge_aggs[f"{c}_unique"] = ops.set_union_flatten()
-
-        merged = partials.pipe(lambda df: df.groupby(view_type).agg(merge_aggs))
+        merged = partials.pipe(
+            lambda df: merge_view_partials(
+                df, full_cols, sum_cols, min_cols, max_cols, [c for c, _ in set_cols_items], BetterSet.flatten
+            )
+        )
 
         final = merged.apply(
             finalize_view_partials,
@@ -717,9 +702,7 @@ class DFTracerAnalyzer(Analyzer):
         # the count includes files the analysis dropped.
         index_path = getattr(self, "_index_path", None)
         if index_path:
-            return count_index_files(
-                getattr(self, "_all_files", []), index_path, tuple(IGNORED_FILE_PATTERNS)
-            )
+            return count_index_files(getattr(self, "_all_files", []), index_path, tuple(IGNORED_FILE_PATTERNS))
         file_hash = traces["file_hash"]
         return file_hash[file_hash != ""].nunique()
 

@@ -318,11 +318,11 @@ def test_read_trace_standardizes_profiles_and_aligns_to_5s_grid(dask_client, hyb
     assert profile["count"] == 3
     assert profile["time"] == pytest.approx(0.0003)
     assert profile["size"] is None or str(profile["size"]) == "<NA>"
-    # time_range is relative to the trace origin (first populated bucket):
-    # the read event and the profile both fall in bucket 0.
-    assert profile["time_start"] == 0
-    assert profile["time_end"] == 5_000_000
-    assert profile["time_range"] == 0
+    # time_range is relative to the trace origin (first populated bucket).
+    # The read at 6.0s is in bucket 0; the profile at 10.0s is one bucket later.
+    assert profile["time_start"] == 5_000_000
+    assert profile["time_end"] == 10_000_000
+    assert profile["time_range"] == 1
     assert profile["time_start"] % 5_000_000 == 0
 
 
