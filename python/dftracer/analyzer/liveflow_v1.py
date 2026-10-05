@@ -27,7 +27,11 @@ def declaration(workload=None, tf_decode=None):
     # in the trainer's main thread (stall.delivery), so the storage/delivery split is a measurement,
     # not an estimate. Declared, never inferred from a missing column: an unmeasured declared family
     # leaves the window invalid and nothing is attributed.
-    if workload in ('sfno', 'stormer'):
+    # Cross-layer ablation (LIVEFLOW_SFNO_APP_ONLY=1): an application-level-only detector declares ONE input
+    # family, storage; the trainer then emits its whole fetch wait as stall.storage (the DLIO-style undivided
+    # next(loader) total) and the delivery family is not declared.
+    app_only = workload == 'sfno' and os.environ.get('LIVEFLOW_SFNO_APP_ONLY', '0') == '1'
+    if workload in ('sfno', 'stormer') and not app_only:
         families.append('delivery')
     return dict(workload=workload, input_families=families, comm=True,
                 split_wait=len(families) == 2,
