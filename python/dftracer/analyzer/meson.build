@@ -13,6 +13,8 @@ py.install_sources(
         'dftracer.py',
         'fact_engine.py',
         'fact_rules.py',
+        'liveflow_v1.py',
+        'fastpath.py',
         'input.py',
         'metrics.py',
         'output.py',
@@ -24,7 +26,9 @@ py.install_sources(
 
 install_data(
     'configs/fact_rules/dlio.yaml',
+    'configs/fact_rules/liveflow-v1.yaml',
     'configs/fact_rules/dlio-global.yaml',
+    'configs/fact_rules/dlio-wisio-worker-slope.yaml',
     'configs/fact_rules/stormer.yaml',
     install_dir: py.get_install_dir(subdir: 'dftracer/analyzer/configs/fact_rules'),
 )

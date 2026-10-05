@@ -1,0 +1,61 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow StorMer input rule (OFFLINE CANDIDATE, 2026-09-25).  Not selected by any preset or
+# launcher.  Port of liveflow-tf-input-slope-exposure.yaml with StorMer-specific semantics; see
+# liveflow_shm/DETECTOR-CARD-stormer-input.md.
+#
+# Three things are named SEPARATELY and never merged:
+#   1. worker-read family: canonical WiSIO reader_posix_read_ops_slope (count_frac_total /
+#      time_proc_frac_total, 45-degree reference 1), reduced by min over the roster-verified
+#      DataLoader WORKER rows.  Imbalance diagnostic only (2026-09-24 judge boundary).
+#   2. measured total consumer wait on the critical rank: domain_input + domain_decode crit.  The
+#      TOTAL is measured; it is the only exposure quantity the gate uses.
+#   3. estimated storage/decode split of that wait (StallAccount exact=False, ratio of stage
+#      service times, or all-storage when no stage evidence).  Reported as
+#      estimated_storage_wait_share; never a gate and never used to pick a knob.
+#
+# DELIBERATE DIFFERENCE FROM THE TF/DLIO RULES: no `stall_storage_rank_coverage` term.  DLIO/TF
+# treat an emitted zero-duration stall.storage record as proof of instrument coverage.  StorMer's
+# emitter omits zero-duration records (`_emit`: `if ms <= 0: return`), so there absence means "no
+# wait" as often as "no instrument", and requiring every rank to carry a record would suppress
+# exactly the windows where some rank was not starved.  Exposure is instead required on the
+# critical rank (crit total > 0), and worker-owned rows are proven by the worker roster.
+defaults:
+  rule_version: "liveflow-stormer-input-slope-exposure-v1"
+
+rules:
+  - id: stormer.reader_posix_read.worker_pool.slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: reader_posix_read.worker_pool
+    worker_only: true
+    window_reducer: min
+    window_reducer_metric: reader_posix_read_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: reader_posix
+    required_metrics:
+      - worker_roster_coverage
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - reader_posix_read_count_frac_total
+      - reader_posix_read_time_proc_frac_total
+      - reader_posix_read_ops_slope
+    derived_metrics:
+      reader_posix_read_ops_slope_ref45_deficit: "clip01(1.0 - reader_posix_read_ops_slope)"
+      measured_total_wait_time_proc_crit: "fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit)"
+      estimated_storage_wait_share: "fillna0(domain_input_time_proc_crit) / max(fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit), 1e-9)"
+    when: "worker_roster_coverage == 1.0 and domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and measured_total_wait_time_proc_crit > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and reader_posix_read_count_frac_total > 0.0 and reader_posix_read_time_proc_frac_total > 0.0 and reader_posix_read_ops_slope > 0.0 and reader_posix_read_ops_slope_ref45_deficit > 0.0"
+    severity_score: reader_posix_read_ops_slope_ref45_deficit
+    opportunity_tags:
+      - reader_parallelism

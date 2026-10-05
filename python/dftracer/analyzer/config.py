@@ -222,6 +222,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'fetch_iter': {},
             'fetch_block': {},
             'stall_storage': {},
+            'reader_decode': {},
             'data_loader': {
                 'init': 'func_name.str.contains("init")',
                 'item': 'func_name.str.contains("item")',
@@ -276,6 +277,11 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'comm_all_reduce': 'cat == "comm" & func_name == "all_reduce"',
             # Children only. DLIO emits no parent `stall` region.
             'stall_storage': 'cat == "stall" & func_name == "stall.storage"',
+            # TF decode service time (`dft_ai.data.derive("decode")` around tf_reader._parse_image).
+            # A per-operation FAMILY for the canonical WiSIO slope only: DLIO has no separately
+            # measurable decode EXPOSURE (see set_window_decomposition_metrics), so this layer does
+            # not feed the coherent domain vector while stall_storage is present.
+            'reader_decode': 'cat == "data" & func_name == "decode"',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
@@ -300,6 +306,7 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             'fetch_iter': 'epoch',
             'fetch_block': 'epoch',
             'stall_storage': 'fetch_iter',
+            'reader_decode': 'fetch_iter',
             'compute': 'fetch_block',
             'comm': 'compute',
             'comm_all_reduce': 'comm',
@@ -424,7 +431,16 @@ class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
     layer_defs: Dict[str, Optional[str]] = dc.field(
         default_factory=lambda: dict(
             AnalyzerPresetConfigStormer().layer_defs,
-            **dict(_STALL_LAYER_DEFS, **{'reader_decode': 'cat == "data" & func_name == "decode"'})
+            **dict(_STALL_LAYER_DEFS, **{'reader_decode': 'cat == "data" & func_name == "decode"',
+                                          # DELIVERY (worker -> trainer sample handoff,
+                                          # liveflow_delivery.py): the main-thread time inside
+                                          # next(loader) spent on handoff mechanics (unpickle, map,
+                                          # housekeeping), measured exactly, not estimated.
+                                          # stall_storage then carries the REST of the fetch wait.
+                                          'stall_delivery': 'cat == "stall" & func_name == "stall.delivery"',
+                                          # Worker-side service time of the handoff (share/copy into
+                                          # the ring); like reader_decode it overlaps the fetch wait.
+                                          'delivery': 'cat == "data" & func_name == "delivery"'})
         )
     )
     layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
@@ -432,19 +448,21 @@ class AnalyzerPresetConfigStormerXLayer(AnalyzerPresetConfigStormer):
             AnalyzerPresetConfigStormer().layer_deps,
             # decode runs in the forked workers and overlaps the main-process fetch wait through
             # the prefetch queue -> child of fetch_iter AND async (see async_layers below).
-            **{'reader_decode': 'fetch_iter',
+            **{'reader_decode': 'fetch_iter', 'delivery': 'fetch_iter',
                # A decomposition of the app-level fetch wait, like reader_decode, but MAIN THREAD
                # and on the critical path, so NOT listed in async_layers.
-               'stall_storage': 'fetch_iter', 'stall_decode': 'fetch_iter'}
+               'stall_storage': 'fetch_iter', 'stall_decode': 'fetch_iter',
+               'stall_delivery': 'fetch_iter'}
         )
     )
     async_layers: List[str] = dc.field(
-        default_factory=lambda: list(AnalyzerPresetConfigStormer().async_layers) + ['reader_decode']
+        default_factory=lambda: list(AnalyzerPresetConfigStormer().async_layers) + ['reader_decode', 'delivery']
     )
     derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
         default_factory=lambda: dict(
             AnalyzerPresetConfigStormer().derived_metrics or {},
-            **{'reader_decode': {}, 'stall_storage': {}, 'stall_decode': {}}
+            **{'reader_decode': {}, 'stall_storage': {}, 'stall_decode': {}, 'stall_delivery': {},
+               'delivery': {}}
         )
     )
     name: str = "stormer_xlayer"
@@ -507,6 +525,44 @@ class AnalyzerPresetConfigHalo3d(AnalyzerPresetConfigStormer):
                                   'stall_storage', 'stall_decode']})
     size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=lambda: {})
     name: str = "halo3d"
+
+
+def _liveflow_declaration():
+    import os
+    from .liveflow_v1 import declaration
+    return declaration(os.environ.get("LIVEFLOW_WORKLOAD", "dlio-pytorch"))
+
+
+def _liveflow_profile():
+    declared = _liveflow_declaration()
+    if declared['workload'] == 'sfno':
+        # SFNO emits the dft_ai vocabulary the stormer preset already reads; its comm region is the
+        # DDP all-reduce hook (cat "comm"), so the base comm layer is kept.
+        return AnalyzerPresetConfigStormerXLayer()
+    if declared['workload'] == 'stormer':
+        profile = AnalyzerPresetConfigStormerXLayer()
+        # stormer-v1-smoke (2026-10-04): under STORMER_COMM_PROBE=event StorMer emits two `comm` event
+        # families per step, comm.exposed (the non-overlapped collective wait) and comm.total (the sum of
+        # per-bucket spans, overlapped with backward).  The v1 attribution needs the WAIT, and compute
+        # (which contains the overlapped total) is reduced by it, so the comm family is exposed-only.
+        profile.layer_defs = dict(profile.layer_defs,
+                                  comm='cat == "comm" & func_name == "comm.exposed"')
+        return profile
+    return (AnalyzerPresetConfigHalo3d() if declared['workload'] == 'halo3d'
+            else AnalyzerPresetConfigDLIOAILogging())
+
+
+@dc.dataclass
+class AnalyzerPresetConfigLiveFlowV1(AnalyzerPresetConfigDLIO):
+    """One selected preset, with an explicit workload measurement declaration."""
+    name: str = 'liveflow-v1'
+    layer_defs: Dict[str, Optional[str]] = dc.field(default_factory=lambda: _liveflow_profile().layer_defs)
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=lambda: _liveflow_profile().layer_deps)
+    async_layers: List[str] = dc.field(default_factory=lambda: _liveflow_profile().async_layers)
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=lambda: _liveflow_profile().derived_metrics)
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(default_factory=lambda: _liveflow_profile().size_derived_metrics)
+    # Presence is declared in this preset, never inferred from missing columns.
+    liveflow_families: Dict[str, Any] = dc.field(default_factory=_liveflow_declaration)
 
 
 @dc.dataclass
@@ -773,6 +829,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
     cs.store(group="analyzer/preset", name="stormer", node=AnalyzerPresetConfigStormer)
     cs.store(group="analyzer/preset", name="halo3d", node=AnalyzerPresetConfigHalo3d)
+    cs.store(group="analyzer/preset", name="liveflow-v1", node=AnalyzerPresetConfigLiveFlowV1)
     cs.store(group="analyzer/preset", name="stormer_xlayer", node=AnalyzerPresetConfigStormerXLayer)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)

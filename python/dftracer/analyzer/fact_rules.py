@@ -27,6 +27,11 @@ class FactRule:
     opportunity_tags: List[str]
     suppresses_tags: List[str] = dc.field(default_factory=list)
     emit_mode: str = "per_row"
+    scope_entity: Optional[str] = None
+    worker_only: bool = False
+    rank_thread_only: bool = False
+    window_reducer: str = "first"
+    window_reducer_metric: Optional[str] = None
     rule_version: str = "1.0.0"
     allow_mixed: bool = False
     referenced_columns: Set[str] = dc.field(default_factory=set)
@@ -74,10 +79,27 @@ def build_fact_rule(
     confidence = raw_rule.get("confidence", defaults.get("confidence"))
     opportunity_tags = list(raw_rule.get("opportunity_tags", []))
     emit_mode = str(raw_rule.get("emit_mode", defaults.get("emit_mode", "per_row")))
+    scope_entity = raw_rule.get("scope_entity")
+    worker_only = bool(raw_rule.get("worker_only", False))
+    rank_thread_only = bool(raw_rule.get("rank_thread_only", False))
+    window_reducer = str(raw_rule.get("window_reducer", "first"))
+    window_reducer_metric = raw_rule.get("window_reducer_metric")
     allow_mixed = bool(raw_rule.get("allow_mixed", False))
     if emit_mode not in {"per_row", "window"}:
         raise FactRuleValidationError(
             f"Rule '{rule_id}' has invalid emit_mode '{emit_mode}'. Expected one of ['per_row', 'window']."
+        )
+    if worker_only and rank_thread_only:
+        raise FactRuleValidationError(
+            f"Rule '{rule_id}' cannot set both worker_only and rank_thread_only."
+        )
+    if window_reducer not in {"first", "min", "max"}:
+        raise FactRuleValidationError(
+            f"Rule '{rule_id}' has invalid window_reducer '{window_reducer}'."
+        )
+    if window_reducer != "first" and not window_reducer_metric:
+        raise FactRuleValidationError(
+            f"Rule '{rule_id}' uses window_reducer={window_reducer} without window_reducer_metric."
         )
 
     expressions = [when, severity_score]
@@ -113,6 +135,12 @@ def build_fact_rule(
         opportunity_tags=opportunity_tags,
         suppresses_tags=suppresses_tags,
         emit_mode=emit_mode,
+        scope_entity=str(scope_entity) if scope_entity is not None else None,
+        worker_only=worker_only,
+        rank_thread_only=rank_thread_only,
+        window_reducer=window_reducer,
+        window_reducer_metric=(str(window_reducer_metric)
+                               if window_reducer_metric is not None else None),
         rule_version=str(raw_rule.get("rule_version", defaults.get("rule_version", "1.0.0"))),
         allow_mixed=allow_mixed_effective,
         referenced_columns=referenced_columns,

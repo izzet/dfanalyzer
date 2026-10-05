@@ -1,0 +1,64 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow TensorFlow input rule, MEASURED-SKEW variant (2026-09-25).  Same slope detection as
+# liveflow-tf-input-slope-exposure.yaml, but the exposure conjunction is the analyzer's measured
+# cross-rank attribution (SKEW-ATTRIBUTION-2026-09-25.md): domain_skew_coverage == 1 and the attributed
+# input-skew time A > 0 (constants 0 and 1 only).  This is the rule the loop arm uses: an input
+# fact can no longer be carried by a comm-dominant window without measured A > 0.
+# (Below: the original rule's header.)  LiveFlow TensorFlow input rule (production candidate, 2026-09-25).
+# Detection = the canonical within-family WiSIO reader_posix_read slope
+# (count_frac_total / time_proc_frac_total, 45-degree reference of 1, no tuned
+# constant) CONJOINED with measured same-window consumer input exposure: the
+# fact is emitted only if the completed window is coherent, the rank-side
+# stall.storage event was observed for every expected control rank
+# (stall_storage_rank_coverage == 1) and domain_input_time_proc_crit > 0.
+# A slope below one alone is NOT a trigger (2026-09-24 judge boundary).  The
+# fact is evidence only: LiveOptimizer (cbandit, predicted-effect gate) owns the
+# action decision.  Selected by liveflow_shm/tests/p3_loop_smoke.sh only.
+defaults:
+  rule_version: "liveflow-tf-input-skew-slope-exposure-v1"
+
+rules:
+  - id: tf.reader_posix_read.rank_thread_pool.skew_slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: reader_posix_read.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: reader_posix_read_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: reader_posix
+    required_metrics:
+      - stall_storage_rank_coverage
+      - domain_skew_coverage
+      - domain_input_skew_attributed_time
+      - domain_input_skew_excess_time
+      - domain_comm_barrier_wait_time
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_decode_time_proc_typ
+      - domain_compute_time_proc_typ
+      - window_wall_time_proc_typ
+      - domain_skew_late_proc_input_time
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - reader_posix_read_count_frac_total
+      - reader_posix_read_time_proc_frac_total
+      - reader_posix_read_ops_slope
+    derived_metrics:
+      reader_posix_read_ops_slope_ref45_deficit: "clip01(1.0 - reader_posix_read_ops_slope)"
+    when: "stall_storage_rank_coverage == 1.0 and domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and domain_skew_coverage == 1.0 and domain_input_skew_attributed_time > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and reader_posix_read_count_frac_total > 0.0 and reader_posix_read_time_proc_frac_total > 0.0 and reader_posix_read_ops_slope > 0.0 and reader_posix_read_ops_slope_ref45_deficit > 0.0"
+    severity_score: reader_posix_read_ops_slope_ref45_deficit
+    opportunity_tags:
+      - reader_parallelism

@@ -2,6 +2,7 @@ import dataclasses as dc
 import importlib.util
 import math
 import os
+import re
 from pathlib import Path
 import pandas as pd
 import structlog
@@ -29,6 +30,78 @@ RESERVED_IDENTIFIERS = {
     "fillna0",
     "math",
 }
+
+COHERENT_WINDOW_METRICS = (
+    "domain_coherent", "domain_procs_active", "window_wall_time_proc_crit",
+    "domain_input_time_proc_crit", "domain_decode_time_proc_crit",
+    "domain_comm_time_proc_crit", "domain_compute_time_proc_crit",
+    "residual_time_proc_crit",
+)
+
+# The online control window is the authority for safety and domain context.  A
+# worker-only proc_name rule may receive only this fixed vector; arbitrary
+# analyzer context must never become rule input.
+CONTROL_WINDOW_METRICS = COHERENT_WINDOW_METRICS + (
+    "epoch_nunique", "step_nunique", "step_min", "step_max",
+)
+
+# Optional, analyzer-owned: the measured cross-rank input-skew attribution (SKEW-ATTRIBUTION-2026-09-25.md)
+# and the typical rank's vector.  Injected into a rank-thread rule only when the window frame carries them
+# and they are finite; a rule that requires one fails closed when it is absent.
+SKEW_WINDOW_METRICS = (
+    "domain_skew_coverage", "domain_input_skew_attributed_time", "domain_input_skew_excess_time",
+    "domain_comm_barrier_wait_time", "domain_skew_late_proc_input_time",
+    "domain_skew_late_proc_comm_time", "domain_comm_residual_after_skew_time",
+    "domain_input_time_proc_typ", "domain_decode_time_proc_typ", "domain_comm_time_proc_typ",
+    "domain_compute_time_proc_typ", "window_wall_time_proc_typ",
+)
+
+# Window-level exposure metrics the PLANNER reads (clbo_planner.domains_from_metrics): the step-
+# granular input sum-of-max (per node and job), and the exposed/total comm window medians.  The
+# analyzer computes them on the ("window",) view (metrics.attach_input_step_max_sum_metrics,
+# attach_input_job_step_max_sum_metrics, attach_comm_exposed_median_metrics,
+# attach_comm_total_median_metrics) but a finding's key_metrics are exactly the fact's evidence
+# metrics, which held only the rule's own required/derived metrics -- so on every real run the
+# planner logged input_job_sum_of_max=null, comm_*_median=null and silently fell back to the
+# crit-reference tier these metrics exist to replace (v4.5.10.1 1N run, 2026-09-28).  Forwarded
+# ONLY when present and finite; a rule never requires them, so no rule's fail-closed behaviour
+# changes and no threshold is involved.
+LOOP_EXPOSURE_WINDOW_METRICS = (
+    "domain_input_step_max_sum_time", "domain_input_step_nunique",
+    "domain_input_job_step_max_sum_time",
+    "domain_comm_pure_exposure_time_v2", "domain_comm_exposure_step_nunique",
+    "domain_comm_total_median_time_v3", "domain_comm_total_step_nunique",
+)
+
+COMPLETED_WINDOW_PROVENANCE_METRICS = (
+    "stall_storage_rank_coverage", "stall_storage_rank_expected_count",
+    "stall_storage_rank_observed_count", "stall_storage_raw_event_count",
+)
+
+COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS = (
+    "worker_roster_coverage", "worker_roster_expected_count",
+    "worker_roster_observed_count",
+)
+
+_RANK_THREAD_NAME = re.compile(r"^app#([^#]+)#([0-9]+)#([0-9]+)$")
+_RANK_THREAD_FAMILY_METRICS = (
+    "reader_posix_read_count_frac_total",
+    "reader_posix_read_time_proc_frac_total",
+    "reader_posix_read_ops_slope",
+)
+
+
+def _rank_thread_family_metrics(rule) -> tuple:
+    """The canonical WiSIO count/time/slope triple of the rule's operation family.
+
+    The family is named by the rule's reducer metric (`<family>_ops_slope`); a rule without one
+    keeps the original reader_posix_read family.  Families are never mixed within one rule.
+    """
+    metric = getattr(rule, "window_reducer_metric", None) or ""
+    if metric.endswith("_ops_slope"):
+        family = metric[: -len("_ops_slope")]
+        return ("%s_count_frac_total" % family, "%s_time_proc_frac_total" % family, metric)
+    return _RANK_THREAD_FAMILY_METRICS
 
 
 def _as_dict(raw_stats: Any) -> Dict[str, Any]:
@@ -246,7 +319,11 @@ class FactEngine:
                 raise
 
         logger.info("facts.rules.loaded", rule_file=resolved_rule_file, count=len(compiled_rules))
-        return cls(compiled_rules)
+        engine = cls(compiled_rules)
+        if Path(resolved_rule_file).stem == "liveflow-v1":
+            from .liveflow_v1 import declaration
+            engine.liveflow_declaration = declaration()
+        return engine
 
     @staticmethod
     def _resolve_rule_file(rule_file: str) -> str:
@@ -274,7 +351,25 @@ class FactEngine:
         self,
         flat_views: Dict[ViewKey, pd.DataFrame],
         raw_stats: Any,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[ViewKey, List[AnalysisFact]]:
+        # Always-on (no --debug dependency): the 2026-09-27 v4.5.6 short rerun showed
+        # analysis_facts=0 for all 40 windows with zero facts.rule.* lines even with DEBUG
+        # confirmed active process-wide (patch 12) -- not even the unconditional first-action
+        # facts.rule.skip inside _evaluate_view_rules fired once. FactEngine construction was
+        # independently verified correct (2 rules, rules_by_view={'proc_name': [...]}), so the
+        # remaining open question is whether the runtime flat_views dict handed to evaluate()
+        # ever actually contains a ("proc_name",) key for real windows. This line answers that
+        # directly and cheaply, every call, regardless of self.rules or view-key match outcome.
+        logger.info(
+            "facts.evaluate.view_keys",
+            view_keys=list(flat_views.keys()),
+            view_row_counts={str(k): len(v) for k, v in flat_views.items()},
+            rules_by_view_keys=list(self.rules_by_view.keys()),
+        )
+        if hasattr(self, "liveflow_declaration"):
+            from .liveflow_v1 import prepare_views
+            flat_views = prepare_views(flat_views, self.liveflow_declaration)
         if not self.rules:
             return {}
 
@@ -290,6 +385,7 @@ class FactEngine:
                 rules=view_rules,
                 raw_stats=raw_stats_dict,
                 view_key=view_key,
+                context=context or {},
             )
             if facts:
                 all_facts[view_key] = facts
@@ -307,6 +403,7 @@ class FactEngine:
         rules: List[FactRule],
         raw_stats: Dict[str, Any],
         view_key: ViewKey,
+        context: Dict[str, Any],
     ) -> List[AnalysisFact]:
         run_id = raw_stats.get("run_id")
         view_type = view_key[-1]
@@ -316,12 +413,187 @@ class FactEngine:
 
         for rule in rules:
             projected_columns = [column for column in rule.projected_columns() if column in rule_df.columns]
-            missing_required = [column for column in rule.required_metrics if column not in projected_columns]
+            if hasattr(self, "liveflow_declaration"):
+                optional = ("windows_remaining", "epochs_remaining", "remaining_windows",
+                            "remaining_epochs", "remaining_steps", "configured_total_steps",
+                            "completed_steps", "configured_window_steps", "planner_history_ready",
+                            "lf_v1_per_step", "reader_posix_read_ops_slope",
+                            "reader_decode_ops_slope", "comm_ops_slope",
+                            "step_wall_p90_us")
+                # Applied-vector snapshot: `physical_<knob>` for each knob the workload declared.
+                optional += tuple(c for c in rule_df.columns
+                                  if isinstance(c, str) and c.startswith("physical_"))
+                projected_columns += [name for name in optional
+                                      if name in rule_df.columns and name not in projected_columns]
+            working_df = rule_df.loc[:, projected_columns].copy()
+
+            rank_thread_provenance = {}
+            if rule.worker_only or rule.rank_thread_only:
+                # A proc_name view is diagnostic by default.  Online
+                # worker-membership comes only from completed-window PID
+                # provenance, never from parsing a display name.
+                if view_type != "proc_name":
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="worker_only_non_proc_name_view")
+                    continue
+                row_pid_by_index = context.get("row_pid_by_index", {})
+                if not row_pid_by_index:
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="selector_provenance_missing")
+                    continue
+                eligible = []
+                if rule.worker_only:
+                    worker_pids = {int(pid) for pid in context.get("worker_pids", ())}
+                    if not worker_pids:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="worker_provenance_missing")
+                        continue
+                    for index in working_df.index:
+                        try:
+                            eligible.append(int(row_pid_by_index.get(index)) in worker_pids)
+                        except (TypeError, ValueError):
+                            eligible.append(False)
+                else:
+                    native_host = context.get("native_host")
+                    try:
+                        rank_pids = {int(pid) for pid in context.get("rank_pids", ())}
+                    except (TypeError, ValueError):
+                        rank_pids = set()
+                    if not isinstance(native_host, str) or not native_host or not rank_pids:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="rank_thread_provenance_missing")
+                        continue
+                    for index in working_df.index:
+                        match = _RANK_THREAD_NAME.match(str(index))
+                        if match is None or match.group(1) != native_host:
+                            eligible.append(False)
+                            continue
+                        parsed_pid, thread_id = int(match.group(2)), int(match.group(3))
+                        try:
+                            mapped_pid = int(row_pid_by_index.get(index))
+                        except (TypeError, ValueError):
+                            eligible.append(False)
+                            continue
+                        ok = parsed_pid == mapped_pid and parsed_pid in rank_pids
+                        eligible.append(ok)
+                        if ok:
+                            rank_thread_provenance[index] = {
+                                "selected_proc_name": str(index),
+                                "selected_rank_pid": parsed_pid,
+                                "selected_thread_id": thread_id,
+                                "selected_mapped_pid": mapped_pid,
+                            }
+                working_df = working_df.loc[eligible]
+                if working_df.empty:
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="no_selector_eligible_rows")
+                    continue
+                if rule.rank_thread_only:
+                    family_metrics = _rank_thread_family_metrics(rule)
+                    missing_family = [name for name in family_metrics
+                                      if name not in working_df.columns]
+                    if missing_family:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="rank_thread_family_metrics_missing",
+                                     missing=missing_family)
+                        continue
+                    numeric = working_df.loc[:, list(family_metrics)].apply(
+                        pd.to_numeric, errors="coerce")
+                    finite_positive = numeric.map(
+                        lambda value: pd.notna(value) and math.isfinite(float(value)) and float(value) > 0.0)
+                    working_df = working_df.loc[finite_positive.all(axis=1)]
+                    if working_df.empty:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="rank_thread_family_metrics_invalid")
+                        continue
+                # The worker row supplies only operation-family evidence.  The
+                # coherent control vector is the one-row completed-window
+                # aggregate, supplied by the analyzer context rather than
+                # selected from an arbitrary worker row.
+                native_window = _to_int_or_none(context.get("native_window"))
+                window_metrics = context.get("window_metrics", {})
+                if native_window is None or not isinstance(window_metrics, Mapping):
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="window_control_vector_missing")
+                    continue
+                try:
+                    control = {
+                        metric: float(window_metrics[metric])
+                        for metric in CONTROL_WINDOW_METRICS
+                    }
+                except (KeyError, TypeError, ValueError):
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="window_control_vector_invalid")
+                    continue
+                if (not all(math.isfinite(value) for value in control.values())
+                        or control["domain_coherent"] != 1.0
+                        or control["domain_procs_active"] <= 0
+                        or control["window_wall_time_proc_crit"] <= 0
+                        or any(control[name] < 0 for name in (
+                            "domain_input_time_proc_crit", "domain_decode_time_proc_crit",
+                            "domain_comm_time_proc_crit", "domain_compute_time_proc_crit",
+                        ))
+                        or control["epoch_nunique"] != 1.0
+                        or control["step_nunique"] < 1.0
+                        or control["step_min"] > control["step_max"]):
+                    logger.debug("facts.rule.skip", rule_id=rule.id,
+                                 reason="window_control_vector_invalid")
+                    continue
+                # Merge after PID membership filtering and before validation.
+                # The proc_name row remains the sole source of operation-family
+                # slope; this vector supplies only the completed-window gate.
+                # The native identity is also analyzer-owned context.  It is
+                # deliberately overwritten rather than accepted from a row so
+                # a test fixture may select a native window without allowing a
+                # proc-name artifact to forge its control provenance.
+                for metric, value in control.items():
+                    working_df[metric] = value
+                if rule.rank_thread_only:
+                    for metric in SKEW_WINDOW_METRICS + LOOP_EXPOSURE_WINDOW_METRICS:
+                        try:
+                            value = float(window_metrics[metric])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if math.isfinite(value):
+                            working_df[metric] = value
+                # A proc_name row may contain an identically named column.
+                # Never let it stand in for analyzer-owned raw-event evidence.
+                working_df.drop(columns=list(COMPLETED_WINDOW_PROVENANCE_METRICS),
+                                errors="ignore", inplace=True)
+                working_df.drop(columns=list(COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS),
+                                errors="ignore", inplace=True)
+                # Optional raw-event provenance is supplied exclusively by
+                # Analyzer's completed-window context. Future rules that
+                # require it fail closed if this context is unavailable;
+                # existing rules do not consume it.
+                provenance = context.get("completed_window_provenance", {})
+                if isinstance(provenance, Mapping):
+                    for metric in COMPLETED_WINDOW_PROVENANCE_METRICS:
+                        try:
+                            value = float(provenance[metric])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if math.isfinite(value):
+                            working_df[metric] = value
+                # The worker roster is an opt-in completed-window identity
+                # proof. It is never inferred from a proc_name row and is
+                # intentionally unavailable to rank-thread or default rules.
+                if rule.worker_only:
+                    roster_provenance = context.get("completed_window_worker_roster_provenance", {})
+                    if isinstance(roster_provenance, Mapping):
+                        for metric in COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS:
+                            try:
+                                value = float(roster_provenance[metric])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            if math.isfinite(value):
+                                working_df[metric] = value
+                working_df["__liveflow_window_index"] = float(native_window)
+
+            missing_required = [column for column in rule.required_metrics if column not in working_df.columns]
             if missing_required:
                 logger.debug("facts.rule.skip", rule_id=rule.id, reason="missing_metrics", missing=missing_required)
                 continue
-
-            working_df = rule_df.loc[:, projected_columns].copy()
 
             try:
                 for metric_name, expression in rule.derived_metrics.items():
@@ -392,8 +664,18 @@ class FactEngine:
 
             matched_indices = list(working_df.index[condition_mask])
             if rule.emit_mode == "window" and matched_indices:
-                # Emit a single finding for the whole window/view using the first matched row as anchor.
-                matched_indices = [matched_indices[0]]
+                if rule.window_reducer == "first":
+                    matched_indices = [matched_indices[0]]
+                else:
+                    metric = rule.window_reducer_metric
+                    assert metric is not None
+                    values = pd.to_numeric(working_df.loc[matched_indices, metric], errors="coerce").dropna()
+                    if values.empty:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="window_reducer_metric_missing", metric=metric)
+                        continue
+                    selected = values.idxmin() if rule.window_reducer == "min" else values.idxmax()
+                    matched_indices = [selected]
 
             for row_index in matched_indices:
                 row = working_df.loc[row_index]
@@ -407,6 +689,27 @@ class FactEngine:
                     evidence_metrics[metric] = _to_scalar(row.get(metric))
                 for metric_name in rule.derived_metrics:
                     evidence_metrics[metric_name] = _to_scalar(row.get(metric_name))
+                if hasattr(self, "liveflow_declaration"):
+                    for name in ("windows_remaining", "epochs_remaining", "remaining_windows",
+                                 "remaining_epochs", "remaining_steps", "configured_total_steps",
+                                 "completed_steps", "configured_window_steps", "planner_history_ready",
+                                 "lf_v1_per_step", "reader_posix_read_ops_slope",
+                                 "reader_decode_ops_slope", "comm_ops_slope", "step_wall_p90_us",
+                                 *[c for c in row.index if isinstance(c, str) and c.startswith("physical_")]):
+                        if name in row.index and name not in evidence_metrics:
+                            value = _to_scalar(row.get(name))
+                            if value is not None:
+                                evidence_metrics[name] = value
+                for metric_name in LOOP_EXPOSURE_WINDOW_METRICS:
+                    if metric_name in evidence_metrics or metric_name not in row.index:
+                        continue
+                    forwarded = _to_scalar(row.get(metric_name))
+                    if forwarded is not None:
+                        evidence_metrics[metric_name] = forwarded
+                if rule.worker_only:
+                    evidence_metrics["selected_worker_pid"] = context["row_pid_by_index"].get(row_index)
+                elif rule.rank_thread_only:
+                    evidence_metrics.update(rank_thread_provenance[row_index])
 
                 window = None
                 epoch = None
@@ -425,6 +728,13 @@ class FactEngine:
                     step = _to_int_or_none(row_index)
                 elif "step" in row.index and row.get("step") is not None and not pd.isna(row.get("step")):
                     step = _to_int_or_none(row.get("step"))
+                native_window = context.get("native_window")
+                if native_window is not None:
+                    window = _to_int_or_none(native_window)
+                    if window is None:
+                        logger.debug("facts.rule.skip", rule_id=rule.id,
+                                     reason="invalid_native_window")
+                        continue
                 if view_type == "time_range":
                     time_bucket = _to_int_or_none(row_index)
                     if time_bucket is None and "time_range" in row.index:
@@ -439,7 +749,11 @@ class FactEngine:
                             t0_ns = int(time_bucket * interval_us * 1_000)
                             t1_ns = int((time_bucket + 1) * interval_us * 1_000)
 
-                scope_entity = "window" if rule.emit_mode == "window" else str(row_index)
+                scope_entity = (
+                    rule.scope_entity
+                    if rule.scope_entity is not None
+                    else ("window" if rule.emit_mode == "window" else str(row_index))
+                )
                 scope_node = None
                 if view_type in {"source_node", "host_hash"}:
                     scope_node = str(row_index)

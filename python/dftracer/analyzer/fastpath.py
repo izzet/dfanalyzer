@@ -45,7 +45,11 @@ WRONG, and the gated rule sets keep working unchanged as ablation controls.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from numbers import Integral, Real
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
@@ -63,7 +67,13 @@ from .constants import (
 )
 from .metrics import (
     DOMAIN_VECTOR_COLUMNS,
+    attach_window_integrity_metrics,
+    attach_input_step_max_sum_metrics,
+    attach_input_job_step_max_sum_metrics,
+    attach_comm_exposed_median_metrics,
+    attach_comm_total_median_metrics,
     coherent_domain_vectors,
+    set_view_metrics,
     set_window_decomposition_metrics,
 )
 
@@ -87,6 +97,185 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 _STRING_LITERAL = re.compile(r"""(['"])(?:\\.|(?!\1).)*\1""")
+
+
+def completed_window_stall_storage_provenance(
+    traces: pd.DataFrame, expected_rank_pids: Iterable[int], *, pid_column: str = "pid",
+) -> Dict[str, object]:
+    """Raw-event coverage for a completed control window's rank-owned stalls.
+
+    Event presence is intentionally independent of duration: an emitted
+    zero-duration ``stall.storage`` record proves instrumentation coverage.
+    Missing schema, no expected ranks, absent events, or a missing rank fail
+    closed. This is completed-window context, never a flat-view metric.
+    """
+    try:
+        expected = {int(pid) for pid in expected_rank_pids}
+    except (TypeError, ValueError):
+        expected = set()
+    required = {COL_CATEGORY, COL_FUNC_NAME, pid_column}
+    observed = set()
+    event_count = 0
+    if expected and required.issubset(traces.columns):
+        mask = ((traces[COL_CATEGORY] == "stall")
+                & (traces[COL_FUNC_NAME] == "stall.storage"))
+        for raw_pid in traces.loc[mask, pid_column]:
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                continue
+            if pid in expected:
+                observed.add(pid)
+                event_count += 1
+    covered = bool(expected) and observed == expected
+    return {
+        "stall_storage_rank_coverage": float(covered),
+        "stall_storage_rank_expected_count": float(len(expected)),
+        "stall_storage_rank_observed_count": float(len(observed)),
+        "stall_storage_raw_event_count": float(event_count),
+        "stall_storage_expected_rank_pids": sorted(expected),
+        "stall_storage_observed_rank_pids": sorted(observed),
+    }
+
+
+_DLIO_WORKER_ROSTER_SCHEMA = "dlio-worker-posix-roster.v1"
+_STORMER_WORKER_ROSTER_SCHEMA = "stormer-worker-posix-roster.v1"
+# Schema dispatch is by EXPLICIT allow-list.  The two producers write the same field set and the
+# same `<schema>.<digest>.rank-R.worker-W.json` naming; anything else fails closed.
+_WORKER_ROSTER_SCHEMAS = frozenset((_DLIO_WORKER_ROSTER_SCHEMA, _STORMER_WORKER_ROSTER_SCHEMA))
+_DLIO_WORKER_ROSTER_FIELDS = frozenset((
+    "schema_version", "run_prefix", "host", "rank", "worker_id", "pid",
+    "expected_workers",
+))
+
+
+def completed_window_worker_roster_provenance(
+    traces: pd.DataFrame,
+    row_pid_by_index: Dict[object, int],
+    *,
+    roster_dir: Optional[str],
+    roster_prefix: Optional[str],
+    expected_workers: Optional[int],
+    expected_host: str,
+    expected_ranks: int,
+    expected_rank_pids: Iterable[int],
+    pid_column: str = "pid",
+    roster_schema: str = _DLIO_WORKER_ROSTER_SCHEMA,
+) -> Dict[str, object]:
+    """Fail-closed v1 worker roster proof (DLIO default, or StorMer) for one completed local window.
+
+    `roster_schema` selects which producer's records are accepted; the default preserves the DLIO
+    behaviour exactly.  An unknown schema, or records of a different schema, fail closed.
+
+    The roster is an opt-in identity whitelist, not a replacement for control
+    membership or rank-side raw stall coverage.  It is read only after the
+    completed window frame is available, so a late filesystem record simply
+    suppresses this window.  Every whitelisted PID must also own an
+    unambiguous same-window reader-POSIX row.
+    """
+    result = {
+        "worker_roster_coverage": 0.0,
+        "worker_roster_expected_count": 0.0,
+        "worker_roster_observed_count": 0.0,
+        "worker_roster_pids": [],
+    }
+    if roster_schema not in _WORKER_ROSTER_SCHEMAS:
+        return result
+    if (not isinstance(roster_dir, str) or not roster_dir
+            or not isinstance(roster_prefix, str) or not roster_prefix
+            or type(expected_workers) is not int or expected_workers < 1
+            or not isinstance(expected_host, str) or not expected_host
+            or type(expected_ranks) is not int or expected_ranks < 1):
+        return result
+    directory = Path(roster_dir)
+    if not directory.is_absolute() or not directory.is_dir():
+        return result
+
+    digest = hashlib.sha256(roster_prefix.encode("utf-8")).hexdigest()[:16]
+    records = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return result
+        if not isinstance(record, dict) or set(record) != _DLIO_WORKER_ROSTER_FIELDS:
+            return result
+        valid = (
+            record.get("schema_version") == roster_schema
+            and record.get("run_prefix") == roster_prefix
+            and isinstance(record.get("host"), str) and bool(record["host"])
+            and type(record.get("rank")) is int and record["rank"] >= 0
+            and type(record.get("worker_id")) is int
+            and 0 <= record["worker_id"] < expected_workers
+            and type(record.get("pid")) is int and record["pid"] > 0
+            and record.get("expected_workers") == expected_workers
+        )
+        expected_name = (
+            f"{roster_schema}.{digest}.rank-{record.get('rank')}"
+            f".worker-{record.get('worker_id')}.json"
+        )
+        if not valid or path.name != expected_name:
+            return result
+        records.append(record)
+
+    local = [record for record in records if record["host"] == expected_host]
+    if len(local) != expected_ranks * expected_workers:
+        return result
+    rank_ids = {record["rank"] for record in local}
+    if len(rank_ids) != expected_ranks:
+        return result
+    if any(
+        {record["worker_id"] for record in local if record["rank"] == rank}
+        != set(range(expected_workers))
+        for rank in rank_ids
+    ):
+        return result
+    roster_pids = {record["pid"] for record in local}
+    if len(roster_pids) != len(local):
+        return result
+
+    result["worker_roster_expected_count"] = float(len(roster_pids))
+    if rank_ids != set(range(expected_ranks)):
+        return result
+
+    def _exact_pid(value: object) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, Integral):
+            return int(value)
+        if isinstance(value, Real):
+            try:
+                integer = int(value)
+            except (OverflowError, ValueError):
+                return None
+            return integer if value == integer else None
+        return None
+
+    rank_pids = {_exact_pid(pid) for pid in expected_rank_pids}
+    rank_pids.discard(None)
+    if len(rank_pids) != expected_ranks or roster_pids & rank_pids:
+        return result
+    required = {COL_CATEGORY, COL_PROC_NAME, pid_column}
+    if not required.issubset(traces.columns):
+        return result
+    categories = traces[COL_CATEGORY].astype("string")
+    reader_posix = (
+        categories.str.contains("posix", case=False, regex=False, na=False)
+        & categories.str.contains("_reader", case=False, regex=False, na=False)
+    )
+    observed = set()
+    for proc_name, raw_pid in traces.loc[reader_posix, [COL_PROC_NAME, pid_column]].dropna().itertuples(
+        index=False, name=None
+    ):
+        pid = _exact_pid(raw_pid)
+        if pid is None:
+            continue
+        if pid in roster_pids and row_pid_by_index.get(proc_name) == pid:
+            observed.add(pid)
+    result["worker_roster_observed_count"] = float(len(observed))
+    result["worker_roster_pids"] = sorted(roster_pids)
+    result["worker_roster_coverage"] = float(observed == roster_pids)
+    return result
 
 
 def _condition_columns(condition: str, available: Iterable[str]) -> Set[str]:
@@ -149,10 +338,26 @@ class FastPathPlan:
                 )
 
         self.produced_columns: Set[str] = set()
+        # These are materialized only by ``set_view_metrics`` on the proc_name
+        # view.  Keep them distinct from universally available aggregates so
+        # a window/epoch rule cannot be accepted merely because a sibling
+        # proc_name view happens to be requested.
+        self.proc_name_only_columns: Set[str] = set()
         for prefix, _condition, wants_size in self.terms:
             self.produced_columns.add("%s_time_sum" % prefix)
             self.produced_columns.add("%s_time_proc_max" % prefix)
             self.produced_columns.add("%s_count_sum" % prefix)
+            # ``set_view_metrics`` below emits these canonical WiSIO shares
+            # for the proc_name view before it emits ``*_ops_slope``.  They
+            # are first-class rule inputs, not optional diagnostics: omitting
+            # them here incorrectly rejects an otherwise exact fast-path plan
+            # and silently falls back to the legacy aggregate-only path,
+            # whose control vector is deliberately incoherent.
+            self.proc_name_only_columns.add("%s_count_frac_total" % prefix)
+            self.proc_name_only_columns.add("%s_time_proc_frac_total" % prefix)
+            # `set_view_metrics()` below produces the canonical WiSIO slope
+            # for a process view from precisely these count/time sums.
+            self.proc_name_only_columns.add("%s_ops_slope" % prefix)
             if wants_size:
                 self.produced_columns.add("%s_size_sum" % prefix)
         # set_window_decomposition_metrics adds these on top, for both time metrics.
@@ -162,6 +367,13 @@ class FastPathPlan:
                 self.produced_columns.add("%s_%s" % (name, metric))
         self.produced_columns.add("domain_exposure_present")
         self.produced_columns.update(DOMAIN_VECTOR_COLUMNS)
+        # `attach_window_integrity_metrics()` adds these only to the native
+        # window view.  Worker-only rules receive that one-row vector as a
+        # fail-closed safety gate; advertise the existing fields so such a
+        # rule is not needlessly demoted to the full online path.
+        self.produced_columns.update({
+            "epoch_nunique", "step_nunique", "step_min", "step_max",
+        })
         self._mask_cache: Dict[tuple, Dict[str, np.ndarray]] = {}
 
     # -- gate ------------------------------------------------------------------------------
@@ -171,7 +383,11 @@ class FastPathPlan:
         if fact_engine is None or not getattr(fact_engine, "rules", None):
             return None
         plan = cls(preset, view_types, layers)
-        from .fact_engine import RESERVED_IDENTIFIERS
+        from .fact_engine import (
+            COMPLETED_WINDOW_PROVENANCE_METRICS,
+            COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS,
+            RESERVED_IDENTIFIERS,
+        )
 
         for rule in fact_engine.rules:
             if rule.source_view not in plan.view_types and rule.source_view != COL_PROC_NAME:
@@ -180,9 +396,25 @@ class FastPathPlan:
                 logger.info("analyzer.fastpath.declined", rule_id=rule.id,
                             reason="source_view_not_built", source_view=rule.source_view)
                 return None
+            available = set(plan.produced_columns)
+            if rule.source_view == COL_PROC_NAME:
+                available.update(plan.proc_name_only_columns)
+                if rule.rank_thread_only:
+                    from .fact_engine import SKEW_WINDOW_METRICS
+                    available.update(SKEW_WINDOW_METRICS)
+                if rule.worker_only or rule.rank_thread_only:
+                    # These are never flat-view columns. FactEngine injects
+                    # them only from completed-window analyzer context, so a
+                    # missing raw-event coverage still fails closed at evaluation.
+                    available.update(COMPLETED_WINDOW_PROVENANCE_METRICS)
+                if rule.worker_only:
+                    # The opt-in worker roster is never available to rank-thread rules.
+                    available.update(COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS)
+            else:
+                available.difference_update(plan.proc_name_only_columns)
             unknown = (
                 set(rule.referenced_columns)
-                - plan.produced_columns
+                - available
                 - set(rule.derived_metrics or ())
                 - set(RESERVED_IDENTIFIERS)
             )
@@ -195,6 +427,7 @@ class FastPathPlan:
             rules=[rule.id for rule in fact_engine.rules],
             terms=len(plan.terms),
             views=plan.view_types,
+            fact_engine_id=id(fact_engine),
         )
         return plan
 
@@ -244,7 +477,11 @@ class FastPathPlan:
                 masks[prefix] = _eval_mask(traces, condition, prefix)
         return masks
 
-    def flat_views(self, traces: pd.DataFrame) -> Dict[Tuple[str, ...], pd.DataFrame]:
+    def flat_views(
+        self,
+        traces: pd.DataFrame,
+        control_pids: Optional[List[int]] = None,
+    ) -> Dict[Tuple[str, ...], pd.DataFrame]:
         views: Dict[Tuple[str, ...], pd.DataFrame] = {}
         if traces is None or traces.empty:
             return views
@@ -340,9 +577,16 @@ class FastPathPlan:
             else:
                 matrix_dproc_codes, matrix_dproc_uniques = pd.factorize(matrix_traces[COL_PROC_NAME])
             matrix_n_dproc = max(len(matrix_dproc_uniques), 1)
-            matrix_group_codes = pd.Categorical(
-                matrix_traces[view_type], categories=group_uniques
-            ).codes
+            # Pandas stores categorical codes in the narrowest signed integer.
+            # With 34 groups and four processes, the final pair identifier is
+            # 33 * 4 = 132: valid in the output matrix but not representable in
+            # int8.  Widen before arithmetic; the codes are indexes, not a
+            # compact persisted data field.
+            matrix_dproc_codes = np.asarray(matrix_dproc_codes, dtype=np.int64)
+            matrix_group_codes = np.asarray(
+                pd.Categorical(matrix_traces[view_type], categories=group_uniques).codes,
+                dtype=np.int64,
+            )
             matrix_valid = matrix_group_codes >= 0
             matrix_pair_codes = matrix_group_codes * matrix_n_dproc + matrix_dproc_codes
             matrix_n_pairs = n_groups * matrix_n_dproc
@@ -397,8 +641,20 @@ class FastPathPlan:
             if not is_process_based and "window_wall" in domain_mats:
                 coherent = coherent_domain_vectors(domain_mats)
             view = set_window_decomposition_metrics(view, is_process_based, coherent=coherent)
+            if is_process_based:
+                # Reuse the analyzer's canonical normalized-count/normalized-
+                # time slope implementation.  This is a small vectorized
+                # operation over the already-reduced proc_name frame, not the
+                # full view/layer expansion that this fast path avoids.
+                view = set_view_metrics(
+                    view, metric_boundaries={}, is_view_process_based=True
+                )
             if view_type == "epoch" and not is_process_based:
                 view["domain_epoch_association_unambiguous"] = domain_epoch_association_unambiguous
                 view["domain_unkeyed_rows_included"] = domain_unkeyed_rows_included
             views[(view_type,)] = view.sort_index(axis=1)
-        return views
+        views = attach_window_integrity_metrics(views, traces, control_pids=control_pids)
+        views = attach_input_step_max_sum_metrics(views, traces)
+        views = attach_input_job_step_max_sum_metrics(views, traces)
+        views = attach_comm_exposed_median_metrics(views, traces)
+        return attach_comm_total_median_metrics(views, traces)

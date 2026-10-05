@@ -13,6 +13,7 @@ import numpy as np
 import os
 import pandas as pd
 import signal
+import socket
 import threading
 import structlog
 import time
@@ -141,7 +142,7 @@ class _PendingTraceEvents:
         """The distinct pids currently parked. At most one per rank plus its workers."""
         return list(self._by_pid)
 
-    def pop_first_under_target(self, is_over_target):
+    def pop_first_under_target(self, is_over_target, is_ineligible=None):
         """The oldest parked event whose pid is not yet at its target, or None.
 
         O(pids), not O(events). This is the whole reason the class exists.
@@ -151,12 +152,40 @@ class _PendingTraceEvents:
         for pid, bucket in self._by_pid.items():
             if is_over_target(pid):
                 continue
+            if is_ineligible is not None and is_ineligible(bucket[0][1]):
+                continue
             seq = bucket[0][0]
             if best_seq is None or seq < best_seq:
                 best_pid, best_seq = pid, seq
         if best_pid is None:
             return None
         return self._take(best_pid, from_left=True)
+
+
+_TRACE_FRAMING_LINES = ("[", "]")
+
+
+def split_trace_batch_lines(text: str) -> Tuple[List[str], int]:
+    """Split a newline-delimited trace batch into (payload lines, framing-line count).
+
+    The SHM writer's per-pid `events_written` drain target counts every newline in the
+    payloads it publishes (shm_ring_writer.cpp, "COUNT EVENTS, NOT RECORDS").  DFTracer's
+    array framing line (`[`, written once at the head of a process's first flush) is such a
+    newline but carries no event, so a consumer that counts only parsed events is one short
+    of the target for every writing pid, and the window can never close.  Framing lines are
+    returned separately so the caller can charge them to the pid that wrote the batch.
+    """
+    lines: List[str] = []
+    framing = 0
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line in _TRACE_FRAMING_LINES:
+            framing += 1
+            continue
+        lines.append(line)
+    return lines, framing
 
 
 def drain_settle_ms(targets_satisfied: bool, timeout_ms: int, override: Optional[int] = None) -> int:
@@ -232,6 +261,52 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
         if isinstance(event, dict) and event.get("name") == "window.stop"
     )
 
+    step_fields = ("configured_total_steps", "completed_steps", "configured_window_steps")
+    step_sources = []
+    for candidate in candidates:
+        try:
+            values = {name: int(candidate[name]) for name in step_fields}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (values["configured_total_steps"] >= values["completed_steps"] >= 0
+                and values["configured_window_steps"] >= 1):
+            step_sources.append(values)
+    if step_sources:
+        first_steps = step_sources[0]
+        if any(value != first_steps for value in step_sources[1:]):
+            logger.warning("window.horizon.step_mismatch", candidates=step_sources)
+            return {}
+        remaining = first_steps["configured_total_steps"] - first_steps["completed_steps"]
+        ready = [int(candidate["planner_history_ready"]) for candidate in candidates
+                 if "planner_history_ready" in candidate]
+        history = {"planner_history_ready": ready[0]} if ready and len(set(ready)) == 1 else {}
+        # The applied (physical) vector: every `physical_<knob>` the writer snapshotted plus the
+        # step it took effect at. Knob names are the workload's (halo3d: read_threads/decode_threads;
+        # StorMer: num_workers/prefetch_factor/bucket_cap_mb), so the field set is read from the
+        # events, not fixed here. Ranks of one node must agree exactly; otherwise nothing is
+        # passed (a discordant vector is not evidence of any configuration).
+        vectors = []
+        for c in candidates:
+            if "physical_applied_step" not in c:
+                continue
+            try:
+                vectors.append(tuple(sorted((k, int(v)) for k, v in c.items()
+                                            if isinstance(k, str) and k.startswith("physical_"))))
+            except (TypeError, ValueError):
+                continue
+        physical = dict(vectors[0]) if vectors and len(set(vectors)) == 1 else {}
+        # Tail of the per-step wall in the window (microseconds -> seconds is the planner's job).
+        # Each rank reports its own p90; the node's value is the worst rank's, the critical path.
+        tails = []
+        for c in candidates:
+            try:
+                tails.append(int(c["step_wall_p90_us"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        tail = {"step_wall_p90_us": max(tails)} if tails else {}
+        return dict(first_steps, **history, **physical, **tail, remaining_steps=remaining,
+                    windows_remaining=remaining / first_steps["configured_window_steps"])
+
     complete = []
     for candidate in candidates:
         try:
@@ -249,6 +324,19 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
     first = complete[0]
     if any(values != first for values in complete[1:]):
         logger.warning("window.horizon.mismatch", candidates=complete)
+        return {}
+
+    # `window_index` is the native control-window identity, while
+    # `epochs_total * windows_per_epoch` is the declared size of the run at
+    # this cadence.  A tuple beyond that bound is internally inconsistent.
+    # Clamping it to zero would make a malformed source look like a genuine
+    # exhausted run and silently convert a source-contract failure into a
+    # planner decline.  Keep it absent instead: no horizon evidence, no
+    # cost-aware action.
+    declared_windows = first["epochs_total"] * first["windows_per_epoch"]
+    if first["window_index"] > declared_windows:
+        logger.warning("window.horizon.impossible", values=first,
+                       declared_windows=declared_windows)
         return {}
 
     metrics = dict(first)
@@ -337,6 +425,11 @@ from .constants import (
     Layer,
 )
 from .metrics import (
+    attach_window_integrity_metrics,
+    attach_input_step_max_sum_metrics,
+    attach_input_job_step_max_sum_metrics,
+    attach_comm_exposed_median_metrics,
+    attach_comm_total_median_metrics,
     find_layer_time_metrics,
     set_cross_layer_metrics,
     set_main_metrics,
@@ -532,6 +625,8 @@ class Analyzer(abc.ABC):
             self.logical_views = preset.logical_views
         else:
             self.logical_views = dict(OmegaConf.to_object(preset.logical_views))  # type: ignore
+        if self.fact_engine is not None and getattr(preset, "name", None) == "liveflow-v1":
+            self.fact_engine.liveflow_declaration = dict(preset.liveflow_families)
         self.preset = preset
         self.time_approximate = time_approximate
         self.time_granularity = time_granularity
@@ -541,6 +636,7 @@ class Analyzer(abc.ABC):
         # Set only around an online completed control window.  Offline analysis
         # deliberately has no fabricated window/rank identity.
         self._debug_window_provenance = None
+        self._fact_window_context = None
         ensure_dir(self.checkpoint_dir)
 
     def _debug_artifact_suffix(self) -> str:
@@ -580,6 +676,68 @@ class Analyzer(abc.ABC):
         name = f"flat_view_{'_'.join(view_key)}{self._debug_artifact_suffix()}.csv"
         export.to_csv(os.path.join(debug_dir, name), index=False)
 
+    def _write_debug_window_integrity_ledger(self, traces: pd.DataFrame) -> None:
+        """Export raw rows that can explain a window-integrity decision.
+
+        This is debug provenance, not an alternate aggregation: it preserves the
+        normalized rows passed to the analyzer and marks precisely which rows
+        the window integrity helper is allowed to count.  It is intentionally
+        emitted only for a completed control window.
+        """
+        if not self.debug or traces is None or not isinstance(traces, pd.DataFrame):
+            return
+        provenance = self._debug_window_provenance or {}
+        window_index = provenance.get("window_index")
+        if window_index is None:
+            return
+        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+        os.makedirs(debug_dir, exist_ok=True)
+        columns = [
+            column for column in (
+                "window", "pid", "proc_name", "time_start", "time_end",
+                "name", "func_name", "cat", "epoch", "step",
+            ) if column in traces.columns
+        ]
+        export = traces.loc[:, columns].copy()
+        rank_pids = {int(pid) for pid in provenance.get("rank_pids", [])}
+        if "pid" in export.columns:
+            numeric_pid = pd.to_numeric(export["pid"], errors="coerce")
+            is_rank_pid = numeric_pid.isin(rank_pids)
+            export["__liveflow_is_rank_pid"] = is_rank_pid
+        else:
+            is_rank_pid = pd.Series(False, index=traces.index)
+            export["__liveflow_is_rank_pid"] = is_rank_pid
+        needed = {"window", "epoch", "step"}
+        if needed.issubset(traces.columns):
+            numeric_epoch = pd.to_numeric(traces["epoch"], errors="coerce")
+            numeric_step = pd.to_numeric(traces["step"], errors="coerce")
+            export["__liveflow_integrity_contributes"] = (
+                is_rank_pid & traces["window"].notna()
+                & numeric_epoch.notna() & numeric_step.notna()
+            )
+        else:
+            export["__liveflow_integrity_contributes"] = False
+        export.insert(0, "__liveflow_analysis_window", int(window_index))
+        name = f"window_integrity_ledger{self._debug_artifact_suffix()}.csv"
+        export.to_csv(os.path.join(debug_dir, name), index=False)
+
+    def _write_debug_fact_envelope(self, result: AnalysisResult) -> None:
+        """Preserve the exact emitted fact envelope for a completed debug window.
+
+        The CSV views explain aggregation and the integrity ledger explains the
+        gate, but neither retains the selected worker PID carried by a fact.
+        This is debug provenance only; transport still serializes the same
+        ``AnalysisResult.to_fact_envelope()`` payload.
+        """
+        if not self.debug or not result.analysis_facts:
+            return
+        debug_dir = getattr(self, "debug_output_dir", os.getcwd())
+        os.makedirs(debug_dir, exist_ok=True)
+        envelope = result.to_fact_envelope().to_dict()
+        name = f"analysis_facts{self._debug_artifact_suffix()}.json"
+        with open(os.path.join(debug_dir, name), "w") as handle:
+            json.dump(envelope, handle, cls=NpEncoder, indent=2, sort_keys=True)
+
     @staticmethod
     def _build_facts_config(facts_config: Optional[Union[FactsConfig, Dict[str, Any]]]) -> FactsConfig:
         if facts_config is None:
@@ -604,15 +762,101 @@ class Analyzer(abc.ABC):
         flat_views: Dict[ViewKey, pd.DataFrame],
         raw_stats: Any,
     ) -> Dict[ViewKey, List[Any]]:
+        # Always-on (2026-09-28, follow-up to the facts.evaluate.view_keys diagnostic): the
+        # v4.5.7 rerun showed that line NEVER fires, which by elimination (both AnalysisResult
+        # construction paths that reach here execute without raising) means one of the two
+        # early returns below is the one firing silently. Only the second is logged (DEBUG);
+        # the first never was. Log both conditions unconditionally, plus id(self.fact_engine),
+        # so a comparison against the id logged where FastPathPlan.build() consumes
+        # self.fact_engine (fastpath.py's analyzer.fastpath.enabled line) settles directly
+        # whether self.fact_engine is None here or has become a *different* object.
+        logger.info(
+            "facts.evaluate_analysis_facts.entry",
+            fact_engine_is_none=(self.fact_engine is None),
+            fact_engine_id=(id(self.fact_engine) if self.fact_engine is not None else None),
+            emit_analysis_facts=self.facts_config.emit_analysis_facts,
+            analyzer_id=id(self),
+        )
         if self.fact_engine is None:
             return {}
         if not self.facts_config.emit_analysis_facts:
             logger.debug("facts.emit_analysis_facts.disabled")
             return {}
-        return self.fact_engine.evaluate(
+        fact_context = dict(self._fact_window_context or {})
+        # A proc_name slope is meaningful only relative to peer processes;
+        # the optimizer must nevertheless receive the completed window's one
+        # coherent vector, not whichever worker happened to be selected.
+        window_view = flat_views.get(("window",))
+        if fact_context and window_view is not None and len(window_view) == 1:
+            row = window_view.iloc[0]
+            control_names = (
+                "domain_coherent", "domain_procs_active",
+                "window_wall_time_proc_crit", "domain_input_time_proc_crit",
+                "domain_decode_time_proc_crit", "domain_comm_time_proc_crit",
+                "domain_compute_time_proc_crit", "residual_time_proc_crit",
+                "epoch_nunique", "step_nunique", "step_min", "step_max",
+            )
+            # Optional measured cross-rank skew attribution (metrics.SKEW_COLUMNS) and the typical
+            # rank's own vector, which the planner needs to price the skew link.  Optional: a
+            # producer without them simply omits them, and rules requiring them fail closed.
+            from .fact_engine import LOOP_EXPOSURE_WINDOW_METRICS, SKEW_WINDOW_METRICS
+            fact_context["window_metrics"] = {
+                name: row[name]
+                for name in control_names + SKEW_WINDOW_METRICS + LOOP_EXPOSURE_WINDOW_METRICS
+                if name in row.index
+            }
+        result = self.fact_engine.evaluate(
             flat_views=flat_views,
             raw_stats=raw_stats,
+            context=fact_context,
         )
+        # 2026-09-28 (judge batch 5 G4, orchestrator direction): patch 13's unconditional
+        # logger.info() as the FIRST statement inside FactEngine.evaluate() never fired in the
+        # v4.5.8.1 1N run even though this call is provably reached (fact_engine_is_none=false,
+        # emit_analysis_facts=true, fact_engine_id matching the id logged at construction) and no
+        # exception was raised (analysis_facts=0 is a clean return, not a crash). Rather than
+        # trust another log line to explain a log line that already failed to appear, persist the
+        # same information via plain, unbuffered file I/O -- immune to any structlog/logging
+        # level, handler, or cache-on-first-use configuration this process may have accumulated
+        # across the analyzer/diagnoser/optimizer stages' independent configure_logging() calls.
+        try:
+            _diag_dir = getattr(self, "debug_output_dir", None)
+            if _diag_dir:
+                _diag_path = os.path.join(_diag_dir, "fact_engine_diagnostics.jsonl")
+                _std_logger = __import__("logging").getLogger("dftracer.analyzer.fact_engine")
+                with open(_diag_path, "a") as _f:
+                    _f.write(json.dumps({
+                        "view_keys": [list(_k) for _k in flat_views.keys()],
+                        "view_row_counts": {str(_k): len(_v) for _k, _v in flat_views.items()},
+                        "rules_by_view_keys": list(self.fact_engine.rules_by_view.keys()),
+                        "facts_returned_counts": {str(_k): len(_v) for _k, _v in result.items()},
+                        "total_facts": sum(len(_v) for _v in result.values()),
+                        # 2026-09-28 (orchestrator follow-up): views/rules align (source_view
+                        # "proc_name" is present in flat_views with real rows) yet facts_returned
+                        # is still empty every window -- ruling out a view-config/source_view
+                        # mismatch. Both rules declare rank_thread_only: true, which requires
+                        # non-empty context["row_pid_by_index"] and context["worker_pids"] (see
+                        # fact_engine.py's early skip checks). An ordinary StorMer SHM launch
+                        # (this diagnostic included) does not activate libdftracer_preload.so
+                        # inside forked DataLoader workers (STORMER-WORKER-POSIX-GATE.md), so
+                        # worker PIDs may never appear distinct from rank PIDs in the traces this
+                        # window saw. Record both sizes directly to confirm or refute that without
+                        # another round of guessing.
+                        "context_row_pid_by_index_size": len(fact_context.get("row_pid_by_index", {}) or {}),
+                        "context_worker_pids_size": len(fact_context.get("worker_pids", ()) or ()),
+                        "context_rank_pids_size": len(fact_context.get("rank_pids", ()) or ()),
+                        "fact_engine_logger_level": _std_logger.level,
+                        "fact_engine_logger_effective_level": _std_logger.getEffectiveLevel(),
+                        "fact_engine_logger_propagate": _std_logger.propagate,
+                        "fact_engine_logger_disabled": _std_logger.disabled,
+                        "fact_engine_logger_handler_count": len(_std_logger.handlers),
+                        "root_logger_handler_count": len(__import__("logging").getLogger().handlers),
+                    }) + "\n")
+                    _f.flush()
+                    os.fsync(_f.fileno())
+        except Exception:
+            pass  # diagnostic-only: never let this persistence path break the analysis pipeline
+        return result
 
     def _materialize_output_artifacts(
         self,
@@ -910,6 +1154,10 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
+        worker_roster_dir: Optional[str] = None,
+        worker_roster_prefix: Optional[str] = None,
+        worker_roster_expected_workers: Optional[int] = None,
+        worker_roster_schema: Optional[str] = None,
     ) -> None:
         from .streaming.transport import open_consumer
 
@@ -998,8 +1246,13 @@ class Analyzer(abc.ABC):
             # every writer implementation learns the new fields.
             args = trace_event.get("args", {})
             if isinstance(normalized_event, dict) and isinstance(args, dict):
-                for field in HORIZON_SOURCE_FIELDS:
+                for field in (*HORIZON_SOURCE_FIELDS, "configured_total_steps",
+                              "completed_steps", "configured_window_steps", "planner_history_ready",
+                              "step_wall_p90_us"):
                     if field in args:
+                        normalized_event[field] = args[field]
+                for field in args:
+                    if isinstance(field, str) and field.startswith("physical_"):
                         normalized_event[field] = args[field]
             event_ts = None
             event_pid = None
@@ -1049,16 +1302,20 @@ class Analyzer(abc.ABC):
                                            nbytes=len(data))
                             return results
                     text = data.decode("utf-8", errors="replace")
-                    for line in text.split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
+                    batch_lines, framing_lines = split_trace_batch_lines(text)
+                    for line in batch_lines:
                         try:
                             trace_event = json.loads(line)
                         except json.JSONDecodeError:
                             continue
                         if isinstance(trace_event, dict):
                             results.append(_normalize_single_trace(trace_event))
+                    if framing_lines and results:
+                        # One ring record has one writer pid.  Charge the framing lines the
+                        # writer counted to it, as event-less placeholders, so `seen` and the
+                        # writer's target count the same unit.
+                        _, first_ts, first_pid = results[0]
+                        results[:0] = [(None, first_ts, first_pid)] * framing_lines
             elif isinstance(metadata, dict):
                 # Legacy single-event format: event JSON in metadata
                 results.append(_normalize_single_trace(metadata))
@@ -1154,7 +1411,9 @@ class Analyzer(abc.ABC):
                 start_counts=start_counts,
             )
 
-        def _pop_pending_event_for_window(target_counts: Dict[int, int]):
+        def _pop_pending_event_for_window(
+            target_counts: Dict[int, int], boundary_ts_us: int
+        ):
             """The oldest parked event whose pid is still under its target, or None.
 
             The queue answers this in O(pids). It used to be a walk over the events, which is
@@ -1162,24 +1421,131 @@ class Analyzer(abc.ABC):
             zero decode.
             """
             return pending_trace_events.pop_first_under_target(
-                lambda event_pid: _event_exceeds_target(event_pid, target_counts)
+                lambda event_pid: _event_exceeds_target(event_pid, target_counts),
+                lambda item: (
+                    item[2] not in target_counts
+                    and bool(boundary_ts_us and item[1] and item[1] > boundary_ts_us)
+                ),
             )
 
+        trace_snapshot = None
+        last_completed_boundary = None
+        accepted_stop_controls = {}
         try:
             control_future = control_consumer.pull()
             trace_future = trace_consumer.pull()
+            eos_seen = False
             while not _shutdown_requested:
                 # Block on control topic and only drain trace topic once a control
                 # boundary arrives; this keeps consumer-side window buffering disabled.
                 control_mofka_event = control_future.wait(timeout_ms=control_wait_timeout_ms)
                 if control_mofka_event is None:
-                    continue
+                    if not eos_seen:
+                        continue
+                    # EOS is producer completion, not an ordered boundary: the
+                    # Python EOS lane is drained before the C++ rank lanes.
+                    # Finish every already-committed rank boundary before
+                    # accepting the quiet control stream as terminal.
+                    if window_tracker.pending_by_window:
+                        known_pids = (set(window_tracker.active_window_by_pid)
+                                      | set(window_tracker.completed_window_by_pid))
+                        incomplete = [
+                            (window, sorted(
+                                pid for pid in known_pids
+                                if window_tracker.completed_window_by_pid.get(pid, 0) < window
+                            ))
+                            for window in sorted(window_tracker.pending_by_window)
+                        ]
+                        raise RuntimeError(
+                            "incomplete window at liveflow.eos: "
+                            + "; ".join(
+                                f"window {window} missing rank stops {pids}"
+                                for window, pids in incomplete
+                            )
+                        )
+                    # First account for events already read beyond the final
+                    # boundary. They are tail diagnostics, never fact evidence.
+                    final_window = (
+                        last_completed_boundary.window_index
+                        if last_completed_boundary is not None else None
+                    )
+                    final_targets = (
+                        last_completed_boundary.events_written_by_pid
+                        if last_completed_boundary is not None else {}
+                    )
+                    final_stops = {
+                        pid: stop for pid, stop in accepted_stop_controls.items()
+                        if stop["window"] == final_window
+                    }
+                    logger.info(
+                        "mofka.stream.eos_tail_boundary",
+                        final_window=final_window,
+                        final_targets=final_targets,
+                        final_stop_controls=final_stops,
+                    )
+                    eos_records = 0
+                    def _record_eos_tail(normalized, ts_us, pid, *, source, lane=None,
+                                         sequence=None, batch_index=None):
+                        nonlocal eos_records
+                        eos_records += 1
+                        logger.info(
+                            "mofka.stream.eos_tail_event",
+                            ordinal=eos_records,
+                            source=source,
+                            lane=lane,
+                            sequence=sequence,
+                            batch_index=batch_index,
+                            pid=pid,
+                            ts_us=ts_us,
+                            final_window=final_window,
+                            final_target=final_targets.get(pid),
+                            final_stop_control=final_stops.get(pid),
+                            trace_event=normalized,
+                        )
+
+                    while pending_trace_events:
+                        normalized, ts_us, pid = pending_trace_events.popleft()
+                        _record_eos_tail(normalized, ts_us, pid, source="pending")
+                    eos_deadline = time.monotonic() + (selected_trace_drain_grace_ms / 1000.0)
+                    while True:
+                        remaining_ms = int(max(0.0, (eos_deadline - time.monotonic()) * 1000.0))
+                        if remaining_ms <= 0:
+                            break
+                        trace_mofka_event = trace_future.wait(
+                            timeout_ms=min(trace_drain_timeout_ms, remaining_ms)
+                        )
+                        if trace_mofka_event is None:
+                            continue
+                        for batch_index, (normalized, ts_us, pid) in enumerate(
+                            _normalize_trace_event(trace_mofka_event)
+                        ):
+                            _record_eos_tail(
+                                normalized, ts_us, pid, source="ring",
+                                lane=getattr(trace_mofka_event, "lane", None),
+                                sequence=getattr(trace_mofka_event, "seq", None),
+                                batch_index=batch_index,
+                            )
+                        trace_future = trace_consumer.pull()
+                        eos_deadline = time.monotonic() + (selected_trace_drain_grace_ms / 1000.0)
+                    logger.info("mofka.stream.eos_drained", unassociated_trace_events=eos_records)
+                    return
 
                 control_future = control_consumer.pull()
                 control_event = control_mofka_event.metadata
                 if not isinstance(control_event, dict) or control_event.get("type") != "boundary_event":
                     if hasattr(control_mofka_event, "acknowledge"):
                         _ack_event(control_mofka_event)
+                    continue
+
+                # The launcher publishes this only after every application rank has
+                # exited. SHM lanes have no global order: EOS can be yielded
+                # before already-committed rank stops in higher-numbered lanes.
+                # Defer finalization until those controls have passed through
+                # the ordinary window assembly path.
+                if control_event.get("trigger_event_name") == "liveflow.eos":
+                    if hasattr(control_mofka_event, "acknowledge"):
+                        _ack_event(control_mofka_event)
+                    eos_seen = True
                     continue
 
                 try:
@@ -1219,19 +1585,58 @@ class Analyzer(abc.ABC):
                     )
                     continue
 
-                boundary_ts_us = _parse_control_int(control_event, "trace_ts_us")
-                if boundary_ts_us is not None and boundary_ts_us > 0:
+                stop_start_us = _parse_control_int(control_event, "trace_ts_us")
+                stop_duration_us = _parse_control_int(control_event, "duration_us")
+                if stop_start_us is not None and stop_start_us > 0:
+                    # A stop control timestamp marks the beginning of its window.
+                    # Include trace rows emitted during its valid elapsed duration;
+                    # legacy controls without one retain their start-time boundary.
+                    boundary_ts_us = stop_start_us + (
+                        stop_duration_us
+                        if stop_duration_us is not None and stop_duration_us >= 0
+                        else 0
+                    )
                     boundary_ts_ns = boundary_ts_us * 1000
                 else:
                     boundary_ts_ns = int(control_event.get("ts_unix_ns", 0))
+                stop_window = window_tracker.current_window(pid)
+                previously_completed = window_tracker.completed_window_by_pid.get(pid)
                 completed_windows = window_tracker.observe_end_boundary(
                     pid=pid,
                     boundary_ts_ns=boundary_ts_ns,
                     events_written=events_written,
                     discard=bool(_parse_control_int(control_event, "discard") or 0),
                 )
+                if (
+                    stop_window is not None
+                    and previously_completed != stop_window
+                    and window_tracker.completed_window_by_pid.get(pid) == stop_window
+                ):
+                    stop_end_us = (
+                        stop_start_us + stop_duration_us
+                        if stop_start_us is not None and stop_start_us >= 0
+                        and stop_duration_us is not None and stop_duration_us >= 0
+                        else None
+                    )
+                    accepted_stop_controls[pid] = {
+                        "window": stop_window,
+                        "events_written": events_written,
+                        "trace_start_ts_us": stop_start_us,
+                        "duration_us": stop_duration_us,
+                        "trace_end_ts_us": stop_end_us,
+                        "ts_unix_ns": _parse_control_int(control_event, "ts_unix_ns"),
+                        "flush": bool(_parse_control_int(control_event, "flush") or 0),
+                        "discard": bool(_parse_control_int(control_event, "discard") or 0),
+                    }
+                    logger.info(
+                        "mofka.window.stop",
+                        pid=pid,
+                        window=stop_window,
+                        boundary_seq=events_written,
+                    )
 
                 for completed_window in completed_windows:
+                    last_completed_boundary = completed_window
                     _discard_values = list(completed_window.discard_by_pid.values())
                     _all_discarded = (
                         len(_discard_values) == num_ranks and all(_discard_values)
@@ -1275,17 +1680,28 @@ class Analyzer(abc.ABC):
                     )
 
                     if target_counts:
+                        # SHM rank boundaries follow the trace writes they count.
+                        # Capture each lane's committed head once so unrelated
+                        # later arrivals cannot extend this window's work.
+                        trace_snapshot = (
+                            trace_consumer.snapshot_committed()
+                            if hasattr(trace_consumer, "snapshot_committed") else None
+                        )
                         start_counts = {
                             int(boundary_pid): int(boundary_count)
                             for boundary_pid, boundary_count in completed_window.start_events_written_by_pid.items()
                             if boundary_count is not None and int(boundary_count) > 0
                         }
-                        drain_deadline = (
-                            time.monotonic()
-                            + (selected_trace_drain_grace_ms / 1000.0)
-                        )
+                        # The grace is an unavailable-data wait budget, not a limit on
+                        # decoding records that are already committed in SHM.  In
+                        # particular the first window can contain a large backlog.
+                        idle_wait_ms = 0.0
                         while not _targets_satisfied(target_counts):
-                            pending_event = _pop_pending_event_for_window(target_counts)
+                            if _shutdown_requested:
+                                raise RuntimeError("shutdown during trace target drain")
+                            pending_event = _pop_pending_event_for_window(
+                                target_counts, boundary_ts_us
+                            )
                             if pending_event is not None:
                                 normalized_event, event_ts, event_pid = pending_event
                                 _record_trace_event(
@@ -1297,28 +1713,47 @@ class Analyzer(abc.ABC):
                                 )
                                 continue
 
-                            remaining_ms = int(
-                                max(0.0, (drain_deadline - time.monotonic()) * 1000.0)
-                            )
-                            if trace_drain_timeout_ms > 0:
-                                remaining_ms = min(remaining_ms, trace_drain_timeout_ms)
-                            if remaining_ms <= 0:
-                                break
+                            # Check the consumer's existing buffer and committed ring
+                            # records before charging any wait budget.  Processing time
+                            # cannot turn those records into an incomplete window.
                             _t0 = time.perf_counter()
-                            trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                            trace_mofka_event = (
+                                trace_snapshot.next() if trace_snapshot is not None
+                                else trace_future.wait(timeout_ms=0)
+                            )
                             _waited = (time.perf_counter() - _t0) * 1000.0
                             _dstat["counted_ms"] += _waited
                             if trace_mofka_event is None:
-                                _dstat["polls_empty"] += 1
-                                _dstat["empty_wait_ms"] += _waited
-                                continue
+                                if trace_snapshot is not None:
+                                    break
+                                remaining_ms = selected_trace_drain_grace_ms - idle_wait_ms
+                                if remaining_ms <= 0:
+                                    break
+                                poll_ms = min(trace_drain_timeout_ms, max(1, int(remaining_ms)))
+                                _t0 = time.perf_counter()
+                                trace_mofka_event = trace_future.wait(timeout_ms=poll_ms)
+                                _waited = (time.perf_counter() - _t0) * 1000.0
+                                _dstat["counted_ms"] += _waited
+                                if trace_mofka_event is None:
+                                    idle_wait_ms += _waited
+                                    _dstat["polls_empty"] += 1
+                                    _dstat["empty_wait_ms"] += _waited
+                                    continue
                             _dstat["polls_data"] += 1
                             _t0 = time.perf_counter()
                             unpacked = _normalize_trace_event(trace_mofka_event)
                             _dstat["decode_ms"] += (time.perf_counter() - _t0) * 1000.0
-                            trace_future = trace_consumer.pull()
+                            if trace_snapshot is None:
+                                trace_future = trace_consumer.pull()
                             for normalized_event, event_ts, event_pid in unpacked:
-                                if _event_exceeds_target(event_pid, target_counts):
+                                if (
+                                    _event_exceeds_target(event_pid, target_counts)
+                                    or (
+                                        event_pid not in target_counts
+                                        and boundary_ts_us and event_ts
+                                        and event_ts > boundary_ts_us
+                                    )
+                                ):
                                     pending_trace_events.append((normalized_event, event_ts, event_pid))
                                     continue
                                 _record_trace_event(
@@ -1360,8 +1795,13 @@ class Analyzer(abc.ABC):
                             override=drain_settle_ms_override,
                         )
                         _dstat["settle_ms"] = settle_ms
+                        drain_deadline = time.monotonic() + (settle_ms / 1000.0)
                         past_boundary = False
-                        while not past_boundary:
+                        while trace_snapshot is not None or not past_boundary:
+                            if _shutdown_requested:
+                                raise RuntimeError("shutdown during trace timestamp sweep")
+                            if trace_snapshot is not None and trace_snapshot.remaining == 0:
+                                break
                             remaining_ms = int(
                                 max(
                                     0.0,
@@ -1375,10 +1815,13 @@ class Analyzer(abc.ABC):
                             # into its buffer before it consults the deadline, so a non-blocking
                             # pull returns everything already in the ring and only then None.
                             # Breaking on remaining_ms <= 0 would skip that drain entirely.
-                            if settle_ms > 0 and remaining_ms <= 0:
+                            if trace_snapshot is None and settle_ms > 0 and remaining_ms <= 0:
                                 break
                             _t0 = time.perf_counter()
-                            trace_mofka_event = trace_future.wait(timeout_ms=remaining_ms)
+                            trace_mofka_event = (
+                                trace_snapshot.next() if trace_snapshot is not None
+                                else trace_future.wait(timeout_ms=remaining_ms)
+                            )
                             _waited = (time.perf_counter() - _t0) * 1000.0
                             _dstat["sweep_ms"] += _waited
                             if trace_mofka_event is None:
@@ -1389,9 +1832,13 @@ class Analyzer(abc.ABC):
                             _t0 = time.perf_counter()
                             unpacked = _normalize_trace_event(trace_mofka_event)
                             _dstat["decode_ms"] += (time.perf_counter() - _t0) * 1000.0
-                            trace_future = trace_consumer.pull()
+                            if trace_snapshot is None:
+                                trace_future = trace_consumer.pull()
                             for normalized_event, event_ts, event_pid in unpacked:
-                                if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                                if (
+                                    _event_exceeds_target(event_pid, target_counts)
+                                    or (boundary_ts_us and event_ts and event_ts > boundary_ts_us)
+                                ):
                                     pending_trace_events.append(
                                         (normalized_event, event_ts, event_pid)
                                     )
@@ -1405,11 +1852,18 @@ class Analyzer(abc.ABC):
                                     start_counts=start_counts,
                                 )
 
+                        if trace_snapshot is not None:
+                            trace_snapshot.close()
+                            trace_snapshot = None
+
                         _t0 = time.perf_counter()
                         carried_events = deque()
                         while pending_trace_events:
                             normalized_event, event_ts, event_pid = pending_trace_events.popleft()
-                            if boundary_ts_us and event_ts and event_ts > boundary_ts_us:
+                            if (
+                                _event_exceeds_target(event_pid, target_counts)
+                                or (boundary_ts_us and event_ts and event_ts > boundary_ts_us)
+                            ):
                                 carried_events.append((normalized_event, event_ts, event_pid))
                                 continue
                             _record_trace_event(
@@ -1471,6 +1925,17 @@ class Analyzer(abc.ABC):
                                         pulled_events,
                                         window_index=completed_window.window_index,
                                     )
+
+                    if target_counts and not _targets_satisfied(target_counts):
+                        missing_counts = {
+                            pid: {"seen": trace_events_seen_by_pid.get(pid, 0), "target": target}
+                            for pid, target in target_counts.items()
+                            if trace_events_seen_by_pid.get(pid, 0) < target
+                        }
+                        raise RuntimeError(
+                            "incomplete trace targets for window "
+                            f"{completed_window.window_index}: {missing_counts}"
+                        )
 
                     if not pulled_events:
                         logger.warning(
@@ -1587,6 +2052,63 @@ class Analyzer(abc.ABC):
                         "rank_pids": sorted(completed_window.boundary_ts_ns_by_pid or {}),
                         "boundary_ts_ns_by_pid": completed_window.boundary_ts_ns_by_pid or {},
                     }
+                    self._write_debug_window_integrity_ledger(traces)
+                    # Fact rules receive the completed control-window identity
+                    # and PID membership directly from the stream, not from the
+                    # debug CSV.  A proc_name maps only when its trace rows
+                    # unambiguously name one numeric PID; ambiguous/missing
+                    # mappings are deliberately omitted and worker-only rules
+                    # then fail closed.
+                    row_pid_by_index = {}
+                    trace_pids = set()
+                    if {"proc_name", process_key}.issubset(traces.columns):
+                        for proc_name, group in traces[["proc_name", process_key]].dropna().groupby("proc_name"):
+                            pids = {int(pid) for pid in group[process_key]}
+                            trace_pids.update(pids)
+                            if len(pids) == 1:
+                                row_pid_by_index[proc_name] = pids.pop()
+                    rank_pids = {int(pid) for pid in (completed_window.boundary_ts_ns_by_pid or {})}
+                    from .fastpath import (
+                        completed_window_stall_storage_provenance,
+                        completed_window_worker_roster_provenance,
+                    )
+                    roster_requested = any(value is not None for value in (
+                        worker_roster_dir, worker_roster_prefix,
+                        worker_roster_expected_workers,
+                    ))
+                    roster_provenance = None
+                    if roster_requested:
+                        roster_provenance = completed_window_worker_roster_provenance(
+                            traces,
+                            row_pid_by_index,
+                            roster_dir=worker_roster_dir,
+                            roster_prefix=worker_roster_prefix,
+                            expected_workers=worker_roster_expected_workers,
+                            expected_host=socket.gethostname(),
+                            expected_ranks=num_ranks,
+                            expected_rank_pids=rank_pids,
+                            pid_column=process_key,
+                            # None keeps the DLIO default; an unknown name fails closed.
+                            **({"roster_schema": worker_roster_schema}
+                               if worker_roster_schema is not None else {}),
+                        )
+                        worker_pids = (
+                            roster_provenance["worker_roster_pids"]
+                            if roster_provenance["worker_roster_coverage"] == 1.0 else []
+                        )
+                    else:
+                        worker_pids = sorted(trace_pids - rank_pids)
+                    self._fact_window_context = {
+                        "native_window": completed_window.window_index,
+                        "native_host": socket.gethostname(),
+                        "rank_pids": sorted(rank_pids),
+                        "worker_pids": worker_pids,
+                        "row_pid_by_index": row_pid_by_index,
+                        "completed_window_provenance": completed_window_stall_storage_provenance(
+                            traces, rank_pids, pid_column=process_key),
+                    }
+                    if roster_provenance is not None:
+                        self._fact_window_context["completed_window_worker_roster_provenance"] = roster_provenance
                     try:
                         # The fast path serves the threshold-free *-signal rule sets directly
                         # from the traces frame and declines anything else, so a rule set it
@@ -1642,6 +2164,7 @@ class Analyzer(abc.ABC):
                     finally:
                         # A later offline call must not inherit a stale online-window identity.
                         self._debug_window_provenance = None
+                        self._fact_window_context = None
                     _analysis_elapsed_ms = round((time.perf_counter() - _window_wall_start) * 1000, 1)
                     # The release rule of section 4j: analysis_elapsed_ms must be below the
                     # window's own wall-clock span, else the agent is sampling rather than
@@ -1672,6 +2195,8 @@ class Analyzer(abc.ABC):
                     )
 
         finally:
+            if trace_snapshot is not None:
+                trace_snapshot.close()
             logger.info("mofka.control_stream.stop", reason="sigterm")
             del control_consumer
             del control_driver
@@ -1695,6 +2220,10 @@ class Analyzer(abc.ABC):
         extra_columns_fn: Optional[Callable[[dict], dict]] = None,
         output_handler: Optional[Callable[[AnalysisResult], None]] = None,
         num_ranks: int = 1,
+        worker_roster_dir: Optional[str] = None,
+        worker_roster_prefix: Optional[str] = None,
+        worker_roster_expected_workers: Optional[int] = None,
+        worker_roster_schema: Optional[str] = None,
     ) -> None:
         resolved_control_topic = (
             control_topic_name
@@ -1726,6 +2255,10 @@ class Analyzer(abc.ABC):
             extra_columns_fn=extra_columns_fn,
             output_handler=output_handler,
             num_ranks=num_ranks,
+            worker_roster_dir=worker_roster_dir,
+            worker_roster_prefix=worker_roster_prefix,
+            worker_roster_expected_workers=worker_roster_expected_workers,
+            worker_roster_schema=worker_roster_schema,
         )
 
     def analyze_mofka_global(
@@ -2749,6 +3282,8 @@ class Analyzer(abc.ABC):
         system_metrics: Optional[pd.DataFrame] = None,
         layer_main_views: Optional[Dict[Layer, DataFrameType]] = None,
         is_dask: bool = True,
+        source_traces: Optional[pd.DataFrame] = None,
+        source_control_pids: Optional[List[int]] = None,
     ) -> AnalysisResult:
         # Compute layers & views
         with console_block("Compute views"):
@@ -2894,6 +3429,21 @@ class Analyzer(abc.ABC):
                             view_key=view_key,
                         )
 
+            # HLM-only callers have no original event frame.  Preserve missing
+            # integrity fields in that case rather than fabricating metadata;
+            # trace-backed streaming callers pass their concrete input below.
+            flat_views = attach_window_integrity_metrics(
+                flat_views,
+                source_traces,
+                control_pids=source_control_pids,
+            )
+            flat_views = attach_input_step_max_sum_metrics(flat_views, source_traces)
+            flat_views = attach_input_job_step_max_sum_metrics(flat_views, source_traces)
+            flat_views = attach_comm_exposed_median_metrics(flat_views, source_traces)
+            flat_views = attach_comm_total_median_metrics(flat_views, source_traces)
+            if self.debug and ("window",) in flat_views:
+                self._write_debug_flat_view(flat_view=flat_views[("window",)], view_key=("window",))
+
         # Checkpoint flat views if enabled
         if self.checkpoint:
             with log_block("write_flat_view_checkpoints"):
@@ -2950,7 +3500,7 @@ class Analyzer(abc.ABC):
             analysis_facts=analysis_facts,
         )
 
-        return AnalysisResult(
+        result = AnalysisResult(
             _hlms=hlms,
             _main_views=main_views,
             _metric_boundaries=metric_boundaries,
@@ -2966,6 +3516,8 @@ class Analyzer(abc.ABC):
             view_types=proc_view_types,
             views=views,
         )
+        self._write_debug_fact_envelope(result)
+        return result
 
     # ------------------------------------------------------------------ live fast path
     def _fastpath_mode(self) -> str:
@@ -3022,7 +3574,10 @@ class Analyzer(abc.ABC):
         plan = self._get_fastpath_plan(proc_view_types)
         if plan is None:
             return None
-        flat_views = plan.flat_views(traces)
+        flat_views = plan.flat_views(
+            traces,
+            control_pids=(getattr(self, "_debug_window_provenance", None) or {}).get("rank_pids", []),
+        )
         if not flat_views:
             return None
         # The fast path is an analysis optimization, not a provenance opt-out.
@@ -3038,7 +3593,7 @@ class Analyzer(abc.ABC):
             flat_views=flat_views,
             analysis_facts=analysis_facts,
         )
-        return AnalysisResult(
+        result = AnalysisResult(
             _hlms={},
             _main_views={},
             _metric_boundaries=metric_boundaries,
@@ -3051,6 +3606,8 @@ class Analyzer(abc.ABC):
             view_types=list(proc_view_types),
             views={},
         )
+        self._write_debug_fact_envelope(result)
+        return result
 
     def _analyze_trace(
         self,
@@ -3100,6 +3657,8 @@ class Analyzer(abc.ABC):
                 raw_stats=raw_stats,
                 profile_hlm=profile_hlm,
                 system_metrics=system_metrics,
+                source_traces=traces if isinstance(traces, pd.DataFrame) else None,
+                source_control_pids=(getattr(self, "_debug_window_provenance", None) or {}).get("rank_pids", []),
             )
         else:
             result = self._analyze_hlm(
@@ -3110,6 +3669,8 @@ class Analyzer(abc.ABC):
                 proc_view_types=proc_view_types,
                 raw_stats=raw_stats,
                 system_metrics=system_metrics,
+                source_traces=traces if isinstance(traces, pd.DataFrame) else None,
+                source_control_pids=(getattr(self, "_debug_window_provenance", None) or {}).get("rank_pids", []),
             )
 
         # Attach correct traces & view types

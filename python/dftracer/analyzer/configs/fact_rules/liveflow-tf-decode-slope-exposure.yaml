@@ -1,0 +1,50 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow TensorFlow DECODE-family rule (candidate, 2026-09-25).  Family = the `reader_decode`
+# service-time region (dft_ai.data.derive("decode") around tf_reader._parse_image); detection =
+# canonical within-family WiSIO slope (count_frac_total / time_proc_frac_total, reference 1, no
+# tuned constant).  LIMITATION, stated rather than hidden: DLIO/TF has no separately measurable
+# decode EXPOSURE (the consumer wait stall.storage contains any decode wait), so the exposure
+# conjunction here is the same measured consumer wait as the input rule
+# (stall coverage + coherent window + domain_input_time_proc_crit > 0).  The fact therefore says
+# "decode-family operations are disproportionately slow while the consumer waited"; it does not
+# separate decode from read.  Which knob helps is decided by the cbandit's verified effect, never
+# by comparing this slope with the reader_posix_read slope (different families are not divided).
+
+defaults:
+  rule_version: "liveflow-tf-decode-slope-exposure-v1"
+
+rules:
+  - id: tf.reader_decode.rank_thread_pool.slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: reader_decode.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: reader_decode_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: reader_posix
+    required_metrics:
+      - stall_storage_rank_coverage
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - reader_decode_count_frac_total
+      - reader_decode_time_proc_frac_total
+      - reader_decode_ops_slope
+    derived_metrics:
+      reader_decode_ops_slope_ref45_deficit: "clip01(1.0 - reader_decode_ops_slope)"
+    when: "stall_storage_rank_coverage == 1.0 and domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and domain_input_time_proc_crit > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and reader_decode_count_frac_total > 0.0 and reader_decode_time_proc_frac_total > 0.0 and reader_decode_ops_slope > 0.0 and reader_decode_ops_slope_ref45_deficit > 0.0"
+    severity_score: reader_decode_ops_slope_ref45_deficit
+    opportunity_tags:
+      - decode_pressure

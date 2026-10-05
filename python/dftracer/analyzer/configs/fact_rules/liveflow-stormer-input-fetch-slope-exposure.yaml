@@ -1,0 +1,65 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow StorMer INPUT rule, RANK-SIDE family variant (OFFLINE CANDIDATE, 2026-09-26; NOT judge-reviewed;
+# liveflow_shm/STORMER-LOOP-DESIGN-2026-09-26.md sec 3).  Why it exists next to
+# liveflow-stormer-input-slope-exposure.yaml (worker reader_posix_read family):
+#   the worker-POSIX roster proof is a controller-OFF fixed-W gate (node_agent rejects a roster unless
+#   the preset is dlio with stages analyzer,diagnoser; the StorMer launcher only builds it for
+#   STORMER_WORKER_POSIX_GATE with controller and plans disabled).  A num_workers action replaces the
+#   DataLoader workers, so a live loop arm cannot use worker-owned rows.  This variant keeps the same
+#   detection SHAPE on rows the rank process itself owns: the canonical WiSIO family slope
+#   fetch_iter_ops_slope = count_frac_total / time_proc_frac_total (the consumer's blocking
+#   next(loader) region, one region per step), view proc_name, min over the rank-thread rows of the
+#   native host, conjoined with the SAME measured critical-rank wait the worker candidate uses.
+# Never divided against another family's slope; slope < 1 alone is not a trigger (2026-09-24 boundary).
+# Constants: only 0 and 1.  No stall_storage_rank_coverage term (StorMer omits zero-duration records).
+# Tag: reader_parallelism (num_workers) only.  The estimated storage/decode split is reported, never gated.
+defaults:
+  rule_version: "liveflow-stormer-input-fetch-slope-exposure-v1"
+
+rules:
+  - id: stormer.fetch_iter.rank_thread_pool.slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: fetch_iter.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: fetch_iter_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: fetch
+    required_metrics:
+      - domain_skew_coverage
+      - domain_input_skew_attributed_time
+      - domain_input_skew_excess_time
+      - domain_comm_barrier_wait_time
+      - domain_comm_residual_after_skew_time
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_decode_time_proc_typ
+      - domain_compute_time_proc_typ
+      - window_wall_time_proc_typ
+      - domain_skew_late_proc_input_time
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - fetch_iter_count_frac_total
+      - fetch_iter_time_proc_frac_total
+      - fetch_iter_ops_slope
+    derived_metrics:
+      fetch_iter_ops_slope_ref45_deficit: "clip01(1.0 - fetch_iter_ops_slope)"
+      measured_total_wait_time_proc_crit: "fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit)"
+      estimated_storage_wait_share: "fillna0(domain_input_time_proc_crit) / max(fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit), 1e-9)"
+    when: "domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and measured_total_wait_time_proc_crit > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and fetch_iter_count_frac_total > 0.0 and fetch_iter_time_proc_frac_total > 0.0 and fetch_iter_ops_slope > 0.0 and fetch_iter_ops_slope_ref45_deficit > 0.0"
+    severity_score: fetch_iter_ops_slope_ref45_deficit
+    opportunity_tags:
+      - reader_parallelism

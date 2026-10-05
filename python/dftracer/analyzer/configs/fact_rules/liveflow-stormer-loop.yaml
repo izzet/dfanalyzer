@@ -1,0 +1,99 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow StorMer LOOP rule set (OFFLINE CANDIDATE, 2026-09-26): rank-side input rule + comm rule, one file for node_agent's
+# single --facts-rule-file.  The two rule bodies are byte-identical to the standalone files (test_stormer_loop_path.py asserts it).
+defaults:
+  rule_version: "liveflow-stormer-loop-v1"
+
+rules:
+  - id: stormer.fetch_iter.rank_thread_pool.slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: fetch_iter.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: fetch_iter_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: fetch
+    required_metrics:
+      - domain_skew_coverage
+      - domain_input_skew_attributed_time
+      - domain_input_skew_excess_time
+      - domain_comm_barrier_wait_time
+      - domain_comm_residual_after_skew_time
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_decode_time_proc_typ
+      - domain_compute_time_proc_typ
+      - window_wall_time_proc_typ
+      - domain_skew_late_proc_input_time
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - fetch_iter_count_frac_total
+      - fetch_iter_time_proc_frac_total
+      - fetch_iter_ops_slope
+    derived_metrics:
+      fetch_iter_ops_slope_ref45_deficit: "clip01(1.0 - fetch_iter_ops_slope)"
+      measured_total_wait_time_proc_crit: "fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit)"
+      estimated_storage_wait_share: "fillna0(domain_input_time_proc_crit) / max(fillna0(domain_input_time_proc_crit) + fillna0(domain_decode_time_proc_crit), 1e-9)"
+    when: "domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and measured_total_wait_time_proc_crit > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and fetch_iter_count_frac_total > 0.0 and fetch_iter_time_proc_frac_total > 0.0 and fetch_iter_ops_slope > 0.0 and fetch_iter_ops_slope_ref45_deficit > 0.0"
+    severity_score: fetch_iter_ops_slope_ref45_deficit
+    opportunity_tags:
+      - reader_parallelism
+
+  - id: stormer.comm_all_reduce.rank_thread_pool.skew_slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: comm_all_reduce.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: comm_all_reduce_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: comm
+    required_metrics:
+      - domain_skew_coverage
+      - domain_input_skew_attributed_time
+      - domain_input_skew_excess_time
+      - domain_comm_barrier_wait_time
+      - domain_comm_residual_after_skew_time
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_decode_time_proc_typ
+      - domain_compute_time_proc_typ
+      - window_wall_time_proc_typ
+      - domain_skew_late_proc_input_time
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - comm_all_reduce_count_frac_total
+      - comm_all_reduce_time_proc_frac_total
+      - comm_all_reduce_ops_slope
+    derived_metrics:
+      comm_all_reduce_ops_slope_ref45_deficit: "clip01(1.0 - comm_all_reduce_ops_slope)"
+      comm_exposure_after_skew_share: "fillna0(domain_comm_residual_after_skew_time) / max(fillna0(domain_comm_residual_after_skew_time) + fillna0(domain_input_skew_attributed_time), 1e-9)"
+    when: "domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and domain_skew_coverage == 1.0 and domain_comm_residual_after_skew_time > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and comm_all_reduce_count_frac_total > 0.0 and comm_all_reduce_time_proc_frac_total > 0.0 and comm_all_reduce_ops_slope > 0.0 and comm_all_reduce_ops_slope_ref45_deficit > 0.0"
+    severity_score: comm_all_reduce_ops_slope_ref45_deficit
+    opportunity_tags:
+      - comm_optimization
+

@@ -1,0 +1,40 @@
+schema_version: analysisfact-rules.v1
+
+# Proposed detector from liveflow_shm/DETECTOR-CARD-dlio-reader-posix.md.
+# It is intentionally not selected by any workload preset or launcher.
+defaults:
+  rule_version: "1.0.0"
+
+rules:
+  - id: dlio.reader_posix_read.worker_pool.reference45.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: reader_posix_read.worker_pool
+    worker_only: true
+    window_reducer: min
+    window_reducer_metric: reader_posix_read_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: reader_posix
+    required_metrics:
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      # Completed native-window safety/integrity vector.  These are injected
+      # from the one-row window view only after worker PID selection.
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - reader_posix_read_ops_slope
+    derived_metrics:
+      reader_posix_read_ops_slope_ref45_deficit: "clip01(1.0 - reader_posix_read_ops_slope)"
+    when: "domain_coherent == 1.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and reader_posix_read_ops_slope > 0.0 and reader_posix_read_ops_slope_ref45_deficit > 0.0"
+    severity_score: reader_posix_read_ops_slope_ref45_deficit
+    opportunity_tags:
+      - reader_parallelism

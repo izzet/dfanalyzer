@@ -1,0 +1,74 @@
+schema_version: analysisfact-rules.v1
+
+# LiveFlow StorMer COMM rule (OFFLINE CANDIDATE, 2026-09-26; liveflow_shm/STORMER-LOOP-DESIGN-2026-09-26.md).
+# Sibling of liveflow-stormer-input-slope-exposure.yaml and of the judge-accepted TF input rule pattern.
+#
+# Three things are named SEPARATELY and never merged:
+#   1. within-family slope: the canonical WiSIO comm_all_reduce_ops_slope
+#      (count_frac_total / time_proc_frac_total, 45-degree reference 1) over the all-reduce family ONLY,
+#      analyzer view proc_name, shares normalised over every row of that view on this node BEFORE the
+#      rank-thread filter, reduced by min over the rank-thread rows.  Never divided against another
+#      family's slope.  Imbalance diagnostic only (2026-09-24 judge boundary): below one means some
+#      rank-thread has a disproportionate share of all-reduce time.
+#   2. measured coherent-window comm exposure NOT explained by input skew:
+#      domain_comm_residual_after_skew_time = median_peers(comm) - A, with A = min(E, W) the analyzer's
+#      measured skew attribution (SKEW-ATTRIBUTION-2026-09-25.md).  Wait that a late rank's own excess
+#      input accounts for is NOT credited to comm.  Requires domain_skew_coverage == 1, i.e. the
+#      blocking comm probe is on (STORMER_COMM_PROBE != off); with the hook off there is no per-rank comm
+#      record, coverage is 0 and this rule can never fire (fail closed).
+#   3. the input-attributed part A, reported (evidence) and consumed by cbandit's skew link, never a gate.
+#
+# Constants: only 0 and the 45-degree reference 1.  A slope alone is NOT a trigger.  Presence gate only:
+# exposure magnitude reaches the decision through cbandit's predicted_effect/n_required, not here.
+# LiveDiagnoser owns persistence; LiveOptimizer owns prioritisation and the safety gates.
+# Limits (state them wherever this is cited): A is a LOWER bound under a rotating straggler, so a small A
+# does not prove the residual is inherent barrier cost; the rule is node-local (native host rank rows);
+# the comm knob (bucket_cap_mb) changes only reduction order, gated separately (Step 0 / grad-equivalence).
+defaults:
+  rule_version: "liveflow-stormer-comm-slope-exposure-v1"
+
+rules:
+  - id: stormer.comm_all_reduce.rank_thread_pool.skew_slope_exposure.v1
+    priority: 100
+    source_view: proc_name
+    emit_mode: window
+    scope_entity: comm_all_reduce.rank_thread_pool
+    rank_thread_only: true
+    window_reducer: min
+    window_reducer_metric: comm_all_reduce_ops_slope
+    fact_type: operation_family_time_disproportion
+    scope_layer: comm
+    required_metrics:
+      - domain_skew_coverage
+      - domain_input_skew_attributed_time
+      - domain_input_skew_excess_time
+      - domain_comm_barrier_wait_time
+      - domain_comm_residual_after_skew_time
+      - domain_input_time_proc_typ
+      - domain_comm_time_proc_typ
+      - domain_decode_time_proc_typ
+      - domain_compute_time_proc_typ
+      - window_wall_time_proc_typ
+      - domain_skew_late_proc_input_time
+      - domain_coherent
+      - domain_procs_active
+      - window_wall_time_proc_crit
+      - domain_input_time_proc_crit
+      - domain_decode_time_proc_crit
+      - domain_comm_time_proc_crit
+      - domain_compute_time_proc_crit
+      - residual_time_proc_crit
+      - epoch_nunique
+      - step_nunique
+      - step_min
+      - step_max
+      - comm_all_reduce_count_frac_total
+      - comm_all_reduce_time_proc_frac_total
+      - comm_all_reduce_ops_slope
+    derived_metrics:
+      comm_all_reduce_ops_slope_ref45_deficit: "clip01(1.0 - comm_all_reduce_ops_slope)"
+      comm_exposure_after_skew_share: "fillna0(domain_comm_residual_after_skew_time) / max(fillna0(domain_comm_residual_after_skew_time) + fillna0(domain_input_skew_attributed_time), 1e-9)"
+    when: "domain_coherent == 1.0 and domain_procs_active > 0.0 and window_wall_time_proc_crit > 0.0 and domain_skew_coverage == 1.0 and domain_comm_residual_after_skew_time > 0.0 and epoch_nunique == 1.0 and step_nunique >= 1.0 and step_min <= step_max and comm_all_reduce_count_frac_total > 0.0 and comm_all_reduce_time_proc_frac_total > 0.0 and comm_all_reduce_ops_slope > 0.0 and comm_all_reduce_ops_slope_ref45_deficit > 0.0"
+    severity_score: comm_all_reduce_ops_slope_ref45_deficit
+    opportunity_tags:
+      - comm_optimization

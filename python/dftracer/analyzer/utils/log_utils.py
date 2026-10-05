@@ -23,6 +23,24 @@ def configure_logging(log_file: str, level: str = "info") -> None:
 
     logging_config = {
         "version": 1,
+        # 2026-09-28 (judge batch 5 G4 root cause): dictConfig's own default is True, which
+        # disables every ALREADY-CREATED logger not explicitly named in "loggers" below. This
+        # process calls configure_logging() twice -- once for the analyzer's own setup, once for
+        # the diagnoser's -- and dftracer.analyzer.fact_engine's logger is created and used
+        # (facts.rules.loaded, during FactEngine.from_rule_file() inside build_analyzer()) BEFORE
+        # the diagnoser's own configure_logging() call runs. That second call, with the implicit
+        # default, silently set fact_engine's logger.disabled=True -- which short-circuits every
+        # logging call on it (Logger.info()/.debug() check self.disabled before anything else,
+        # including level), regardless of level/handlers/propagate. This is why
+        # "facts.rules.loaded" always appeared (logged before the disable) while every later call
+        # on the SAME logger -- every facts.rule.* line and patch 13's own diagnostic -- silently
+        # never did, with NO exception and NO visible symptom other than total silence. Confirmed
+        # directly: patch 296's file-persisted diagnostic recorded
+        # fact_engine_logger_disabled=true on every one of 15 windows in the v4.5.9 1N run.
+        # dftracer.analyzer.analyzer's own logger was unaffected only because its first real use
+        # (per-window processing) happens to occur after both configure_logging() calls complete,
+        # so it was never in the "already exists" set either dictConfig call could disable.
+        "disable_existing_loggers": False,
         "handlers": {
             "json_file": {
                 "class": "logging.FileHandler",

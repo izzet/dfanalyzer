@@ -772,6 +772,17 @@ def test_set_cross_layer_metrics_derived_metrics_zero_denoms():
     _assert_no_infinities(out)
 
 
+def test_set_cross_layer_metrics_derived_metrics_lowercase_key_unchanged():
+    df = pd.DataFrame({"a_time_sum": [10.0], "a_foo_time_sum": [4.0]})
+    out = set_cross_layer_metrics(
+        df, layers=["a"], layer_deps={"a": None}, async_layers=[],
+        derived_metrics={"a": {"foo": ""}}, is_view_process_based=True,
+        time_boundary_layer="a",
+    )
+    assert out.loc[0, "a_foo_time_proc_frac_a"] == pytest.approx(0.4)
+    assert out.loc[0, "a_foo_time_call_frac_a"] == pytest.approx(0.4)
+
+
 # ---------- set_quantile_metrics tests ----------
 
 

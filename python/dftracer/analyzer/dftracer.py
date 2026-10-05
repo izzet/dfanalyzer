@@ -1156,7 +1156,11 @@ class DFTracerAnalyzer(Analyzer):
             "step": "Int64",
             "tinterval": "Int64" if self.time_approximate else "string",
             "trange": "Int64",
-            "level": "Int8",
+            # Neither trace nesting nor a live control-window identity is
+            # bounded by an 8-bit signed integer.  Keep the trace schema wide
+            # enough that the streaming path cannot fail once either exceeds
+            # 127.
+            "level": "Int32",
         }
         metadata_columns = {
             "hash": "string",
@@ -1297,6 +1301,15 @@ class DFTracerAnalyzer(Analyzer):
             host_hashes = self._merge_seen_hashes("_seen_host_hashes", host_hashes)
             string_hashes = self._merge_seen_hashes("_seen_string_hashes", string_hashes)
 
+        # DFTracer builds that write the host hash ONLY in the per-process HH/thread_name metadata
+        # records (the PyPI dftracer 1.0.15 in the SFNO venv; events carry no `args` at all) leave
+        # every event's host_hash NA, so unique_host_count is 0 and all views collapse to zeros
+        # (the "still OPEN" host-metadata failure documented in _assert_metadata_resolved).
+        # Events that already carry args.hhash (the project's SHM/STDIO build) are untouched: only
+        # NA host_hash values are filled, from the host hash of the SAME pid's metadata records.
+        pid_hosts = self._pid_host_table(raw_traces, is_dask)
+        traces = self._fill_host_hash_from_pid(traces, pid_hosts)
+        profile_events = self._fill_host_hash_from_pid(profile_events, pid_hosts)
         traces = self._attach_metadata(traces, file_hashes=file_hashes, host_hashes=host_hashes)
         profile_events = self._attach_metadata(profile_events, file_hashes=file_hashes, host_hashes=host_hashes)
         self._file_hashes = file_hashes
@@ -1325,6 +1338,33 @@ class DFTracerAnalyzer(Analyzer):
             merged = pd.concat([table, extra]) if len(extra.index) else table
         setattr(self, attr, merged)
         return merged
+
+    @staticmethod
+    def _pid_host_table(raw_traces, is_dask: bool):
+        """pid -> host_hash from metadata (M) records that carry args.hhash, as a pandas Series."""
+        if "host_hash" not in raw_traces.columns or "pid" not in raw_traces.columns:
+            return None
+        meta_types = [TYPE_FILE_HASH, TYPE_HOST_HASH, TYPE_STRING_HASH, TYPE_METADATA, TYPE_PROC_METADATA]
+        m = raw_traces[raw_traces["type"].isin(meta_types)][["pid", "host_hash"]]
+        m = m.dropna()
+        if is_dask:
+            m = m.compute()
+        if not len(m.index):
+            return None
+        m = m.assign(host_hash=m["host_hash"].astype("string")).drop_duplicates("pid", keep="first")
+        return m.set_index(m["pid"].astype("int64"))["host_hash"]
+
+    @staticmethod
+    def _fill_host_hash_from_pid(records, pid_hosts):
+        """Fill NA host_hash of `records` from pid_hosts; rows that already have one keep it."""
+        if pid_hosts is None or "host_hash" not in records.columns or "pid" not in records.columns:
+            return records
+        records = records.copy()
+        host = records["host_hash"].astype("string")
+        mapped = records["pid"].astype("int64").map(pid_hosts).astype("string") if not isinstance(records, dd.DataFrame) \
+            else records["pid"].astype("int64").map(pid_hosts, meta=("host_hash", "string")).astype("string")
+        records["host_hash"] = host.fillna(mapped)
+        return records
 
     @staticmethod
     def _attach_metadata(records: dd.DataFrame, file_hashes: dd.DataFrame, host_hashes: dd.DataFrame):

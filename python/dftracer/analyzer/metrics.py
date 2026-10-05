@@ -1,3 +1,5 @@
+import statistics
+
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
@@ -166,6 +168,447 @@ def set_view_metrics(
     return df.sort_index(axis=1)
 
 
+def _thread_ids(traces: pd.DataFrame):
+    """Per-row thread id: the `tid` column when present, else field 4 of `app#host#pid#tid`."""
+    if "tid" in traces.columns:
+        return pd.to_numeric(traces["tid"], errors="coerce")
+    if "proc_name" in traces.columns:
+        parts = traces["proc_name"].astype(str).str.split("#", expand=True)
+        if parts.shape[1] >= 4:
+            return pd.to_numeric(parts[3], errors="coerce")
+    return None
+
+
+def authoritative_control_rows(traces: pd.DataFrame, control_pids) -> pd.Series:
+    """Boolean mask of the events that define a control window's epoch/step membership.
+
+    The control rank's own (main-thread) events are authoritative.  Threads that live inside the
+    same rank process (tf.data pool threads, helper threads) share its PID but their per-thread
+    DFTracer epoch stamp can be STALE: on the Corona TF cell every `TFReader._parse_image` event of
+    epochs 2 and 3 carried `epoch=1` while the rank's own `fetch.*` events carried 2 or 3, so every
+    window looked like it spanned two epochs and the single-epoch gate silently suppressed every
+    fact after epoch 1.  For each control PID the main thread (tid == pid) rows are used when the
+    window has any; a PID with no main-thread rows keeps all its rows (no silent loss of a control
+    rank), and without thread identity the filter is a no-op.  The single-epoch gate itself is not
+    changed: two epochs on the authoritative rows still give `epoch_nunique == 2`.
+    """
+    numeric_pid = pd.to_numeric(traces["pid"], errors="coerce")
+    control = {int(pid) for pid in (control_pids or []) if pd.notna(pid)}
+    in_control = numeric_pid.isin(control)
+    tids = _thread_ids(traces)
+    if tids is None:
+        return in_control
+    main = in_control & (tids == numeric_pid)
+    have_main = set(numeric_pid[main].dropna().astype(int).unique())
+    keep_all = in_control & ~numeric_pid.fillna(-1).astype(int).isin(have_main)
+    return main | keep_all
+
+
+def attach_window_integrity_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+    control_pids: Optional[List[int]] = None,
+) -> Dict:
+    """Attach control-side epoch/step coverage to the native window view.
+
+    The gate is defined by completed-window rank/control PIDs only.  Async
+    worker rows remain available to the analyzer and debug ledger, but cannot
+    redefine the control epoch or fabricate a workload step.  Missing control
+    PID provenance deliberately leaves every gate field missing.
+    """
+    view = flat_views.get(("window",))
+    if view is None:
+        return flat_views
+    names = (
+        "epoch_nunique",
+        "step_nunique",
+        "step_min",
+        "step_max",
+    )
+    result = view.copy()
+    for name in names:
+        result[name] = pd.NA
+    needed = {"window", "pid", "epoch", "step"}
+    numeric_control_pids = {
+        int(pid) for pid in (control_pids or []) if pd.notna(pid)
+    }
+    if (traces is None or not needed.issubset(traces.columns)
+            or not numeric_control_pids):
+        flat_views[("window",)] = result
+        return flat_views
+    rows = traces.loc[
+        authoritative_control_rows(traces, numeric_control_pids)
+        & traces["epoch"].notna()
+        & traces["step"].notna(),
+        ["window", "epoch", "step"],
+    ].copy()
+    if rows.empty:
+        flat_views[("window",)] = result
+        return flat_views
+    rows["epoch"] = pd.to_numeric(rows["epoch"], errors="coerce")
+    rows["step"] = pd.to_numeric(rows["step"], errors="coerce")
+    rows = rows.dropna()
+    stats = rows.groupby("window").agg(
+        epoch_nunique=("epoch", "nunique"),
+        step_nunique=("step", "nunique"),
+        step_min=("step", "min"),
+        step_max=("step", "max"),
+    )
+    for name in names:
+        result[name] = result.index.to_series().map(stats[name]).astype("Float64")
+    flat_views[("window",)] = result
+    return flat_views
+
+
+FETCH_ITER_SELECTOR = 'cat == "dataloader" & func_name == "fetch.iter"'
+
+
+def attach_input_step_max_sum_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+) -> Dict:
+    """Declared step-granular view for critical-path input exposure (E1, STORMER-LOOP-DESIGN sec 11/12/14).
+
+    Family: fetch_iter (`FETCH_ITER_SELECTOR`, the same selector the accepted rank-side input rule
+    uses).  View: a new ``("window", "step")`` grouping key, alongside the existing ``("window",)``
+    and ``("proc_name", "window")`` views -- nothing else in the fact path changes.  Named
+    count/time aggregation: ``fetch_iter_step_time_sum`` (per window, step, pid) and
+    ``fetch_iter_step_count_sum``.
+
+    Reduction to the window level, reported on the existing ``("window",)`` view as NEW columns
+    that never overwrite the accepted `A = min(E, W)` skew-attribution fields:
+      - `domain_input_step_max_sum_time`  = sum over steps in the window of (max over pid of that
+        step's `fetch_iter_step_time_sum`) -- sum-of-max, sec 12.  Structural (argmax + sum), no
+        threshold constant.
+      - `domain_input_step_max_sum_count` = the same reduction over `fetch_iter_step_count_sum`,
+        reported for provenance (should be step_nunique * 1 in the normal single-call-per-step case;
+        a value above that says a step made more than one `fetch.iter` call and the exposure sum
+        may double count within a step -- report, do not silently correct).
+      - `domain_input_step_nunique`       = number of distinct steps this window's fetch_iter rows
+        actually cover, so a caller can tell a real reduction from an artifact of a mostly-empty
+        window (a window with `step_nunique <= 1` cannot support a sum-of-max claim and must be
+        treated as missing, never as zero exposure).
+
+    Only ADDS columns to an existing window view; does not create one. Missing/absent `step` on
+    fetch_iter rows (pre-tag data, or an app that never tags this family) leaves every new column
+    NA for that window -- consistent with the project rule that missing normalization/attribution
+    must suppress a finding, never read as zero.
+    """
+    view = flat_views.get(("window",))
+    if view is None:
+        return flat_views
+    names = (
+        "domain_input_step_max_sum_time",
+        "domain_input_step_max_sum_count",
+        "domain_input_step_nunique",
+    )
+    result = view.copy()
+    for name in names:
+        result[name] = pd.NA
+    needed = {"window", "pid", "step", "cat", "func_name", "time"}
+    if traces is None or not needed.issubset(traces.columns):
+        flat_views[("window",)] = result
+        return flat_views
+    try:
+        family_mask = traces.eval(FETCH_ITER_SELECTOR)
+    except Exception:
+        flat_views[("window",)] = result
+        return flat_views
+    rows = traces.loc[
+        family_mask & traces["window"].notna() & traces["step"].notna() & traces["pid"].notna(),
+        ["window", "step", "pid", "time"],
+    ].copy()
+    if rows.empty:
+        flat_views[("window",)] = result
+        return flat_views
+    rows["step"] = pd.to_numeric(rows["step"], errors="coerce")
+    rows["time"] = pd.to_numeric(rows["time"], errors="coerce").fillna(0.0)
+    rows = rows.dropna(subset=["window", "step", "pid"])
+    # Declared view: (window, step, pid) -> named count/time aggregation.
+    per_pid_step = rows.groupby(["window", "step", "pid"]).agg(
+        fetch_iter_step_time_sum=("time", "sum"),
+        fetch_iter_step_count_sum=("time", "size"),
+    )
+    flat_views[("window", "step")] = per_pid_step
+    # Reduction: max over pid within (window, step) -- the critical rank's own fetch wait that step.
+    per_step_max = per_pid_step.groupby(["window", "step"]).agg(
+        step_max_time=("fetch_iter_step_time_sum", "max"),
+        step_max_count=("fetch_iter_step_count_sum", "max"),
+    )
+    # Reduction: sum over steps within window -- sum-of-max, sec 12.
+    stats = per_step_max.groupby("window").agg(
+        domain_input_step_max_sum_time=("step_max_time", "sum"),
+        domain_input_step_max_sum_count=("step_max_count", "sum"),
+        domain_input_step_nunique=("step_max_time", "size"),
+    )
+    for name in names:
+        result[name] = result.index.to_series().map(stats[name])
+    flat_views[("window",)] = result
+    return flat_views
+
+
+INPUT_EXPOSURE_JOB_SELECTOR = 'cat == "input_exposure_job" & func_name == "input_step_max_sum_job"'
+
+
+def attach_input_job_step_max_sum_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+) -> Dict:
+    """Job-wide (cross-node) sum-of-max input exposure (STORMER-LOOP-DESIGN sec 16, judge batch 5).
+
+    `attach_input_step_max_sum_metrics` above is PER NODE: each node_agent's analyzer only sees its
+    own local ranks' `fetch_iter` rows, so its max-over-pid is a max over that node's ranks, not the
+    job's true `max over ALL ranks per step`. Sec 16 closes this on the RANK side instead: every
+    rank runs an `Iallreduce(MAX)` over its own per-step fetch-wait vector for the window
+    (`Trainer._sync_input_exposure_window`, opt-in `STORMER_INPUT_EXPOSURE_JOB_SYNC=1`), so every
+    rank ends up with the IDENTICAL job-wide sum-of-max and writes it as ONE event, per rank, per
+    window, to its own node's SHM lane (family `input_exposure_job`, this selector). That means the
+    value is already correctly reduced before it reaches this function -- no per-pid max is needed
+    here, only a per-window read of the (redundant, identical-per-rank) family time.
+
+    Attaches, on the existing ``("window",)`` view, as NEW columns that never overwrite the
+    per-node reference (`domain_input_step_max_sum_time`) or the accepted `A = min(E, W)` fields:
+      - `domain_input_job_step_max_sum_time` = this family's `time` for the window (`.max()` over
+        the window's redundant per-rank rows for idempotence -- NOT `.sum()`, which would multiply
+        the single job-wide value by however many local ranks wrote it).
+      - `domain_input_job_step_count`        = the `step_count` int-arg the rank-side reduction
+        attached (the job-wide valid-step count for that window), for provenance.
+
+    Absent when the emitting flag was never turned on (the common case today) -- every column stays
+    NA, consistent with the project rule that missing attribution suppresses, never reads as zero.
+    """
+    view = flat_views.get(("window",))
+    if view is None:
+        return flat_views
+    names = ("domain_input_job_step_max_sum_time", "domain_input_job_step_count")
+    result = view.copy()
+    for name in names:
+        result[name] = pd.NA
+    needed = {"window", "cat", "func_name", "time"}
+    if traces is None or not needed.issubset(traces.columns):
+        flat_views[("window",)] = result
+        return flat_views
+    try:
+        family_mask = traces.eval(INPUT_EXPOSURE_JOB_SELECTOR)
+    except Exception:
+        flat_views[("window",)] = result
+        return flat_views
+    rows = traces.loc[family_mask & traces["window"].notna(), ["window", "time"]].copy()
+    step_count_col = None
+    if "step_count" in traces.columns:
+        step_count_col = pd.to_numeric(
+            traces.loc[family_mask & traces["window"].notna(), "step_count"], errors="coerce")
+    if rows.empty:
+        flat_views[("window",)] = result
+        return flat_views
+    rows["time"] = pd.to_numeric(rows["time"], errors="coerce")
+    rows = rows.dropna(subset=["window"])
+    stats = rows.groupby("window")["time"].max().rename("domain_input_job_step_max_sum_time")
+    result["domain_input_job_step_max_sum_time"] = (
+        result.index.to_series().map(stats))
+    if step_count_col is not None:
+        rows2 = rows.assign(step_count=step_count_col.reindex(rows.index))
+        sc = rows2.groupby("window")["step_count"].max().rename("domain_input_job_step_count")
+        result["domain_input_job_step_count"] = result.index.to_series().map(sc)
+    flat_views[("window",)] = result
+    return flat_views
+
+
+# CONFIRMED against domain2's landed emission (tree-v4.4.1, train.py `_emit_exposed_comm`):
+# `inst.log_event(name="comm.exposed", cat="comm", ..., int_args={"step": step})`, one call per rank
+# per step, no-op below a sub-microsecond floor (a fully-hidden step emits nothing, not a zero-duration
+# event) -- `exposed_comm_ms = max(0, last_all_reduce_end - backward_end)` via
+# `comm_hook.compute_exposed_comm_ms` (STORMER-LOOP-DESIGN sec 17 v2). `func_name == "comm.exposed"`
+# keeps this family disjoint from the existing `comm`/`comm_all_reduce` selectors (`cat == "comm"` with
+# no func_name filter, and `func_name == "all_reduce"` respectively) despite sharing `cat == "comm"`.
+COMM_EXPOSED_SELECTOR = 'cat == "comm" & func_name == "comm.exposed"'
+COMM_EXPOSED_TRIM_FRACTION = 0.10   # the "10%" in "10%-trimmed mean" -- a declared, disclosed choice,
+                                     # not hidden inside the reduction; median is the primary estimator.
+
+
+def _trimmed_mean(values, frac):
+    """Symmetric trimmed mean: drop the lowest and highest `frac` fraction each side, then average
+    what remains. `frac` must be stated wherever this is cited (sec 17.1); it is not constant-free
+    the way a plain median/max/argmax is, and is reported as an explicit alternate, never silently
+    substituted for the median."""
+    vals = sorted(values)
+    n = len(vals)
+    if n == 0:
+        return None
+    k = int(n * frac)
+    trimmed = vals[k: n - k] if n - 2 * k > 0 else vals
+    return sum(trimmed) / len(trimmed)
+
+
+def attach_comm_exposed_median_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+) -> Dict:
+    """Window comm exposure from domain2's per-step exposed-comm event (STORMER-LOOP-DESIGN sec 17 v2,
+    orchestrator decision 2026-09-27, full input+comm loop).
+
+    Domain2's B1 agreement check found raw per-step exposed-comm sums are spike-dominated (a
+    non-blocking CUDA-event timer absorbs cross-rank arrival skew at stall steps, up to 14x a
+    blocking-probe reference that measures a DIFFERENT quantity and must not be used to calibrate
+    this one). The window fact is therefore the MEDIAN (primary) or a declared 10%-trimmed mean
+    (alternate, `COMM_EXPOSED_TRIM_FRACTION`) of the window's per-step values, times the number of
+    steps in the window -- both are structural population statistics (a percentile and a symmetric
+    trim), not thresholds on the DATA itself; only the trim fraction is a disclosed numeric choice.
+
+    Family: `COMM_EXPOSED_SELECTOR` (confirmed against domain2's landed emission, tree-v4.4.1). View: a new
+    `("window", "step")` grouping key (parallel to `attach_input_step_max_sum_metrics`), named
+    count/time aggregation `comm_exposed_step_time_sum`/`comm_exposed_step_count_sum` per
+    `(window, step, pid)`. Reduction: per step, MAX over pid (the job-wide CRITICAL exposed comm that
+    step -- never averaged away, same "critical path" philosophy as every other reduction in this
+    file); per window, MEDIAN (and 10%-trimmed mean) over the window's per-step maxima, multiplied by
+    the count of steps that went into it.
+
+    New columns on the existing `("window",)` view, never overwriting the older `domain_comm_time_
+    proc_crit`:
+      - `domain_comm_pure_exposure_time_v2` = median(job-wide per-step exposed comm) * step_nunique.
+      - `domain_comm_exposure_trimmed10_time_v2` = the declared 10%-trimmed-mean alternate, same
+        step count multiplier -- reported, never silently substituted for the median above.
+      - `domain_comm_exposure_step_nunique` = the step count used, so a caller can tell a real
+        reduction from a near-empty window (mirrors `domain_input_step_nunique`'s own suppression rule
+        -- a `step_nunique <= 1` window must be treated as missing, not zero exposure).
+
+    ZERO-FILL FIX (2026-09-27, orchestrator): `_emit_exposed_comm` is a no-op below a sub-microsecond
+    floor, so a fully-hidden step emits NO row at all, not a `time == 0` row. Left alone, the per-step
+    reduction below would only ever see steps that had at least one rank's row, silently DROPPING the
+    true zero-exposure steps from the population and biasing the median upward. The authoritative step
+    population for a window is instead taken from the SAME step-tagged `fetch_iter` family sec 12/16
+    already use (every step that produced a fetch wait, tagged the same way, in the same run): a step
+    present there but absent from `comm.exposed` rows is fully hidden and contributes exactly 0.0, not
+    a missing value. If a window has NO `fetch_iter` step tags at all, there is no authoritative
+    population to zero-fill against, and this fact stays NA for that window -- suppression, never a
+    fabricated population, per the project's missing-attribution rule.
+    """
+    return _comm_median_metrics(
+        flat_views, traces, selector=COMM_EXPOSED_SELECTOR,
+        time_col="domain_comm_pure_exposure_time_v2",
+        trimmed_col="domain_comm_exposure_trimmed10_time_v2",
+        nunique_col="domain_comm_exposure_step_nunique",
+        pid_step_time_col="comm_exposed_step_time_sum",
+        pid_step_count_col="comm_exposed_step_count_sum",
+    )
+
+
+# sec 17 v3 (orchestrator decision 2026-09-27): domain2's exposed-comm validation found exposed comm
+# tiny and HIGHER at cap400 (1.8ms cap25/W16 vs 7.6ms cap400/W16) while TOTAL comm was 173 vs 81ms --
+# Step 0c's cap400 gain looks like comm/compute INTERFERENCE, not an exposed-tail effect. `comm.total`
+# (train.py's `_emit_total_comm`, event-probe mode only) is the sum of every bucket's own span that
+# step, an UPPER BOUND on what a cap change can be worth. Selected via
+# `DFOPTIMIZER_COMM_EXPOSURE_SOURCE=total` (clbo_planner.py); JOINT_VERIFY's measured wall improvement
+# is the arbiter that decides whether a move made on this bound is kept (cbandit_planner.py already
+# does this, unmodified -- see its docstring for the "proposal bound, wall as arbiter" framing).
+COMM_TOTAL_SELECTOR = 'cat == "comm" & func_name == "comm.total"'
+
+
+def attach_comm_total_median_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+) -> Dict:
+    """Window TOTAL comm (sec 17 v3) -- same reduction as `attach_comm_exposed_median_metrics`
+    (per-step max-over-pid, then window median/trimmed-mean over steps, zero-filled from the
+    `fetch_iter` step population), applied to the `comm.total` family instead of `comm.exposed`.
+
+    New columns on the existing ``("window",)`` view, never overwriting `domain_comm_pure_exposure_
+    time_v2` (sec 17 v2) or the older `domain_comm_time_proc_crit`:
+      - `domain_comm_total_median_time_v3` = median(job-wide per-step TOTAL comm) * step_nunique.
+      - `domain_comm_total_trimmed10_time_v3` = the declared 10%-trimmed-mean alternate.
+      - `domain_comm_total_step_nunique` = the step count used (same suppression rule as sec 17 v2:
+        `<= 1` must be treated as missing, not zero).
+    """
+    return _comm_median_metrics(
+        flat_views, traces, selector=COMM_TOTAL_SELECTOR,
+        time_col="domain_comm_total_median_time_v3",
+        trimmed_col="domain_comm_total_trimmed10_time_v3",
+        nunique_col="domain_comm_total_step_nunique",
+        pid_step_time_col="comm_total_step_time_sum",
+        pid_step_count_col="comm_total_step_count_sum",
+    )
+
+
+def _comm_median_metrics(
+    flat_views: Dict,
+    traces: pd.DataFrame,
+    *,
+    selector: str,
+    time_col: str,
+    trimmed_col: str,
+    nunique_col: str,
+    pid_step_time_col: str,
+    pid_step_count_col: str,
+) -> Dict:
+    """Shared reduction for sec 17 v2 (`comm.exposed`) and v3 (`comm.total`): per-step MAX over pid,
+    then window MEDIAN (primary) and a declared 10%-trimmed-mean alternate over steps, multiplied by
+    the step count, zero-filled against the `fetch_iter` step population (a step present there but
+    absent from `selector`'s rows is fully hidden and contributes 0.0, never silently dropped nor
+    fabricated as NA when no window can be built -- see the ZERO-FILL FIX note on the v2 caller)."""
+    view = flat_views.get(("window",))
+    if view is None:
+        return flat_views
+    names = (time_col, trimmed_col, nunique_col)
+    result = view.copy()
+    for name in names:
+        result[name] = pd.NA
+    needed = {"window", "pid", "step", "cat", "func_name", "time"}
+    if traces is None or not needed.issubset(traces.columns):
+        flat_views[("window",)] = result
+        return flat_views
+    fetch_rows = traces.loc[
+        traces.eval(FETCH_ITER_SELECTOR) & traces["window"].notna() & traces["step"].notna(),
+        ["window", "step"],
+    ].copy()
+    if fetch_rows.empty:
+        flat_views[("window",)] = result
+        return flat_views
+    fetch_rows["step"] = pd.to_numeric(fetch_rows["step"], errors="coerce")
+    fetch_rows = fetch_rows.dropna(subset=["window", "step"])
+    fetch_steps_by_window = fetch_rows.groupby("window")["step"].apply(lambda s: set(s.unique()))
+    try:
+        family_mask = traces.eval(selector)
+    except Exception:
+        family_mask = pd.Series(False, index=traces.index)
+    rows = traces.loc[
+        family_mask & traces["window"].notna() & traces["step"].notna() & traces["pid"].notna(),
+        ["window", "step", "pid", "time"],
+    ].copy()
+    if not rows.empty:
+        rows["step"] = pd.to_numeric(rows["step"], errors="coerce")
+        rows["time"] = pd.to_numeric(rows["time"], errors="coerce").fillna(0.0)
+        rows = rows.dropna(subset=["window", "step", "pid"])
+    per_pid_step = rows.groupby(["window", "step", "pid"]).agg(
+        **{pid_step_time_col: ("time", "sum"), pid_step_count_col: ("time", "size")}
+    ) if not rows.empty else pd.DataFrame(columns=[pid_step_time_col])
+    # Note: deliberately does NOT touch flat_views[("window", "step")] -- sec 14's own declared view
+    # under that same key (fetch_iter) is a different family and must not be overwritten by this one.
+    per_step_max = (
+        per_pid_step.groupby(["window", "step"])[pid_step_time_col].max()
+        if not per_pid_step.empty else pd.Series(dtype=float)
+    )
+
+    def _reduce(vals):
+        n = len(vals)
+        if not n:
+            return None, None, None
+        med = statistics.median(vals) * n
+        trimmed = (_trimmed_mean(vals, COMM_EXPOSED_TRIM_FRACTION) or 0.0) * n
+        return med, trimmed, n
+
+    out = {name: {} for name in names}
+    for window, steps in fetch_steps_by_window.items():
+        vals = [per_step_max.get((window, s), 0.0) for s in steps]
+        med, trimmed, n = _reduce(vals)
+        out[time_col][window] = med
+        out[trimmed_col][window] = trimmed
+        out[nunique_col][window] = n
+    for name in names:
+        result[name] = result.index.to_series().map(out[name])
+    flat_views[("window",)] = result
+    return flat_views
+
+
 def set_cross_layer_metrics(
     df: pd.DataFrame,
     layers: List[str],
@@ -253,7 +696,7 @@ def set_cross_layer_metrics(
 
     # Set relational time metrics for derived metrics
     for layer in derived_metrics:
-        for dm in derived_metrics.get(layer.lower(), {}):
+        for dm in derived_metrics[layer]:
             dm_col = f"{layer}_{dm}"
             dm_time_proc_col = f"{dm_col}_{time_proc_metric}"
             dm_time_call_col = f"{dm_col}_{time_call_metric}"
@@ -373,6 +816,36 @@ def set_cross_layer_metrics(
 # Both are taken from a single process, so both close on the wall by construction and their
 # residual is a measurement of what the annotations did not name rather than an aggregation error.
 
+# CROSS-RANK INPUT-SKEW ATTRIBUTION (2026-09-25; liveflow_shm/SKEW-ATTRIBUTION-2026-09-25.md).
+# A bulk-synchronous step makes the ranks that arrive EARLY wait for the LATE one inside the
+# collective, so that wait is measured as comm on the early ranks although the late rank's own
+# input stall caused it.  `coherent_domain_vectors` therefore also reports a measured accounting
+# identity per window (all seconds, one value per window):
+#   late rank L            = the active rank that waited LEAST in the collective (smallest comm);
+#                            it arrived last.  (Not `crit`: crit is the largest input exposure.)
+#   peers                  = every other active rank
+#   E  excess_time         = max(0, input(L) - median_peers(input))   input = stall.storage +
+#                            stall.decode, or fetch_iter - decode when the stall instrument is absent
+#   W  wait_time           = max(0, median_peers(comm) - comm(L))     comm = comm.all_reduce/barrier
+#   A  attributed_time     = min(E, W)     the part of the peers' comm wait that L's own excess
+#                            input can account for; never more than either measured quantity
+#   comm_residual_time     = median_peers(comm) - A      what stays communication
+#   coverage               = 1 only if the window has >= 2 active ranks, every active rank measured
+#                            a positive comm time (an absent comm record is not a zero), an input
+#                            instrument is present, and, when the caller knows it, the active-rank
+#                            count equals the expected rank count.  Otherwise every value is 0 and
+#                            coverage is 0: attribution is SUPPRESSED, never invented.
+# There is no constant: E and W are differences of measurements taken in the same window, and A is
+# their minimum.
+SKEW_COLUMNS = (
+    "domain_skew_coverage",
+    "domain_skew_late_proc_input_time", "domain_skew_late_proc_comm_time",
+    "domain_skew_peer_median_input_time", "domain_skew_peer_median_comm_time",
+    "domain_input_skew_excess_time", "domain_comm_barrier_wait_time",
+    "domain_input_skew_attributed_time", "domain_comm_residual_after_skew_time",
+)
+
+
 DOMAIN_VECTOR_SUFFIXES = ("crit", "typ")
 DOMAIN_VECTOR_COLUMNS = tuple(
     "%s_time_proc_%s" % (name, suffix)
@@ -389,10 +862,55 @@ DOMAIN_VECTOR_COLUMNS = tuple(
      # vector wherever an input domain is claimed, and because `p1 - p2` is the planner's payoff
      # bound when it relieves the critical rank.
      "domain_input_time_proc_p1", "domain_input_time_proc_p2",
-     "domain_input_time_proc_med", "domain_input_time_proc_min")
+     "domain_input_time_proc_med", "domain_input_time_proc_min") + SKEW_COLUMNS
 
 
-def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+def skew_attribution(
+    active: np.ndarray, input_t: np.ndarray, comm_t: np.ndarray,
+    *, input_instrument: bool, comm_instrument: bool, expected_procs: Optional[int] = None,
+) -> Dict[str, np.ndarray]:
+    """Per-window measured input-skew accounting; see the note on SKEW_COLUMNS.
+
+    `active`, `input_t`, `comm_t` are (n_groups, n_proc).  Pure and deterministic.
+    """
+    n_groups = active.shape[0]
+    out = {name: np.zeros(n_groups) for name in SKEW_COLUMNS}
+    if not (input_instrument and comm_instrument):
+        return out
+    for g in range(n_groups):
+        idx = np.flatnonzero(active[g])
+        if idx.size < 2:
+            continue
+        if expected_procs is not None and idx.size != int(expected_procs):
+            continue
+        comm = comm_t[g][idx]
+        if not np.all(comm > 0.0):
+            continue                       # a rank with no comm record: cannot order arrivals
+        inp = input_t[g][idx]
+        # Late rank = smallest comm; exact ties resolved toward the SMALLEST input (conservative:
+        # a tie can never manufacture attribution).
+        tied = np.flatnonzero(comm == comm.min())
+        late = tied[np.argmin(inp[tied])]
+        peers = np.delete(np.arange(idx.size), late)
+        peer_in = float(np.median(inp[peers]))
+        peer_comm = float(np.median(comm[peers]))
+        excess = max(0.0, float(inp[late]) - peer_in)
+        wait = max(0.0, peer_comm - float(comm[late]))
+        attributed = min(excess, wait)
+        out["domain_skew_coverage"][g] = 1.0
+        out["domain_skew_late_proc_input_time"][g] = float(inp[late])
+        out["domain_skew_late_proc_comm_time"][g] = float(comm[late])
+        out["domain_skew_peer_median_input_time"][g] = peer_in
+        out["domain_skew_peer_median_comm_time"][g] = peer_comm
+        out["domain_input_skew_excess_time"][g] = excess
+        out["domain_comm_barrier_wait_time"][g] = wait
+        out["domain_input_skew_attributed_time"][g] = attributed
+        out["domain_comm_residual_after_skew_time"][g] = peer_comm - attributed
+    return out
+
+
+def coherent_domain_vectors(mats: Dict[str, np.ndarray],
+                            expected_procs: Optional[int] = None) -> Dict[str, np.ndarray]:
     """Per-window domain vectors taken whole from one process each.
 
     `mats` maps a layer prefix to a (n_groups, n_proc) array of that layer's summed time for that
@@ -494,6 +1012,10 @@ def coherent_domain_vectors(mats: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     # must fail closed rather than reinterpret those same inputs as legacy
     # aggregate metrics.
     out["domain_coherent"] = (n_active > 0).astype(float)
+    out.update(skew_attribution(
+        active, input_t + decode_t, comm_t,
+        input_instrument=exposure_present or "fetch_iter" in mats,
+        comm_instrument="comm" in mats, expected_procs=expected_procs))
     return out
 
 
@@ -578,6 +1100,8 @@ def set_window_decomposition_metrics(
         columns["domain_coherent"] = 1.0
         for name in ("p1", "p2", "med", "min"):
             columns["domain_input_time_proc_%s" % name] = input_time + decode_time
+        for name in SKEW_COLUMNS:          # no per-process matrices: attribution suppressed (0, coverage 0)
+            columns[name] = 0.0
     else:
         # No per-process matrices reached us (the full analysis path, which builds each view from
         # already-aggregated per-layer maxima). Publish the columns so the wire contract is the
@@ -598,6 +1122,8 @@ def set_window_decomposition_metrics(
         columns["domain_coherent"] = 0.0
         for name in ("p1", "p2", "med", "min"):
             columns["domain_input_time_proc_%s" % name] = input_time + decode_time
+        for name in SKEW_COLUMNS:          # no per-process matrices: attribution suppressed (0, coverage 0)
+            columns[name] = 0.0
 
     additions = pd.DataFrame(columns, index=df.index).astype("Float64")
     return pd.concat([df.drop(columns=[c for c in additions if c in df.columns]), additions], axis=1)

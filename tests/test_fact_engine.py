@@ -13,7 +13,7 @@ if str(_SOURCE_PACKAGE) not in dftracer.__path__:
     dftracer.__path__.insert(0, str(_SOURCE_PACKAGE))
 
 from dftracer.analyzer.fact_engine import FactEngine
-from dftracer.analyzer.fact_rules import build_fact_rule
+from dftracer.analyzer.fact_rules import FactRuleValidationError, build_fact_rule
 
 
 pytestmark = [pytest.mark.smoke, pytest.mark.full]
@@ -117,6 +117,291 @@ def test_fact_engine_explicitly_rebinds_epoch_rules_for_native_window_only():
     fact = facts[("window",)][0]
     assert fact.window.view_type == "window"
     assert fact.window.window == 9
+
+
+def test_proc_name_worker_slope_fact_uses_native_window_and_minimum_worker():
+    rule = build_fact_rule({
+        "id": "wisio.reader_posix_read.worker_pool.v1",
+        "priority": 1,
+        "source_view": "proc_name",
+        "emit_mode": "window",
+        "scope_entity": "reader_posix_read.worker_pool",
+        "worker_only": True,
+        "window_reducer": "min",
+        "window_reducer_metric": "reader_posix_read_ops_slope",
+        "fact_type": "operation_family_time_disproportion",
+        "required_metrics": ["domain_coherent", "reader_posix_read_ops_slope"],
+        "derived_metrics": {
+            "reader_posix_read_ops_slope_ref45_deficit":
+                "clip01(1.0 - reader_posix_read_ops_slope)",
+        },
+        "when": "domain_coherent == 1.0 and reader_posix_read_ops_slope > 0.0 and reader_posix_read_ops_slope_ref45_deficit > 0.0",
+        "severity_score": "reader_posix_read_ops_slope_ref45_deficit",
+        "opportunity_tags": ["reader_parallelism"],
+    })
+    # The diagnostic view contains family evidence only.  Control metrics are
+    # supplied from the one completed native window, after worker selection.
+    rows = pd.DataFrame({
+        "reader_posix_read_ops_slope": [0.1, 0.8, 0.3, 1.2],
+    }, index=["rank-main", "worker-a", "worker-b", "worker-c"])
+    engine = FactEngine([rule])
+
+    # No authoritative completed-window provenance means fail closed.
+    assert engine.evaluate({("proc_name",): rows}, raw_stats={}) == {}
+
+    facts = engine.evaluate(
+        {("proc_name",): rows}, raw_stats={"run_id": "native-worker"},
+        context={
+            "native_window": 17,
+            "worker_pids": [22, 23, 24],
+            "row_pid_by_index": {"rank-main": 11, "worker-a": 22,
+                                 "worker-b": 23, "worker-c": 24},
+            "window_metrics": {
+                "domain_coherent": 1.0, "domain_procs_active": 1.0,
+                "window_wall_time_proc_crit": 2.0,
+                "domain_input_time_proc_crit": 1.0,
+                "domain_decode_time_proc_crit": 0.0,
+                "domain_comm_time_proc_crit": 0.0,
+                "domain_compute_time_proc_crit": 1.0,
+                "residual_time_proc_crit": 0.0,
+                "epoch_nunique": 1.0, "step_nunique": 2.0,
+                "step_min": 1.0, "step_max": 2.0,
+            },
+        },
+    )
+    fact = facts[("proc_name",)][0]
+    assert fact.window.view_type == "proc_name"
+    assert fact.window.window == 17
+    assert fact.scope.entity == "reader_posix_read.worker_pool"
+    # worker-b is the minimum valid worker slope; rank-main is excluded.
+    assert fact.evidence["metrics"]["reader_posix_read_ops_slope"] == pytest.approx(0.3)
+    assert fact.evidence["metrics"]["selected_worker_pid"] == 23
+
+    zero_rows = rows.copy()
+    zero_rows.loc[["worker-a", "worker-b", "worker-c"], "reader_posix_read_ops_slope"] = 0.0
+    assert engine.evaluate(
+        {("proc_name",): zero_rows}, raw_stats={},
+        context={
+            "native_window": 18, "worker_pids": [22, 23, 24],
+            "row_pid_by_index": {"rank-main": 11, "worker-a": 22,
+                                 "worker-b": 23, "worker-c": 24},
+            "window_metrics": {
+                "domain_coherent": 1.0, "domain_procs_active": 1.0,
+                "window_wall_time_proc_crit": 2.0, "domain_input_time_proc_crit": 1.0,
+                "domain_decode_time_proc_crit": 0.0, "domain_comm_time_proc_crit": 0.0,
+                "domain_compute_time_proc_crit": 1.0, "residual_time_proc_crit": 0.0,
+                "epoch_nunique": 1.0, "step_nunique": 2.0,
+                "step_min": 1.0, "step_max": 2.0,
+            },
+        },
+    ) == {}
+    assert fact.severity.score == pytest.approx(0.7)
+
+
+def test_worker_rule_native_window_selector_comes_from_context_not_proc_row():
+    rule = build_fact_rule({
+        "id": "native.window.fixture", "priority": 1, "source_view": "proc_name",
+        "emit_mode": "window", "worker_only": True,
+        "window_reducer": "min", "window_reducer_metric": "reader_posix_read_ops_slope",
+        "fact_type": "fixture", "required_metrics": [
+            "__liveflow_window_index", "domain_coherent", "reader_posix_read_ops_slope",
+        ],
+        "when": "__liveflow_window_index == 17.0 and domain_coherent == 1.0 and reader_posix_read_ops_slope > 0.0",
+        "severity_score": "0.5",
+    })
+    # The row tries to claim window 999.  The emitted fact must instead carry
+    # the completed analyzer window supplied by context.
+    rows = pd.DataFrame({
+        "__liveflow_window_index": [999.0],
+        "reader_posix_read_ops_slope": [0.5],
+    }, index=["worker"])
+    context = {
+        "native_window": 17, "worker_pids": [22],
+        "row_pid_by_index": {"worker": 22},
+        "window_metrics": {
+            "domain_coherent": 1.0, "domain_procs_active": 1.0,
+            "window_wall_time_proc_crit": 2.0, "domain_input_time_proc_crit": 1.0,
+            "domain_decode_time_proc_crit": 0.0, "domain_comm_time_proc_crit": 0.0,
+            "domain_compute_time_proc_crit": 1.0, "residual_time_proc_crit": 0.0,
+            "epoch_nunique": 1.0, "step_nunique": 1.0,
+            "step_min": 1.0, "step_max": 1.0,
+        },
+    }
+    facts = FactEngine([rule]).evaluate({("proc_name",): rows}, raw_stats={}, context=context)
+    assert facts[("proc_name",)][0].window.window == 17
+
+
+@pytest.mark.parametrize("invalid_control", [
+    {"epoch_nunique": 2.0},
+    {"step_nunique": 0.0},
+    {"step_min": 3.0, "step_max": 2.0},
+])
+def test_proc_name_worker_slope_fails_closed_for_invalid_control_window(invalid_control):
+    rule = build_fact_rule({
+        "id": "wisio.worker.control-gate", "priority": 1,
+        "source_view": "proc_name", "emit_mode": "window", "worker_only": True,
+        "window_reducer": "min", "window_reducer_metric": "read_ops_slope",
+        "fact_type": "operation_family_time_disproportion",
+        "required_metrics": ["domain_coherent", "read_ops_slope"],
+        "when": "domain_coherent == 1.0 and read_ops_slope > 0.0",
+        "severity_score": "clip01(1.0 - read_ops_slope)",
+    })
+    control = {
+        "domain_coherent": 1.0, "domain_procs_active": 1.0,
+        "window_wall_time_proc_crit": 1.0,
+        "domain_input_time_proc_crit": 1.0,
+        "domain_decode_time_proc_crit": 0.0, "domain_comm_time_proc_crit": 0.0,
+        "domain_compute_time_proc_crit": 0.0, "residual_time_proc_crit": -0.5,
+        "epoch_nunique": 1.0, "step_nunique": 1.0,
+        "step_min": 2.0, "step_max": 2.0,
+    }
+    control.update(invalid_control)
+    facts = FactEngine([rule]).evaluate(
+        {("proc_name",): pd.DataFrame({"read_ops_slope": [0.2, 0.1]}, index=["rank", "worker"])},
+        raw_stats={},
+        context={"native_window": 8, "worker_pids": [22],
+                 "row_pid_by_index": {"rank": 11, "worker": 22},
+                 "window_metrics": control},
+    )
+    assert facts == {}
+
+
+def test_parked_dlio_worker_rule_merges_only_completed_window_control_vector():
+    """The unselected DLIO rule is executable without duplicating control data in proc_name."""
+    rule_file = (
+        Path(__file__).resolve().parents[1]
+        / "python/dftracer/analyzer/configs/fact_rules/dlio-wisio-worker-slope.yaml"
+    )
+    engine = FactEngine.from_rule_file(
+        str(rule_file), strict_time_semantics=True,
+        allow_mixed_time_aggregates=False,
+    )
+    facts = engine.evaluate(
+        {("proc_name",): pd.DataFrame({
+            "reader_posix_read_ops_slope": [0.2, 0.7, 1.1],
+        }, index=["rank", "worker-slow", "worker-fast"])},
+        raw_stats={"run_id": "parked-rule-unit"},
+        context={
+            "native_window": 12,
+            "worker_pids": [22, 23],
+            "row_pid_by_index": {"rank": 11, "worker-slow": 22, "worker-fast": 23},
+            "window_metrics": {
+                "domain_coherent": 1.0, "domain_procs_active": 1.0,
+                "window_wall_time_proc_crit": 2.0,
+                "domain_input_time_proc_crit": 1.0,
+                "domain_decode_time_proc_crit": 0.0,
+                "domain_comm_time_proc_crit": 0.0,
+                "domain_compute_time_proc_crit": 1.0,
+                "residual_time_proc_crit": -0.5,
+                "epoch_nunique": 1.0, "step_nunique": 2.0,
+                "step_min": 4.0, "step_max": 5.0,
+            },
+        },
+    )
+    fact = facts[("proc_name",)][0]
+    assert fact.window.window == 12
+    assert fact.evidence["metrics"]["reader_posix_read_ops_slope"] == pytest.approx(0.7)
+    assert fact.evidence["metrics"]["selected_worker_pid"] == 22
+    assert fact.evidence["metrics"]["epoch_nunique"] == pytest.approx(1.0)
+
+
+def test_parked_p3_rank_thread_rule_uses_exact_name_pid_and_minimum_deficit():
+    """P3 threads belong to rank processes; they are not DataLoader workers."""
+    rule_file = (
+        Path(__file__).resolve().parents[1]
+        / "python/dftracer/analyzer/configs/fact_rules/p3-tf-rank-thread-slope.yaml"
+    )
+    engine = FactEngine.from_rule_file(
+        str(rule_file), strict_time_semantics=True,
+        allow_mixed_time_aggregates=False,
+    )
+    rows = pd.DataFrame({
+        "reader_posix_read_count_frac_total": [0.4, 0.1, 0.3, 0.0, 0.2],
+        "reader_posix_read_time_proc_frac_total": [0.5, 0.5, 0.3, 0.2, 0.1],
+        "reader_posix_read_ops_slope": [0.8, 0.2, 0.1, 0.0, 2.0],
+    }, index=[
+        "app#node-a#101#1001",     # eligible, but not the minimum
+        "app#node-a#101#1002",     # selected
+        "app#node-b#101#1003",     # wrong K host
+        "app#node-a#101#1004",     # zero normalized count share
+        "app#node-a#101#1005",     # non-deficit
+    ])
+    control = {
+        "domain_coherent": 1.0, "domain_procs_active": 1.0,
+        "window_wall_time_proc_crit": 3.0,
+        "domain_input_time_proc_crit": 1.0,
+        "domain_decode_time_proc_crit": 0.0,
+        "domain_comm_time_proc_crit": 0.0,
+        "domain_compute_time_proc_crit": 2.0,
+        "residual_time_proc_crit": 0.0,
+        "epoch_nunique": 1.0, "step_nunique": 2.0,
+        "step_min": 4.0, "step_max": 5.0,
+    }
+    context = {
+        "native_window": 41, "native_host": "node-a", "rank_pids": [101],
+        "row_pid_by_index": {
+            "app#node-a#101#1001": 101,
+            "app#node-a#101#1002": 101,
+            "app#node-b#101#1003": 101,
+            "app#node-a#101#1004": 101,
+            "app#node-a#101#1005": 101,
+        },
+        "window_metrics": control,
+    }
+    facts = engine.evaluate({("proc_name",): rows}, raw_stats={}, context=context)
+    fact = facts[("proc_name",)][0]
+    metrics = fact.evidence["metrics"]
+    assert fact.window.window == 41
+    assert fact.window.view_type == "proc_name"
+    assert metrics["selected_proc_name"] == "app#node-a#101#1002"
+    assert metrics["selected_rank_pid"] == 101
+    assert metrics["selected_thread_id"] == 1002
+    assert metrics["selected_mapped_pid"] == 101
+    assert metrics["reader_posix_read_ops_slope"] == pytest.approx(0.2)
+    assert metrics["reader_posix_read_count_frac_total"] == pytest.approx(0.1)
+    assert metrics["reader_posix_read_time_proc_frac_total"] == pytest.approx(0.5)
+    assert fact.severity.score == pytest.approx(0.8)
+
+    # Malformed, non-integer, mismapped, non-rank, zero/NaN, and >=1 candidates
+    # all suppress instead of being converted into an issue.
+    invalid = pd.DataFrame({
+        "reader_posix_read_count_frac_total": [0.2] * 6,
+        "reader_posix_read_time_proc_frac_total": [0.2] * 6,
+        "reader_posix_read_ops_slope": [0.2, 0.2, 0.2, 0.0, float("nan"), 1.2],
+    }, index=[
+        "wrong#node-a#101#1", "app#node-a#notpid#1",
+        "app#node-a#101#3", "app#node-a#101#4",
+        "app#node-a#101#5", "app#node-a#101#6",
+    ])
+    invalid_context = dict(context)
+    invalid_context["row_pid_by_index"] = {
+        "app#node-a#101#3": 999, "app#node-a#101#4": 101,
+        "app#node-a#101#5": 101, "app#node-a#101#6": 101,
+    }
+    assert engine.evaluate({("proc_name",): invalid}, raw_stats={}, context=invalid_context) == {}
+
+    for invalid_control in (
+        {"epoch_nunique": 2.0},
+        {"step_nunique": 0.0},
+        {"step_min": 6.0, "step_max": 5.0},
+    ):
+        incomplete_context = dict(context)
+        incomplete_context["window_metrics"] = dict(control, **invalid_control)
+        assert engine.evaluate({("proc_name",): rows}, raw_stats={}, context=incomplete_context) == {}
+    missing_control = dict(context)
+    missing_control["window_metrics"] = {
+        key: value for key, value in control.items() if key != "step_max"
+    }
+    assert engine.evaluate({("proc_name",): rows}, raw_stats={}, context=missing_control) == {}
+
+
+def test_rank_thread_selector_rejects_worker_selector_combination():
+    with pytest.raises(FactRuleValidationError, match="worker_only and rank_thread_only"):
+        build_fact_rule({
+            "id": "invalid.selector.combination", "priority": 1,
+            "source_view": "proc_name", "fact_type": "invalid",
+            "worker_only": True, "rank_thread_only": True,
+        })
 
 
 def test_fact_engine_skips_rule_with_unresolved_identifier():

@@ -66,6 +66,10 @@ def test_synthetic_window_event_publishes_remaining_horizon_to_fact_metrics():
 def test_incomplete_or_disagreeing_horizon_is_not_invented():
     assert window_horizon_metrics([_boundary(epochs_total=None)]) == {}
     assert window_horizon_metrics([_boundary(), _boundary(epoch_index=3)]) == {}
+    # A native control index outside its own declared cadence cannot mean
+    # "the run is genuinely over".  It is an invalid source contract and must
+    # not become a misleading zero horizon that authorizes a fake decline.
+    assert window_horizon_metrics([_boundary(window_index=21)]) == {}
 
 
 def test_native_window_identity_preserves_workload_epoch_and_step():

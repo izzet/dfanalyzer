@@ -514,6 +514,9 @@ class ZMQOutput:
             flat_view = result.flat_views[view_key]
             metadata = dict(
                 artifact_type="flat_view",
+                # This is the analyzer-owned native control-window identity.
+                # Consumers must not reconstruct it from event arrival order.
+                window_index=result.window_index,
                 layers=result.layers,
                 raw_stats=_raw_stats_to_dict(result.raw_stats),
                 view_len=len(flat_view),
@@ -588,6 +591,9 @@ class MofkaOutput:
             flat_view = result.flat_views[view_key]
             metadata = dict(
                 artifact_type="flat_view",
+                # Preserve the analyzer-owned native control-window identity
+                # through the SHM transport as well as the ZMQ transport.
+                window_index=result.window_index,
                 layers=result.layers,
                 raw_stats=_raw_stats_to_dict(result.raw_stats),
                 view_len=len(flat_view),
@@ -603,6 +609,21 @@ class MofkaOutput:
 
         if self._global_producer and result._pre_layer_hlm is not None:
             self._publish_hlm(result)
+
+    def finish_stream(self):
+        """Publish the ordered terminal marker after a successful streaming analysis.
+
+        ``handle_result`` flushes each completed window, but a streaming consumer cannot infer
+        that no later window will arrive from that flush.  The established consumer contract uses
+        ``{"name": "end"}`` as its terminal marker.  Keeping it on the output object makes the
+        marker follow every fact and flat view on the same producer/FIFO rather than having the
+        node agent create a competing producer.
+
+        Call this only after ``analyze_mofka`` has returned normally.  In particular, an analyzer
+        exception must not turn a partial stream into an apparently complete one.
+        """
+        self._producer.push(metadata={"name": "end"}, data=b"")
+        self._producer.flush()
 
     def _publish_hlm(self, result: AnalysisResult):
         import socket as _socket
@@ -656,6 +677,9 @@ class MofkaOutput:
         import socket as _socket
 
         envelope: FactEnvelope = result.to_fact_envelope()
+        # Record the exact post-horizon payload handed to the transport.  The
+        # analyzer's earlier debug fact snapshot precedes horizon attachment.
+        payload_json = envelope.to_json()
         metadata = dict(
             artifact_type="analysis_facts",
             schema_version=envelope.schema_version,
@@ -666,5 +690,10 @@ class MofkaOutput:
         )
         self._producer.push(
             metadata=metadata,
-            data=envelope.to_json().encode("utf-8"),
+            data=payload_json.encode("utf-8"),
+        )
+        logger.info(
+            "analysis_facts.payload_published",
+            window_index=result.window_index,
+            payload=payload_json,
         )
