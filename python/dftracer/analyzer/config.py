@@ -281,7 +281,8 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
             # A per-operation FAMILY for the canonical WiSIO slope only: DLIO has no separately
             # measurable decode EXPOSURE (see set_window_decomposition_metrics), so this layer does
             # not feed the coherent domain vector while stall_storage is present.
-            'reader_decode': 'cat == "data" & func_name == "decode"',
+            # TF emits the region as `data.decode` (dft_ai.data.derive); the two-stage readers emit `decode`.
+            'reader_decode': 'cat == "data" & func_name.isin(["decode", "data.decode"])',
             'compute': 'cat == "compute" & func_name == "compute"',   # PARENT only:
             # `cat == "compute"` sums EVERY level of the hierarchy, so the moment a child
             # region (compute.forward/backward) is added it silently double counts. Selecting
