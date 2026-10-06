@@ -9,6 +9,7 @@ import structlog
 from typing import Any, Dict, List, Mapping, Optional
 from omegaconf import OmegaConf
 
+from .liveflow_v1 import STEP_EVIDENCE_FIELDS
 from .fact_rules import FactRule, FactRuleValidationError, build_fact_rule
 from .types import AnalysisFact, FactProvenance, FactScope, FactSeverity, FactWindow, ViewKey
 
@@ -425,7 +426,7 @@ class FactEngine:
                             "completed_steps", "configured_window_steps", "planner_history_ready",
                             "lf_v1_per_step", "reader_posix_read_ops_slope",
                             "reader_decode_ops_slope", "comm_ops_slope",
-                            "step_wall_p90_us", *LF_V1_JOB_METRICS)
+                            "step_wall_p90_us", *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS)
                 # Applied-vector snapshot: `physical_<knob>` for each knob the workload declared.
                 optional += tuple(c for c in rule_df.columns
                                   if isinstance(c, str) and c.startswith("physical_"))
@@ -701,7 +702,7 @@ class FactEngine:
                                  "completed_steps", "configured_window_steps", "planner_history_ready",
                                  "lf_v1_per_step", "reader_posix_read_ops_slope",
                                  "reader_decode_ops_slope", "comm_ops_slope", "step_wall_p90_us",
-                                 *LF_V1_JOB_METRICS,
+                                 *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS,
                                  *[c for c in row.index if isinstance(c, str) and c.startswith("physical_")]):
                         if name in row.index and name not in evidence_metrics:
                             value = _to_scalar(row.get(name))

@@ -245,6 +245,9 @@ def _lane_occupancy() -> Optional[dict]:
         return None
 
 
+from .liveflow_v1 import STEP_EVIDENCE_COUNTERS, STEP_EVIDENCE_FIELDS, window_step_evidence  # noqa: E402
+
+
 def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = None) -> Dict[str, int]:
     """Return the declared and remaining horizon for one completed window.
 
@@ -304,6 +307,7 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
             except (KeyError, TypeError, ValueError):
                 continue
         tail = {"step_wall_p90_us": max(tails)} if tails else {}
+        tail.update(window_step_evidence(candidates))
         return dict(first_steps, **history, **physical, **tail, remaining_steps=remaining,
                     windows_remaining=remaining / first_steps["configured_window_steps"])
 
@@ -1248,7 +1252,7 @@ class Analyzer(abc.ABC):
             if isinstance(normalized_event, dict) and isinstance(args, dict):
                 for field in (*HORIZON_SOURCE_FIELDS, "configured_total_steps",
                               "completed_steps", "configured_window_steps", "planner_history_ready",
-                              "step_wall_p90_us"):
+                              "step_wall_p90_us", *STEP_EVIDENCE_FIELDS):
                     if field in args:
                         normalized_event[field] = args[field]
                 for field in args:

@@ -6,6 +6,7 @@ for instrumented zero durations is inherited from the sealed halo3d rule.
 """
 import math
 import os
+from typing import Dict, List
 
 import pandas as pd
 import structlog
@@ -223,3 +224,46 @@ def prepare_views(flat_views, declared):
         for key, value in values.items():
             frame.loc[index, key] = value
     return {**flat_views, ('window',): frame}
+
+
+# Per-step evidence of one window (liveflow-v1): the string series the application's Window put on its
+# window.stop (dfoptimizer/step_series.py) and the node's memory-pressure counters at the window close.
+STEP_EVIDENCE_COUNTERS = ("vm_allocstall", "vm_pgscan_direct", "vm_compact_stall", "mem_anon_kb")
+STEP_EVIDENCE_FIELDS = ("step_series", *STEP_EVIDENCE_COUNTERS, "mem_avail_kb")
+
+
+def _series_wall_total(text) -> float:
+    """Sum of the `wall=` series of a v1 step_series string (10 microsecond units); -1 if unparseable."""
+    try:
+        for part in str(text).split(";"):
+            if part.startswith("wall="):
+                return float(sum(int(v) for v in part[5:].split(",")))
+    except ValueError:
+        pass
+    return -1.0
+
+
+def window_step_evidence(candidates: List[dict]) -> Dict[str, object]:
+    """Per-step series and node counters for the window, from the window.stop records of its ranks.
+
+    The series is the CRITICAL rank's (the one with the largest total step wall in the window), so the
+    wall and the per-family exposures it carries are one coherent vector. Node counters are node-wide
+    and identical across the node's ranks up to read skew: the largest is taken (cumulative counters and
+    anonymous memory), the smallest for available memory (the conservative one).
+    """
+    out: Dict[str, object] = {}
+    series = [(_series_wall_total(c["step_series"]), c["step_series"]) for c in candidates
+              if isinstance(c.get("step_series"), str)]
+    series = [t for t in series if t[0] >= 0.0]
+    if series:
+        out["step_series"] = max(series, key=lambda t: t[0])[1]
+    for name in STEP_EVIDENCE_COUNTERS + ("mem_avail_kb",):
+        vals = []
+        for c in candidates:
+            try:
+                vals.append(int(c[name]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if vals:
+            out[name] = min(vals) if name == "mem_avail_kb" else max(vals)
+    return out
