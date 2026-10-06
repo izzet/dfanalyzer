@@ -73,6 +73,12 @@ LOOP_EXPOSURE_WINDOW_METRICS = (
     "domain_comm_total_median_time_v3", "domain_comm_total_step_nunique",
 )
 
+# LiveFlow-v1 job-level layer provenance (liveflow_v1.JOB_VALUE_KEYS): per-step seconds, forwarded when present.
+LF_V1_JOB_METRICS = (
+    "lf_v1_job_available", "lf_v1_job_level", "lf_v1_job_critical_input", "lf_v1_job_own_input",
+    "lf_v1_job_peer_skew", "lf_v1_job_comm_wait_before", "lf_v1_job_attributed",
+)
+
 COMPLETED_WINDOW_PROVENANCE_METRICS = (
     "stall_storage_rank_coverage", "stall_storage_rank_expected_count",
     "stall_storage_rank_observed_count", "stall_storage_raw_event_count",
@@ -419,7 +425,7 @@ class FactEngine:
                             "completed_steps", "configured_window_steps", "planner_history_ready",
                             "lf_v1_per_step", "reader_posix_read_ops_slope",
                             "reader_decode_ops_slope", "comm_ops_slope",
-                            "step_wall_p90_us")
+                            "step_wall_p90_us", *LF_V1_JOB_METRICS)
                 # Applied-vector snapshot: `physical_<knob>` for each knob the workload declared.
                 optional += tuple(c for c in rule_df.columns
                                   if isinstance(c, str) and c.startswith("physical_"))
@@ -695,6 +701,7 @@ class FactEngine:
                                  "completed_steps", "configured_window_steps", "planner_history_ready",
                                  "lf_v1_per_step", "reader_posix_read_ops_slope",
                                  "reader_decode_ops_slope", "comm_ops_slope", "step_wall_p90_us",
+                                 *LF_V1_JOB_METRICS,
                                  *[c for c in row.index if isinstance(c, str) and c.startswith("physical_")]):
                         if name in row.index and name not in evidence_metrics:
                             value = _to_scalar(row.get(name))

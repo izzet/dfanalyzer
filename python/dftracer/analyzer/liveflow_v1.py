@@ -33,7 +33,11 @@ def declaration(workload=None, tf_decode=None):
     app_only = workload == 'sfno' and os.environ.get('LIVEFLOW_SFNO_APP_ONLY', '0') == '1'
     if workload in ('sfno', 'stormer') and not app_only:
         families.append('delivery')
-    return dict(workload=workload, input_families=families, comm=True,
+    # JOB-LEVEL LAYER (LIVEFLOW_JOB_LEVEL=1, DLIO job input sync): barrier wait that a peer's input stall explains
+    # is attributed to the input families.  Off in the per-node ablation, which still receives the same job
+    # columns (provenance) but never moves time between families.
+    job_level = os.environ.get('LIVEFLOW_JOB_LEVEL', '0') == '1'
+    return dict(workload=workload, input_families=families, comm=True, job_level=job_level,
                 split_wait=len(families) == 2,
                 wait_per_step=workload in ('halo3d', 'stormer'),
                 compute_includes_comm=workload != 'halo3d')
@@ -61,6 +65,51 @@ def _measured(row, family):
     if value is None and count is not None and count > 0:
         return 0.0
     return value
+
+
+# Window-level job columns (metrics.attach_input_job_step_max_sum_metrics): totals in seconds.
+JOB_CRITICAL = 'domain_input_job_step_max_sum_time'
+JOB_OWN = 'domain_input_job_own_mean_time'
+JOB_VALUE_KEYS = ('lf_v1_job_available', 'lf_v1_job_level', 'lf_v1_job_critical_input', 'lf_v1_job_own_input',
+                  'lf_v1_job_peer_skew', 'lf_v1_job_comm_wait_before', 'lf_v1_job_attributed')
+
+
+def job_attribution(critical, own, comm, shares):
+    """Peer-skew attribution of barrier wait to the input families (all window totals, seconds).
+
+        S = max(critical_input - own_input, 0)   input wait a typical rank paid because a PEER stalled
+        W = comm                                 barrier/comm wait this node measured
+        A = min(S, W)                            the part of W that peer input explains
+
+    No constant: S and W are differences/values of measurements from the same window and A is their
+    minimum, so the attribution never exceeds either measurement (a wait that is larger than the skew
+    keeps its remainder as comm; a skew larger than the wait cannot create wait that was not paid).
+    Returns None when the measurement is unavailable or the family split is unknown: the window is then
+    left exactly as the per-node view reads it (suppressed, never invented).
+    """
+    if critical is None or own is None or comm is None or not shares:
+        return None
+    skew = max(critical - own, 0.0)
+    attributed = min(skew, max(comm, 0.0))
+    return dict(skew=skew, attributed=attributed, split={f: attributed * x for f, x in shares.items()})
+
+
+def _service_shares(row, families, waits):
+    """Split of an attributed input wait across the declared families: the existing service-share rule.
+
+    One family takes all of it.  With two, service time of each family's layer (the same quantity that
+    apportions the undivided fetch wait); if that is absent the window's own measured waits.  Unknown
+    split -> None (no attribution).
+    """
+    if len(families) == 1:
+        return {families[0]: 1.0}
+    service = [_measured(row, _SERVICE_LAYER[f]) for f in families]
+    if all(v is not None for v in service) and sum(service) > 0:
+        return {f: v / sum(service) for f, v in zip(families, service)}
+    total = sum(waits.get(f, 0.0) for f in families)
+    if total > 0:
+        return {f: waits.get(f, 0.0) / total for f in families}
+    return None
 
 
 def prepare_views(flat_views, declared):
@@ -113,12 +162,33 @@ def prepare_views(flat_views, declared):
                     source = 0.0
         valid = (all(f in waits for f in families) and comm is not None and compute is not None
                  and n is not None and n >= 1)
+        job = {k: 0.0 for k in JOB_VALUE_KEYS}
+        job['lf_v1_job_level'] = float(bool(declared.get('job_level')))
+        if valid:
+            critical, own = _finite(row, JOB_CRITICAL), _finite(row, JOB_OWN)
+            if critical is not None and own is not None:
+                job.update(lf_v1_job_available=1.0, lf_v1_job_critical_input=critical,
+                           lf_v1_job_own_input=own, lf_v1_job_peer_skew=max(critical - own, 0.0),
+                           lf_v1_job_comm_wait_before=comm)
+                if declared.get('job_level'):
+                    got = job_attribution(critical, own, comm, _service_shares(row, families, waits))
+                    if got is not None:
+                        for family, moved in got['split'].items():
+                            waits[family] = waits.get(family, 0.0) + moved
+                        comm -= got['attributed']
+                        job['lf_v1_job_attributed'] = got['attributed']
         if valid:
             storage, decode = waits.get('storage', 0.0), waits.get('decode', 0.0)
             delivery = waits.get('delivery', 0.0)
-            compute = max(compute - comm, 0.0) if declared['compute_includes_comm'] else compute
+            # compute excludes the comm the node MEASURED; moving a peer-explained part of that wait to input
+            # does not make it compute.
+            compute = (max(compute - job['lf_v1_job_comm_wait_before'] if job['lf_v1_job_available'] else compute - comm, 0.0)
+                       if declared['compute_includes_comm'] else compute)
             storage, decode, delivery, comm, compute = (
                 value / n for value in (storage, decode, delivery, comm, compute))
+            for key in ('lf_v1_job_critical_input', 'lf_v1_job_own_input', 'lf_v1_job_peer_skew',
+                        'lf_v1_job_comm_wait_before', 'lf_v1_job_attributed'):
+                job[key] = job[key] / n
             total = storage + decode + delivery + comm + compute
             exposed = storage + decode + delivery
             values.update(lf_v1_valid=1.0, lf_v1_storage_wait=storage, lf_v1_decode_wait=decode,
@@ -133,6 +203,7 @@ def prepare_views(flat_views, declared):
         else:
             logger.info('facts.liveflow_v1.missing_declared_metrics', window=str(index),
                         workload=declared['workload'], input_families=families)
+        values.update(job)
         # Detector 1 is reduced within ONE proc_name operation family. No
         # comparison or division between raw slopes from different families.
         for prefix in ('reader_posix_read', 'reader_decode', 'delivery', 'comm'):

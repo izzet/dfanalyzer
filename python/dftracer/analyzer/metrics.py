@@ -348,6 +348,10 @@ def attach_input_step_max_sum_metrics(
 
 
 INPUT_EXPOSURE_JOB_SELECTOR = 'cat == "input_exposure_job" & func_name == "input_step_max_sum_job"'
+# The job MEAN of every rank's own window fetch wait (DLIO job-level layer, dlio_benchmark
+# utils/job_input.py).  critical (above) minus this mean is the peer-skew input a typical rank paid at
+# the barrier.  Same family, same per-rank redundancy, same reduction (max over the identical values).
+INPUT_OWN_JOB_SELECTOR = 'cat == "input_exposure_job" & func_name == "input_own_mean_job"'
 
 
 def attach_input_job_step_max_sum_metrics(
@@ -380,7 +384,8 @@ def attach_input_job_step_max_sum_metrics(
     view = flat_views.get(("window",))
     if view is None:
         return flat_views
-    names = ("domain_input_job_step_max_sum_time", "domain_input_job_step_count")
+    names = ("domain_input_job_step_max_sum_time", "domain_input_job_step_count",
+             "domain_input_job_own_mean_time")
     result = view.copy()
     for name in names:
         result[name] = pd.NA
@@ -393,6 +398,15 @@ def attach_input_job_step_max_sum_metrics(
     except Exception:
         flat_views[("window",)] = result
         return flat_views
+    try:
+        own_mask = traces.eval(INPUT_OWN_JOB_SELECTOR)
+        own_rows = traces.loc[own_mask & traces["window"].notna(), ["window", "time"]].copy()
+        if not own_rows.empty:
+            own_rows["time"] = pd.to_numeric(own_rows["time"], errors="coerce")
+            own_stats = own_rows.dropna(subset=["window"]).groupby("window")["time"].max()
+            result["domain_input_job_own_mean_time"] = result.index.to_series().map(own_stats)
+    except Exception:
+        pass
     rows = traces.loc[family_mask & traces["window"].notna(), ["window", "time"]].copy()
     step_count_col = None
     if "step_count" in traces.columns:
