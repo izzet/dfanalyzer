@@ -48,6 +48,10 @@ def declaration(workload=None, tf_decode=None):
 _SERVICE_LAYER = {'storage': 'reader_posix_read', 'decode': 'reader_decode', 'delivery': 'delivery'}
 
 
+# Layers that carry a family's service per workload preset (halo3d's storage layer is `reader_posix`, DLIO's `reader_posix_read`).
+_SERVICE_LAYERS = {'storage': ('reader_posix_read', 'reader_posix'), 'decode': ('reader_decode',), 'delivery': ('delivery',)}
+
+
 def _finite(row, name):
     try:
         value = float(row[name])
@@ -236,7 +240,11 @@ def prepare_views(flat_views, declared, context=None):
             fcount = _finite(row, 'fetch_iter_count_sum')
             n_ranks = len(rank_pids) or (int(round(fcount / n)) if fcount and n else None)
             for family in families:
-                got = _stage_service(row, peers_for_svc, _SERVICE_LAYER[family], n, n_ranks, rank_pids)
+                got = None
+                for layer in _SERVICE_LAYERS[family]:      # first layer this workload's preset measures
+                    got = _stage_service(row, peers_for_svc, layer, n, n_ranks, rank_pids)
+                    if got is not None:
+                        break
                 if got is not None:
                     svc['lf_v1_svc_' + family], svc['lf_v1_svc_' + family + '_critical'] = got
         if valid:
