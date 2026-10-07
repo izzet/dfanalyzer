@@ -80,6 +80,10 @@ LF_V1_JOB_METRICS = (
     "lf_v1_job_peer_skew", "lf_v1_job_comm_wait_before", "lf_v1_job_attributed",
 )
 
+# Per-stage service of the critical rank, seconds per step (liveflow_v1.SERVICE_VALUE_KEYS): the Little's-law sizing input.
+LF_V1_SERVICE_METRICS = tuple(k for f in ("storage", "decode", "delivery")
+                              for k in ("lf_v1_svc_" + f, "lf_v1_svc_" + f + "_critical"))
+
 COMPLETED_WINDOW_PROVENANCE_METRICS = (
     "stall_storage_rank_coverage", "stall_storage_rank_expected_count",
     "stall_storage_rank_observed_count", "stall_storage_raw_event_count",
@@ -376,7 +380,7 @@ class FactEngine:
         )
         if hasattr(self, "liveflow_declaration"):
             from .liveflow_v1 import prepare_views
-            flat_views = prepare_views(flat_views, self.liveflow_declaration)
+            flat_views = prepare_views(flat_views, self.liveflow_declaration, context)
         if not self.rules:
             return {}
 
@@ -426,7 +430,7 @@ class FactEngine:
                             "completed_steps", "configured_window_steps", "planner_history_ready",
                             "lf_v1_per_step", "reader_posix_read_ops_slope",
                             "reader_decode_ops_slope", "comm_ops_slope",
-                            "step_wall_p90_us", *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS)
+                            "step_wall_p90_us", *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS, *LF_V1_SERVICE_METRICS)
                 # Applied-vector snapshot: `physical_<knob>` for each knob the workload declared.
                 optional += tuple(c for c in rule_df.columns
                                   if isinstance(c, str) and c.startswith("physical_"))
@@ -702,7 +706,7 @@ class FactEngine:
                                  "completed_steps", "configured_window_steps", "planner_history_ready",
                                  "lf_v1_per_step", "reader_posix_read_ops_slope",
                                  "reader_decode_ops_slope", "comm_ops_slope", "step_wall_p90_us",
-                                 *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS,
+                                 *STEP_EVIDENCE_FIELDS, *LF_V1_JOB_METRICS, *LF_V1_SERVICE_METRICS,
                                  *[c for c in row.index if isinstance(c, str) and c.startswith("physical_")]):
                         if name in row.index and name not in evidence_metrics:
                             value = _to_scalar(row.get(name))

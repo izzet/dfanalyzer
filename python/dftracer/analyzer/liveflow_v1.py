@@ -113,7 +113,53 @@ def _service_shares(row, families, waits):
     return None
 
 
-def prepare_views(flat_views, declared):
+# Per-stage SERVICE used by the Little's-law sizing (dfoptimizer/planner/sizing.py): the busy seconds one rank's stage spends per
+# training step (sum of the layer's operation durations over all threads of the rank, divided by the window's steps).  Per-step
+# columns, forwarded to the planner like the job-level provenance.  `_critical` is 1.0 when the value is the maximum over the
+# node's rank processes (rank membership from the window's rank pids), 0.0 when it is the node total divided by the rank count
+# (forked worker processes cannot be mapped to a rank from their names).
+SERVICE_VALUE_KEYS = tuple(k for f in ('storage', 'decode', 'delivery')
+                           for k in ('lf_v1_svc_' + f, 'lf_v1_svc_' + f + '_critical'))
+
+
+def _proc_pid(name):
+    parts = str(name).split('#')
+    if len(parts) >= 3 and parts[0] == 'app':
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+    return None
+
+
+def _stage_service(row, proc_rows, layer, n, n_ranks, rank_pids):
+    """(busy seconds per step of the critical rank's stage, critical flag) or None when the layer was not measured."""
+    col = layer + '_time_sum'
+    total = _finite(row, col)
+    count = _finite(row, layer + '_count_sum')
+    if total is None and count is not None and count > 0:
+        total = 0.0          # a measured exact-zero duration (fastpath encodes it as NaN), as in _measured
+    if total is None or n is None or n < 1:
+        return None
+    if proc_rows is not None and rank_pids and col in proc_rows.columns:
+        names = (proc_rows.index.get_level_values('proc_name') if isinstance(proc_rows.index, pd.MultiIndex)
+                 and 'proc_name' in proc_rows.index.names else proc_rows.index)
+        times = pd.to_numeric(proc_rows[col], errors='coerce').fillna(0.0).to_numpy()
+        by_rank, off_rank = {}, 0.0
+        for name, t in zip(names, times):
+            pid = _proc_pid(name)
+            if pid in rank_pids:
+                by_rank[pid] = by_rank.get(pid, 0.0) + float(t)
+            else:
+                off_rank += float(t)
+        if by_rank and off_rank <= 0.0 and max(by_rank.values()) > 0.0:
+            return max(by_rank.values()) / n, 1.0
+    if not n_ranks:
+        return None
+    return total / n_ranks / n, 0.0
+
+
+def prepare_views(flat_views, declared, context=None):
     """Adapt real analyzer views to the shared rule's seconds-per-step interface.
 
     Undeclared families are absent by construction. A missing metric needed for
@@ -178,6 +224,21 @@ def prepare_views(flat_views, declared):
                             waits[family] = waits.get(family, 0.0) + moved
                         comm -= got['attributed']
                         job['lf_v1_job_attributed'] = got['attributed']
+        svc = {k: float('nan') for k in SERVICE_VALUE_KEYS}
+        if valid:
+            peers_for_svc = None
+            if proc is not None:
+                if isinstance(proc.index, pd.MultiIndex) and 'window' in proc.index.names:
+                    peers_for_svc = proc.loc[proc.index.get_level_values('window') == index]
+                elif len(view) == 1:
+                    peers_for_svc = proc
+            rank_pids = {int(p) for p in ((context or {}).get('rank_pids') or ())}
+            fcount = _finite(row, 'fetch_iter_count_sum')
+            n_ranks = len(rank_pids) or (int(round(fcount / n)) if fcount and n else None)
+            for family in families:
+                got = _stage_service(row, peers_for_svc, _SERVICE_LAYER[family], n, n_ranks, rank_pids)
+                if got is not None:
+                    svc['lf_v1_svc_' + family], svc['lf_v1_svc_' + family + '_critical'] = got
         if valid:
             storage, decode = waits.get('storage', 0.0), waits.get('decode', 0.0)
             delivery = waits.get('delivery', 0.0)
@@ -205,6 +266,7 @@ def prepare_views(flat_views, declared):
             logger.info('facts.liveflow_v1.missing_declared_metrics', window=str(index),
                         workload=declared['workload'], input_families=families)
         values.update(job)
+        values.update(svc)
         # Detector 1 is reduced within ONE proc_name operation family. No
         # comparison or division between raw slopes from different families.
         for prefix in ('reader_posix_read', 'reader_decode', 'delivery', 'comm'):
