@@ -88,3 +88,61 @@ def test_background_failure_is_not_silent():
     with pytest.raises(RuntimeError,match='continuous trace drain failed'):
         buffered.close()
     assert not buffered._thread.is_alive()
+
+
+def test_prepares_before_control_without_blocking_ring_reader(monkeypatch):
+    from threading import Event
+    from collections import deque
+    from types import SimpleNamespace
+    pending = deque([SimpleNamespace(metadata={'ordinal': n}) for n in range(5)])
+    entered, release = Event(), Event()
+    class Source:
+        def pull(self): return self
+        def wait(self, timeout_ms): return pending.popleft() if pending else None
+        def snapshot_committed(self):
+            class Snapshot:
+                remaining = 0
+                def close(self): pass
+            return Snapshot()
+    def prepare(record):
+        entered.set()
+        assert release.wait(5)
+        return [(record.metadata['ordinal'], None, None)]
+    buffered = BufferedTraceConsumer(Source(), prepare=prepare)
+    buffered.start()
+    try:
+        assert entered.wait(5)
+        eventually(lambda: not pending)
+        snapshot = buffered.snapshot_committed()
+        assert snapshot.remaining == 5  # parser is blocked, reader is not
+        release.set()
+        records = [snapshot.next() for _ in range(5)]
+        assert [r.normalized() for r in records] == [[(n, None, None)] for n in range(5)]
+        assert all(r._record is None for r in records)  # release raw payload bytes
+    finally:
+        release.set()
+        buffered.close()
+
+
+def test_preparation_failure_reaches_snapshot_and_close():
+    from types import SimpleNamespace
+    from threading import Event
+    done = Event()
+    class Source:
+        available = True
+        def pull(self): return self
+        def wait(self, timeout_ms):
+            if self.available:
+                self.available = False
+                return SimpleNamespace(metadata={})
+    def prepare(record):
+        done.set()
+        raise ValueError('bad preparation')
+    buffered = BufferedTraceConsumer(Source(), prepare=prepare)
+    buffered.start()
+    assert done.wait(5)
+    eventually(lambda: buffered._error is not None)
+    with pytest.raises(RuntimeError, match='continuous trace drain failed'):
+        buffered.pull().wait(1000)
+    with pytest.raises(RuntimeError, match='continuous trace drain failed'):
+        buffered.close()

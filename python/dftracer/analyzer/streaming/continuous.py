@@ -1,13 +1,32 @@
 """Drain SHM trace records independently of control-window analysis.
 
-Only transport records are buffered here. Rank counts, timestamp fences,
-normalization and window membership remain owned by the existing analyzer.
+Transport records may be normalized incrementally by the analyzer's callback.
+Rank counts, timestamp fences, metadata state and window membership remain
+owned by the main analyzer.
 """
 from collections import deque
 from threading import Condition, Event, Thread
 import time
 
 import numpy as np
+
+
+class PreparedTraceRecord:
+    """A raw ring record normalized once by the independent preparation worker."""
+    def __init__(self, record):
+        self.metadata = record.metadata
+        self.lane = getattr(record, 'lane', None)
+        self.seq = getattr(record, 'seq', None)
+        self._record = record
+        self._ready = Event()
+        self._results = None
+        self._error = None
+
+    def normalized(self):
+        self._ready.wait()
+        if self._error is not None:
+            raise RuntimeError('continuous trace preparation failed') from self._error
+        return self._results
 
 
 class _Future:
@@ -49,8 +68,10 @@ class _Snapshot:
 
 class BufferedTraceConsumer:
     """One serialized ring reader feeding the agent's private record buffer."""
-    def __init__(self, source):
+    def __init__(self, source, prepare=None):
         self.source = source
+        self._prepare = prepare
+        self._prepare_queue = deque()
         self._condition = Condition()
         self._buffer = deque()
         self._active_snapshot = None
@@ -71,9 +92,44 @@ class BufferedTraceConsumer:
                 (reader.lane_count,), dtype="<u8", buffer=reader._mm,
                 offset=SEG_HEADER_SIZE + _OFF_TAIL, strides=(LANE_SIZE,))
         self._thread = Thread(target=self._drain, name='liveflow-trace-drain', daemon=True)
+        self._prepare_thread = (Thread(target=self._prepare_records, name='liveflow-trace-prepare', daemon=True)
+                                if prepare is not None else None)
 
     def start(self):
+        if self._prepare_thread is not None:
+            self._prepare_thread.start()
         self._thread.start()
+
+    def _buffer_record(self, record):
+        if self._prepare is not None:
+            record = PreparedTraceRecord(record)
+            self._prepare_queue.append(record)
+        self._buffer.append(record)
+        self._condition.notify_all()
+
+    def _prepare_records(self):
+        # Parsing does not hold the ring-reader/snapshot lock. Ring evacuation
+        # remains independent even when a batch is slow to decode. Preparation
+        # is serialized in record order; only the main analyzer assigns windows,
+        # counts events, resolves metadata and updates analysis state.
+        while True:
+            with self._condition:
+                while not self._prepare_queue and not self._stop.is_set():
+                    self._condition.wait()
+                if self._stop.is_set():
+                    return
+                record = self._prepare_queue.popleft()
+            try:
+                record._results = self._prepare(record._record)
+            except Exception as exc:
+                record._error = exc
+                with self._condition:
+                    self._error = exc
+                    self._condition.notify_all()
+                return
+            finally:
+                record._record = None
+                record._ready.set()
 
     def _check_error(self):
         if self._error is not None:
@@ -90,8 +146,7 @@ class BufferedTraceConsumer:
                             and not np.any(self._ring_heads.copy() > self._ring_tails))
                     record = None if idle else self.source.pull().wait(timeout_ms=0)
                     if record is not None:
-                        self._buffer.append(record)
-                        self._condition.notify_all()
+                        self._buffer_record(record)
                 if record is None:
                     self._stop.wait(0.001)
         except Exception as exc:
@@ -126,7 +181,7 @@ class BufferedTraceConsumer:
             source_snapshot = self.source.snapshot_committed()
             try:
                 while source_snapshot.remaining:
-                    self._buffer.append(source_snapshot.next())
+                    self._buffer_record(source_snapshot.next())
             finally:
                 source_snapshot.close()
             snapshot = _Snapshot(self, self._buffer)
@@ -141,4 +196,6 @@ class BufferedTraceConsumer:
             self._condition.notify_all()
         if self._thread.ident is not None:
             self._thread.join()
+        if self._prepare_thread is not None and self._prepare_thread.ident is not None:
+            self._prepare_thread.join()
         self._check_error()

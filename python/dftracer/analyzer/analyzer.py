@@ -1327,10 +1327,6 @@ class Analyzer(abc.ABC):
         )
 
         continuous_trace_consumer = None
-        if os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow":
-            from .streaming.continuous import BufferedTraceConsumer
-            continuous_trace_consumer = BufferedTraceConsumer(trace_consumer)
-            trace_consumer = continuous_trace_consumer
 
         install_shutdown_handler()
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
@@ -1431,6 +1427,8 @@ class Analyzer(abc.ABC):
             Supports both batched format (newline-delimited JSON in DataView)
             and legacy single-event format (JSON in metadata).
             """
+            if isinstance(mofka_event, PreparedTraceRecord):
+                return mofka_event.normalized()
             results = []
             metadata = mofka_event.metadata
 
@@ -1476,6 +1474,11 @@ class Analyzer(abc.ABC):
             if hasattr(mofka_event, "acknowledge"):
                 _ack_event(mofka_event)
             return results
+
+        from .streaming.continuous import BufferedTraceConsumer, PreparedTraceRecord
+        if os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow":
+            continuous_trace_consumer = BufferedTraceConsumer(trace_consumer, prepare=_normalize_trace_event)
+            trace_consumer = continuous_trace_consumer
 
         def _append_trace_event_to_window(
             normalized_event: Optional[dict],
