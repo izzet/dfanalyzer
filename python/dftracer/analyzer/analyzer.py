@@ -60,7 +60,7 @@ class _PendingTraceEvents:
     by the stamp, so the event handed back is the same one the walk would have chosen.
     """
 
-    __slots__ = ("_by_pid", "_len", "_next_seq", "_next_left_seq", "_window_heap", "_window_key")
+    __slots__ = ("_by_pid", "_len", "_next_seq", "_next_left_seq", "_window_heap", "_window_key", "_sweep_ts")
 
     def __init__(self, iterable=()):
         self._by_pid = {}
@@ -69,6 +69,7 @@ class _PendingTraceEvents:
         self._next_left_seq = -1
         self._window_heap = []
         self._window_key = None
+        self._sweep_ts = {}
         for item in iterable:
             self.append(item)
 
@@ -100,12 +101,14 @@ class _PendingTraceEvents:
 
     def append(self, item):
         self._window_key = None
+        self._sweep_ts.pop(self._pid(item), None)
         self._bucket(self._pid(item)).append((self._next_seq, item))
         self._next_seq += 1
         self._len += 1
 
     def appendleft(self, item):
         self._window_key = None
+        self._sweep_ts.pop(self._pid(item), None)
         self._bucket(self._pid(item)).appendleft((self._next_left_seq, item))
         self._next_left_seq -= 1
         self._len += 1
@@ -120,11 +123,13 @@ class _PendingTraceEvents:
 
     def clear(self):
         self._window_key = None
+        self._sweep_ts.clear()
         self._by_pid.clear()
         self._len = 0
 
     def _take(self, pid, from_left):
         self._window_key = None
+        self._sweep_ts.pop(pid, None)
         bucket = self._by_pid[pid]
         entry = bucket.popleft() if from_left else bucket.pop()
         if not bucket:
@@ -183,6 +188,31 @@ class _PendingTraceEvents:
             target = targets.get(pid)
             if target is not None and count >= target:
                 continue
+            if target is None:
+                # Worker rows have no count target. Retained future rows can
+                # vastly outnumber this window's rows. Cache their timestamps
+                # and partition in C, still checking EVERY timestamp rather
+                # than assuming any ordering. Object dtype preserves Python
+                # integer comparisons, including values outside int64.
+                if boundary_ts_us:
+                    cached = self._sweep_ts.get(pid)
+                    timestamps = cached[1] if cached is not None and cached[0] is bucket else np.fromiter(
+                        (item[1] or 0 for _, item in bucket), dtype=object, count=len(bucket)
+                    )
+                    future = (timestamps != 0) & (timestamps > boundary_ts_us)
+                    selected.extend(it.compress(bucket, ~future))
+                    retained = deque(it.compress(bucket, future))
+                else:
+                    selected.extend(bucket)
+                    retained = deque()
+                if retained:
+                    self._by_pid[pid] = retained
+                    self._sweep_ts[pid] = (retained, timestamps[future])
+                else:
+                    del self._by_pid[pid]
+                    self._sweep_ts.pop(pid, None)
+                continue
+            self._sweep_ts.pop(pid, None)
             retained = deque()
             for seq, item in bucket:
                 ts = item[1]
@@ -235,6 +265,7 @@ class _PendingTraceEvents:
             if not eligible(pid, bucket[0][1]):
                 continue
             _, item = bucket.popleft()
+            self._sweep_ts.pop(pid, None)
             self._len -= 1
             if bucket:
                 if eligible(pid, bucket[0][1]):

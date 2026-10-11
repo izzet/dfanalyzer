@@ -127,3 +127,30 @@ def test_idle_ring_vector_check_finds_late_high_lane(monkeypatch):
         buffered.close()
         if writer:writer.close()
         source._r.close();reader.close();(Path('/dev/shm')/name).unlink()
+
+
+def test_worker_timestamp_cache_survives_mutations_and_large_integers():
+    old=collections.deque();new=_PendingTraceEvents()
+    def add(item,left=False):
+        (old.appendleft if left else old.append)(item)
+        (new.appendleft if left else new.append)(item)
+    def sweep(boundary):
+        selected=[];remaining=[]
+        for item in old:
+            if boundary and item[1] and item[1]>boundary:remaining.append(item)
+            else:selected.append(item)
+        old.clear();old.extend(remaining)
+        assert new.sweep_for_window({}, {}, boundary)==selected
+        assert list(new)==list(old)
+    for ts in (200,None,50,2**80,0,120,300):add(({'ts':ts},ts,11))
+    sweep(100);sweep(110)  # build and reuse cache over nonmonotonic rows
+    add(({'ts':90},90,11));sweep(115)
+    add(({'ts':20},20,11),left=True);sweep(125)
+    assert new.popleft()==old.popleft();sweep(150)
+    assert new.pop()==old.pop();sweep(170)
+    add(({},180,11));sweep(175)
+    item=new.pop_for_window({11:100}, {}, 400)
+    assert item==old.popleft();sweep(500)
+    add(({},2**80,12));sweep(2**79);sweep(0)
+    add(({},300,11));sweep(100);new.clear();old.clear()
+    add(({},20,11));sweep(100)
