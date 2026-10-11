@@ -1183,6 +1183,12 @@ class Analyzer(abc.ABC):
             control_topic=control_topic_name,
         )
 
+        continuous_trace_consumer = None
+        if os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow":
+            from .streaming.continuous import BufferedTraceConsumer
+            continuous_trace_consumer = BufferedTraceConsumer(trace_consumer)
+            trace_consumer = continuous_trace_consumer
+
         install_shutdown_handler()
         proc_view_types = self.ensure_proc_view_type(view_types=view_types)
         output_handler = output_handler or (lambda result: None)
@@ -1436,12 +1442,14 @@ class Analyzer(abc.ABC):
         last_completed_boundary = None
         accepted_stop_controls = {}
         try:
+            if continuous_trace_consumer is not None:
+                continuous_trace_consumer.start()
             control_future = control_consumer.pull()
             trace_future = trace_consumer.pull()
             eos_seen = False
             while not _shutdown_requested:
-                # Block on control topic and only drain trace topic once a control
-                # boundary arrives; this keeps consumer-side window buffering disabled.
+                # Control boundaries still define analysis windows. The SHM
+                # drain thread evacuates records while control/analysis waits.
                 control_mofka_event = control_future.wait(timeout_ms=control_wait_timeout_ms)
                 if control_mofka_event is None:
                     if not eos_seen:
@@ -2218,6 +2226,8 @@ class Analyzer(abc.ABC):
         finally:
             if trace_snapshot is not None:
                 trace_snapshot.close()
+            if continuous_trace_consumer is not None:
+                continuous_trace_consumer.close()
             logger.info("mofka.control_stream.stop", reason="sigterm")
             del control_consumer
             del control_driver

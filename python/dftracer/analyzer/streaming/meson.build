@@ -5,6 +5,7 @@ py.install_sources(
         'window_buffer.py',
         'mofka_io.py',
         'transport.py',
+        'continuous.py',
         'zmq_io.py',
     ],
     subdir: 'dftracer/analyzer/streaming',
