@@ -163,6 +163,49 @@ def _stage_service(row, proc_rows, layer, n, n_ranks, rank_pids):
     return total / n_ranks / n, 0.0
 
 
+def window_trace_integrity(traces, rank_pids, step_evidence, dropped_records=None):
+    """Check every control rank against the application's completed step range.
+
+    Cumulative SHM loss cannot be assigned to an exact window. Once any loss
+    occurs, fail closed for the rest of this stream, including worker-only loss.
+    The series header counts steps even when its timing arrays are binned.
+    """
+    import re
+    from .metrics import authoritative_control_rows, _thread_ids
+
+    result = {"lf_v1_trace_complete": 0.0}
+    if dropped_records is not None:
+        result["lf_v1_trace_dropped"] = float(dropped_records)
+        if dropped_records != 0:
+            return result
+    match = re.match(r"^v1;first=(\d+);n=(\d+);b=(\d+);", str(step_evidence.get("step_series", "")))
+    if not match or not rank_pids or traces is None:
+        return result
+    first, count, bins = map(int, match.groups())
+    if count < 1 or bins < 1 or not {"pid", "step"}.issubset(traces.columns):
+        return result
+    end = step_evidence.get("completed_steps")
+    if end is not None and int(end) != first + count - 1:
+        return result
+    expected = set(range(first, first + count))
+    mask = authoritative_control_rows(traces, rank_pids)
+    tids = _thread_ids(traces)
+    if tids is not None:
+        mask &= tids == pd.to_numeric(traces["pid"], errors="coerce")
+    rows = traces.loc[mask].copy()
+    rows["pid"] = pd.to_numeric(rows["pid"], errors="coerce")
+    rows["step"] = pd.to_numeric(rows["step"], errors="coerce")
+    # Boundary/counter events are not per-step workload observations.
+    if "cat" in rows:
+        rows = rows.loc[~rows["cat"].isin(("window", "control"))]
+    for pid in rank_pids:
+        observed = set(rows.loc[rows["pid"] == int(pid), "step"].dropna())
+        if not expected.issubset(observed):
+            return result
+    result["lf_v1_trace_complete"] = 1.0
+    return result
+
+
 def prepare_views(flat_views, declared, context=None):
     """Adapt real analyzer views to the shared rule's seconds-per-step interface.
 
@@ -213,6 +256,10 @@ def prepare_views(flat_views, declared, context=None):
                     source = 0.0
         valid = (all(f in waits for f in families) and comm is not None and compute is not None
                  and n is not None and n >= 1)
+        integrity = (context or {}).get('trace_integrity', {})
+        if integrity or (context or {}).get('native_window') is not None:
+            valid = valid and integrity.get('lf_v1_trace_complete') == 1.0
+        values.update(integrity)
         job = {k: 0.0 for k in JOB_VALUE_KEYS}
         job['lf_v1_job_level'] = float(bool(declared.get('job_level')))
         if valid:

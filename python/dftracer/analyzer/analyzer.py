@@ -2111,6 +2111,22 @@ class Analyzer(abc.ABC):
                         "completed_window_provenance": completed_window_stall_storage_provenance(
                             traces, rank_pids, pid_column=process_key),
                     }
+                    if hasattr(self.fact_engine, "liveflow_declaration"):
+                        from .liveflow_v1 import window_trace_integrity
+                        dropped_records = None
+                        if os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow":
+                            from liveflow_transport.shm_io import ring_totals
+                            totals = ring_totals().get(topic_name)
+                            # An unavailable SHM counter is unknown integrity.
+                            dropped_records = totals[1] if totals is not None else -1
+                        integrity = window_trace_integrity(
+                            traces, rank_pids,
+                            window_horizon_metrics(pulled_events, control_event),
+                            dropped_records=dropped_records,
+                        )
+                        self._fact_window_context["trace_integrity"] = integrity
+                        logger.info("window.trace_integrity", window=completed_window.window_index,
+                                    **integrity)
                     if roster_provenance is not None:
                         self._fact_window_context["completed_window_worker_roster_provenance"] = roster_provenance
                     try:
