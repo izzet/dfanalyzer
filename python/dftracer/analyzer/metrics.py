@@ -84,6 +84,19 @@ def set_main_metrics(df: pd.DataFrame):
     return df.sort_index(axis=1)
 
 
+def _fraction_of_total(values: pd.Series) -> pd.Series:
+    """Normalize numeric measurements; an undefined normalizer stays missing.
+
+    Full-path aggregation can leave object columns containing measured zero and
+    pd.NA. Convert before arithmetic so Python float division cannot raise.
+    """
+    numeric = pd.to_numeric(values, errors="coerce").astype("Float64")
+    total = numeric.sum(min_count=1)
+    if pd.isna(total) or not np.isfinite(total) or total <= 0:
+        return pd.Series(pd.NA, index=values.index, dtype="Float64")
+    return numeric / total
+
+
 def set_view_metrics(
     df: pd.DataFrame,
     metric_boundaries: MetricBoundaries,
@@ -104,46 +117,26 @@ def set_view_metrics(
         if metric.endswith(count_metric):
             count_col = metric
             count_frac_total_col = metric.replace(count_metric, 'count_frac_total')
-            count_sum = df[count_col].sum()
-            if count_sum > 0:
-                new_metrics[count_frac_total_col] = df[count_col] / count_sum
-            else:
-                new_metrics[count_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+            new_metrics[count_frac_total_col] = _fraction_of_total(df[count_col])
         elif metric.endswith(size_proc_metric):
             size_col = metric
             size_proc_frac_total_col = metric.replace(size_proc_metric, 'size_proc_frac_total')
-            size_total = df[size_col].sum()
-            if size_total > 0:
-                new_metrics[size_proc_frac_total_col] = df[size_col] / size_total
-            else:
-                new_metrics[size_proc_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+            new_metrics[size_proc_frac_total_col] = _fraction_of_total(df[size_col])
         elif metric.endswith(time_proc_metric):
             time_col = metric
             time_proc_frac_total_col = metric.replace(time_proc_metric, 'time_proc_frac_total')
-            time_total = df[time_col].sum()
-            if time_total > 0:
-                new_metrics[time_proc_frac_total_col] = df[time_col] / time_total
-            else:
-                new_metrics[time_proc_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+            new_metrics[time_proc_frac_total_col] = _fraction_of_total(df[time_col])
 
     # Compute call_frac_total metrics (always from *_sum, regardless of view type)
     for metric in view_metrics:
         if metric.endswith(size_call_metric):
             size_call_col = metric
             size_call_frac_total_col = metric.replace(size_call_metric, 'size_call_frac_total')
-            size_call_total = df[size_call_col].sum()
-            if size_call_total > 0:
-                new_metrics[size_call_frac_total_col] = df[size_call_col] / size_call_total
-            else:
-                new_metrics[size_call_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+            new_metrics[size_call_frac_total_col] = _fraction_of_total(df[size_call_col])
         elif metric.endswith(time_call_metric):
             time_call_col = metric
             time_call_frac_total_col = metric.replace(time_call_metric, 'time_call_frac_total')
-            time_call_total = df[time_call_col].sum()
-            if time_call_total > 0:
-                new_metrics[time_call_frac_total_col] = df[time_call_col] / time_call_total
-            else:
-                new_metrics[time_call_frac_total_col] = pd.Series(pd.NA, index=df.index, dtype='Float64')
+            new_metrics[time_call_frac_total_col] = _fraction_of_total(df[time_call_col])
 
     count_time_proc_frac_metric_pairs = _find_metric_pairs(list(new_metrics.keys()), 'count_frac_total', 'time_proc_frac_total')
     for count_frac_total_col, time_proc_frac_total_col in count_time_proc_frac_metric_pairs:
@@ -152,9 +145,13 @@ def set_view_metrics(
         # WiSIO orientation: operation-share / time-share.  The geometric
         # 45-degree reference is tan(45)=1; values below it have a
         # disproportionate time share within this operation family.
-        ops_slope = new_metrics[count_frac_total_col] / new_metrics[time_proc_frac_total_col]
+        time_share = new_metrics[time_proc_frac_total_col]
+        # Measured zero time is valid evidence, but its slope is undefined.
+        # Mask the denominator before division, retaining NA through ranking
+        # and fact evaluation (zero-normalization slopes suppress findings).
+        ops_slope = new_metrics[count_frac_total_col] / time_share.where(time_share > 0)
         ops_slope = ops_slope.replace([np.inf, -np.inf], pd.NA)
-        new_metrics[ops_percentile_col] = ops_slope.rank(pct=True)
+        new_metrics[ops_percentile_col] = ops_slope.rank(pct=True).where(ops_slope.notna())
         new_metrics[ops_slope_col] = ops_slope
 
     if new_metrics:
