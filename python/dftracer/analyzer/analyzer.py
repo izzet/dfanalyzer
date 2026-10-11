@@ -4,6 +4,7 @@ from collections import Counter, defaultdict, deque
 import dask
 import dask.dataframe as dd
 import hashlib
+import heapq
 import itertools as it
 import json
 import gzip
@@ -59,13 +60,15 @@ class _PendingTraceEvents:
     by the stamp, so the event handed back is the same one the walk would have chosen.
     """
 
-    __slots__ = ("_by_pid", "_len", "_next_seq", "_next_left_seq")
+    __slots__ = ("_by_pid", "_len", "_next_seq", "_next_left_seq", "_window_heap", "_window_key")
 
     def __init__(self, iterable=()):
         self._by_pid = {}
         self._len = 0
         self._next_seq = 0
         self._next_left_seq = -1
+        self._window_heap = []
+        self._window_key = None
         for item in iterable:
             self.append(item)
 
@@ -96,11 +99,13 @@ class _PendingTraceEvents:
         return bucket
 
     def append(self, item):
+        self._window_key = None
         self._bucket(self._pid(item)).append((self._next_seq, item))
         self._next_seq += 1
         self._len += 1
 
     def appendleft(self, item):
+        self._window_key = None
         self._bucket(self._pid(item)).appendleft((self._next_left_seq, item))
         self._next_left_seq -= 1
         self._len += 1
@@ -114,10 +119,12 @@ class _PendingTraceEvents:
             self.appendleft(item)
 
     def clear(self):
+        self._window_key = None
         self._by_pid.clear()
         self._len = 0
 
     def _take(self, pid, from_left):
+        self._window_key = None
         bucket = self._by_pid[pid]
         entry = bucket.popleft() if from_left else bucket.pop()
         if not bucket:
@@ -160,6 +167,82 @@ class _PendingTraceEvents:
         if best_pid is None:
             return None
         return self._take(best_pid, from_left=True)
+
+    def sweep_for_window(self, targets, seen, boundary_ts_us):
+        """Partition carry-forward buckets once; return selected rows in order.
+
+        Already-satisfied rank buckets cannot contribute any rows. Worker
+        timestamps need not be ordered, so inspect every worker row instead
+        of inferring a timestamp prefix. Avoid repeatedly finding the global
+        oldest PID for rows that will all be carried back unchanged.
+        """
+        self._window_key = None
+        selected = []
+        for pid, bucket in list(self._by_pid.items()):
+            count = seen.get(pid, 0)
+            target = targets.get(pid)
+            if target is not None and count >= target:
+                continue
+            retained = deque()
+            for seq, item in bucket:
+                ts = item[1]
+                over_target = target is not None and count >= target
+                past_boundary = bool(boundary_ts_us and ts and ts > boundary_ts_us)
+                if over_target or past_boundary:
+                    retained.append((seq, item))
+                else:
+                    selected.append((seq, item))
+                    if pid is not None:
+                        count += 1
+            if retained:
+                self._by_pid[pid] = retained
+            else:
+                del self._by_pid[pid]
+        self._len -= len(selected)
+        selected.sort(key=lambda entry: entry[0])
+        return [item for _, item in selected]
+
+    def pop_for_window(self, targets, seen, boundary_ts_us):
+        """Select the same eligible oldest event with a heap of bucket heads.
+
+        Within one window counts only increase. A rank whose target is met
+        cannot become eligible again; a worker's timestamp fence is fixed.
+        Rebuild on queue insertion or a new window. General deque operations
+        invalidate the cursor, so they retain their existing contract.
+        """
+        def eligible(pid, item):
+            if pid in targets:
+                return seen.get(pid, 0) < targets[pid]
+            return not (boundary_ts_us and item[1] and item[1] > boundary_ts_us)
+
+        key = (targets, seen, boundary_ts_us)
+        if (self._window_key is None or self._window_key[0] is not targets
+                or self._window_key[1] is not seen or self._window_key[2] != boundary_ts_us):
+            self._window_heap = [
+                (bucket[0][0], pid) for pid, bucket in self._by_pid.items()
+                if eligible(pid, bucket[0][1])
+            ]
+            heapq.heapify(self._window_heap)
+            self._window_key = key
+        while self._window_heap:
+            _, pid = self._window_heap[0]
+            # The legacy selector uses None as its no-candidate sentinel.
+            # Retain that behavior for pid-less parked records too.
+            if pid is None and eligible(pid, self._by_pid[pid][0][1]):
+                return None
+            heapq.heappop(self._window_heap)
+            bucket = self._by_pid[pid]
+            if not eligible(pid, bucket[0][1]):
+                continue
+            _, item = bucket.popleft()
+            self._len -= 1
+            if bucket:
+                if eligible(pid, bucket[0][1]):
+                    heapq.heappush(self._window_heap, (bucket[0][0], pid))
+            else:
+                del self._by_pid[pid]
+            return item
+        return None
 
 
 _TRACE_FRAMING_LINES = ("[", "]")
@@ -1459,12 +1542,8 @@ class Analyzer(abc.ABC):
             what made a window of 4147 parked events take 12.1 s to assemble with zero pulls and
             zero decode.
             """
-            return pending_trace_events.pop_first_under_target(
-                lambda event_pid: _event_exceeds_target(event_pid, target_counts),
-                lambda item: (
-                    item[2] not in target_counts
-                    and bool(boundary_ts_us and item[1] and item[1] > boundary_ts_us)
-                ),
+            return pending_trace_events.pop_for_window(
+                target_counts, trace_events_seen_by_pid, boundary_ts_us
             )
 
         trace_snapshot = None
@@ -1898,15 +1977,9 @@ class Analyzer(abc.ABC):
                             trace_snapshot = None
 
                         _t0 = time.perf_counter()
-                        carried_events = deque()
-                        while pending_trace_events:
-                            normalized_event, event_ts, event_pid = pending_trace_events.popleft()
-                            if (
-                                _event_exceeds_target(event_pid, target_counts)
-                                or (boundary_ts_us and event_ts and event_ts > boundary_ts_us)
-                            ):
-                                carried_events.append((normalized_event, event_ts, event_pid))
-                                continue
+                        for normalized_event, event_ts, event_pid in pending_trace_events.sweep_for_window(
+                            target_counts, trace_events_seen_by_pid, boundary_ts_us
+                        ):
                             _record_trace_event(
                                 normalized_event,
                                 event_pid,
@@ -1914,7 +1987,6 @@ class Analyzer(abc.ABC):
                                 window_index=completed_window.window_index,
                                 start_counts=start_counts,
                             )
-                        pending_trace_events.extend(carried_events)
                         _dstat["carry_ms"] = (time.perf_counter() - _t0) * 1000.0
                     else:
                         can_drain_trace_stream = True

@@ -4,6 +4,7 @@ import math
 import os
 import re
 from pathlib import Path
+from functools import lru_cache
 import pandas as pd
 import structlog
 from typing import Any, Dict, List, Mapping, Optional
@@ -252,7 +253,20 @@ def _eval_python_expr(df: pd.DataFrame, expression: str) -> pd.Series:
     return _to_series(df, result)
 
 
+@lru_cache(maxsize=512)
+def _expr_identifiers(expression):
+    return frozenset(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression))
+
+
 def _eval_expr(df: pd.DataFrame, expression: str) -> pd.Series:
+    # pandas builds a Series resolver for every column on every eval, even
+    # when a rule reads only one metric from a wide prepared window. Keep the
+    # same engines and fallback; narrow only identifier-safe expressions.
+    if "`" not in expression and all(
+            isinstance(c, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c)
+            for c in df.columns):
+        names = _expr_identifiers(expression)
+        df = df.loc[:, [c for c in df.columns if c in names]]
     # Use numexpr first when available for speed; then pandas python engine;
     # finally restricted eval for aggregate-style expressions.
     if HAS_NUMEXPR:

@@ -5,6 +5,7 @@ import dataclasses as dc
 import inflect
 import json
 import numpy as np
+import os
 import pandas as pd
 import structlog
 
@@ -586,7 +587,12 @@ class MofkaOutput:
     def handle_result(self, result: AnalysisResult):
         if result.analysis_facts:
             self._send_fact_envelope(result=result)
-        for view_key in result.flat_views:
+        # Native LiveFlow control consumes facts. Keep analyzer/debug views,
+        # but avoid parquet serialization and diagnostic rescoring on this hop.
+        compact_facts = (os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow"
+                         and os.environ.get("LIVEFLOW_AGENT_FACTS_ONLY") == "1"
+                         and result.window_index is not None)
+        for view_key in (() if compact_facts else result.flat_views):
             view_type = '_'.join(view_key)
             flat_view = result.flat_views[view_key]
             metadata = dict(

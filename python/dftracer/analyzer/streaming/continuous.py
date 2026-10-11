@@ -7,6 +7,8 @@ from collections import deque
 from threading import Condition, Event, Thread
 import time
 
+import numpy as np
+
 
 class _Future:
     def __init__(self, consumer):
@@ -54,6 +56,20 @@ class BufferedTraceConsumer:
         self._active_snapshot = None
         self._stop = Event()
         self._error = None
+        self._ring_heads = self._ring_tails = None
+        # Only SHM consumers expose this ring layout. A vectorized committed
+        # head/tail check avoids thousands of empty Python lane generators on
+        # every background poll. It never reads payloads or advances tails;
+        # the source remains the sole serialized reader.
+        reader = getattr(source, "_r", None)
+        if reader is not None and source.__class__.__module__.endswith("shm_io"):
+            from shm_reader import SEG_HEADER_SIZE, LANE_SIZE, _OFF_HEAD, _OFF_TAIL
+            self._ring_heads = np.ndarray(
+                (reader.lane_count,), dtype="<u8", buffer=reader._mm,
+                offset=SEG_HEADER_SIZE + _OFF_HEAD, strides=(LANE_SIZE,))
+            self._ring_tails = np.ndarray(
+                (reader.lane_count,), dtype="<u8", buffer=reader._mm,
+                offset=SEG_HEADER_SIZE + _OFF_TAIL, strides=(LANE_SIZE,))
         self._thread = Thread(target=self._drain, name='liveflow-trace-drain', daemon=True)
 
     def start(self):
@@ -69,7 +85,10 @@ class BufferedTraceConsumer:
                 # Serialize source reads with boundary snapshots. Nonblocking
                 # pulls avoid holding this lock while awaiting producer data.
                 with self._condition:
-                    record = self.source.pull().wait(timeout_ms=0)
+                    buffered = getattr(self.source, "_buf", ())
+                    idle = (self._ring_heads is not None and not buffered
+                            and not np.any(self._ring_heads.copy() > self._ring_tails))
+                    record = None if idle else self.source.pull().wait(timeout_ms=0)
                     if record is not None:
                         self._buffer.append(record)
                         self._condition.notify_all()

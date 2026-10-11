@@ -751,7 +751,10 @@ class DFTracerAnalyzer(Analyzer):
         extra_columns: Optional[Dict[str, str]] = None,
     ):
         columns = self._get_columns(extra_columns)
-        df = pd.DataFrame(events, columns=columns)
+        # Unknown M records have no normalized type and _handle_metadata
+        # excludes them from every event/table family. Filter before pandas
+        # construction rather than allocating and converting discarded rows.
+        df = pd.DataFrame((e for e in events if e.get("type") is not None), columns=columns)
         traces, profile_events, system_events = self._handle_metadata(df)
 
         # Compute shared time_origin (same as batch read_trace) so that
