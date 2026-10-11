@@ -397,6 +397,19 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
         ready = [int(candidate["planner_history_ready"]) for candidate in candidates
                  if "planner_history_ready" in candidate]
         history = {"planner_history_ready": ready[0]} if ready and len(set(ready)) == 1 else {}
+        # Preserve the writer's epoch for verification without changing the planner's epoch/regime
+        # key. The step-based horizon intentionally does not publish legacy epoch_index; adding it
+        # would change admission/sample resets. Missing or disagreeing source epochs remain absent.
+        epochs = []
+        for candidate in candidates:
+            value = candidate.get("epoch_index", candidate.get("epoch"))
+            try:
+                epoch = int(value)
+                if float(value) == epoch and epoch >= 0:
+                    epochs.append(epoch)
+            except (TypeError, ValueError, OverflowError):
+                continue
+        verification = {"verification_epoch_index": epochs[0]} if epochs and len(set(epochs)) == 1 else {}
         # The applied (physical) vector: every `physical_<knob>` the writer snapshotted plus the
         # step it took effect at. Knob names are the workload's (halo3d: read_threads/decode_threads;
         # StorMer: num_workers/prefetch_factor/bucket_cap_mb), so the field set is read from the
@@ -422,7 +435,7 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
                 continue
         tail = {"step_wall_p90_us": max(tails)} if tails else {}
         tail.update(window_step_evidence(candidates))
-        return dict(first_steps, **history, **physical, **tail, remaining_steps=remaining,
+        return dict(first_steps, **history, **verification, **physical, **tail, remaining_steps=remaining,
                     windows_remaining=remaining / first_steps["configured_window_steps"])
 
     complete = []
