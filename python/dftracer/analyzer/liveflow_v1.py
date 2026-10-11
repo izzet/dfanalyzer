@@ -125,6 +125,22 @@ def _service_shares(row, families, waits):
 SERVICE_VALUE_KEYS = tuple(k for f in ('storage', 'decode', 'delivery')
                            for k in ('lf_v1_svc_' + f, 'lf_v1_svc_' + f + '_critical'))
 
+# FactEngine.evaluate invokes prepare_views before evaluating declared-family
+# rules. These columns therefore belong to its window interface even though
+# they are not raw aggregates. Invalid/missing measurements still fail closed
+# in prepare_views; advertising this interface must not invent measurements.
+PREPARED_WINDOW_METRICS = frozenset((
+    'lf_v1_valid', 'lf_v1_storage_declared', 'lf_v1_decode_declared',
+    'lf_v1_delivery_declared', 'lf_v1_comm_declared',
+    'lf_v1_storage_wait', 'lf_v1_decode_wait', 'lf_v1_delivery_wait',
+    'lf_v1_comm_wait', 'lf_v1_compute_time', 'lf_v1_active_time',
+    'lf_v1_per_step', 'xlayer_source_is_instrument', 'xlayer_storage_share',
+    'xlayer_decode_share', 'xlayer_delivery_share', 'observation_only',
+    'liveflow_v1_attribution',
+    'reader_posix_read_ops_slope', 'reader_decode_ops_slope',
+    'delivery_ops_slope', 'comm_ops_slope',
+)) | frozenset(JOB_VALUE_KEYS) | frozenset(SERVICE_VALUE_KEYS)
+
 
 def _proc_pid(name):
     parts = str(name).split('#')

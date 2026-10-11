@@ -432,6 +432,17 @@ class FastPathPlan:
                     available.update(COMPLETED_WINDOW_WORKER_ROSTER_PROVENANCE_METRICS)
             else:
                 available.difference_update(plan.proc_name_only_columns)
+            if (rule.source_view == 'window'
+                    and getattr(preset, 'name', None) == 'liveflow-v1'
+                    and hasattr(fact_engine, 'liveflow_declaration')):
+                # The full and fast paths call the SAME FactEngine.evaluate,
+                # which first derives declared-family waits, service and
+                # window slopes through liveflow_v1.prepare_views. They are
+                # supported rule inputs, not additional raw reductions.
+                # Keep this scoped to the interface that actually derives
+                # them; arbitrary presets/views must still decline.
+                from .liveflow_v1 import PREPARED_WINDOW_METRICS
+                available.update(PREPARED_WINDOW_METRICS)
             unknown = (
                 set(rule.referenced_columns)
                 - available
