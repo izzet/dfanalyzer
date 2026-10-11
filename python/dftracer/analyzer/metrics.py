@@ -112,31 +112,47 @@ def set_view_metrics(
 
     view_metrics = list(set(df.columns.tolist()))
     new_metrics: Dict[str, pd.Series] = {}
+    fractions: Dict[str, pd.Series] = {}
+    nonfinite_fractions = set()
+
+    def fraction(column):
+        if column not in fractions:
+            fractions[column] = _fraction_of_total(df[column])
+            if np.isinf(fractions[column].to_numpy(dtype=float, na_value=np.nan)).any():
+                nonfinite_fractions.add(id(fractions[column]))
+        return fractions[column]
+
+    def final_series(series):
+        if id(series) in nonfinite_fractions:
+            # Keep sanitization AFTER slope/rank arithmetic, exactly as in
+            # the old frame-wide pass, including overflow/cancellation cases.
+            series = series.replace([np.inf, -np.inf], pd.NA)
+        return series if series.dtype == pd.Float64Dtype() else series.astype('Float64')
 
     for metric in view_metrics:
         if metric.endswith(count_metric):
             count_col = metric
             count_frac_total_col = metric.replace(count_metric, 'count_frac_total')
-            new_metrics[count_frac_total_col] = _fraction_of_total(df[count_col])
+            new_metrics[count_frac_total_col] = fraction(count_col)
         elif metric.endswith(size_proc_metric):
             size_col = metric
             size_proc_frac_total_col = metric.replace(size_proc_metric, 'size_proc_frac_total')
-            new_metrics[size_proc_frac_total_col] = _fraction_of_total(df[size_col])
+            new_metrics[size_proc_frac_total_col] = fraction(size_col)
         elif metric.endswith(time_proc_metric):
             time_col = metric
             time_proc_frac_total_col = metric.replace(time_proc_metric, 'time_proc_frac_total')
-            new_metrics[time_proc_frac_total_col] = _fraction_of_total(df[time_col])
+            new_metrics[time_proc_frac_total_col] = fraction(time_col)
 
     # Compute call_frac_total metrics (always from *_sum, regardless of view type)
     for metric in view_metrics:
         if metric.endswith(size_call_metric):
             size_call_col = metric
             size_call_frac_total_col = metric.replace(size_call_metric, 'size_call_frac_total')
-            new_metrics[size_call_frac_total_col] = _fraction_of_total(df[size_call_col])
+            new_metrics[size_call_frac_total_col] = fraction(size_call_col)
         elif metric.endswith(time_call_metric):
             time_call_col = metric
             time_call_frac_total_col = metric.replace(time_call_metric, 'time_call_frac_total')
-            new_metrics[time_call_frac_total_col] = _fraction_of_total(df[time_call_col])
+            new_metrics[time_call_frac_total_col] = fraction(time_call_col)
 
     count_time_proc_frac_metric_pairs = _find_metric_pairs(list(new_metrics.keys()), 'count_frac_total', 'time_proc_frac_total')
     for count_frac_total_col, time_proc_frac_total_col in count_time_proc_frac_metric_pairs:
@@ -155,8 +171,13 @@ def set_view_metrics(
         new_metrics[ops_slope_col] = ops_slope
 
     if new_metrics:
-        new_metrics_df = pd.DataFrame(new_metrics, index=df.index)
-        new_metrics_df = new_metrics_df.replace([np.inf, -np.inf], pd.NA).astype('Float64')
+        # Slopes already mask nonfinite results; their percentiles are finite
+        # or missing. Fractions only need the old sanitization on overflow.
+        # Preserve typed arrays rather than re-scanning/re-casting every column.
+        new_metrics_df = pd.DataFrame({
+            name: final_series(series)
+            for name, series in new_metrics.items()
+        }, index=df.index)
         overlapping_cols = [col for col in new_metrics_df.columns if col in df.columns]
         if overlapping_cols:
             df = df.drop(columns=overlapping_cols)

@@ -17,15 +17,15 @@ def eventually(predicate):
         time.sleep(.001)
 
 
-@pytest.fixture
-def consumer(monkeypatch):
+@pytest.fixture(params=[1, 100])
+def consumer(monkeypatch, request):
     name='lf-continuous-'+uuid.uuid4().hex
     reader=ShmRingReader(name,lane_count=2,lane_bytes=32768,create=True)
     monkeypatch.setattr(shm_io,'_seg_name',lambda topic:name)
     monkeypatch.setattr(shm_io,'_receipt_journal',lambda:None)
     monkeypatch.setattr(shm_io,'_trace_persistor',None)
     raw=shm_io.Consumer('trace','continuous-test')
-    buffered=BufferedTraceConsumer(raw);buffered.start()
+    buffered=BufferedTraceConsumer(raw, idle_wait_ms=request.param);buffered.start()
     writer=ShmRingWriter(name,0)
     try:
         yield reader,writer,buffered
@@ -145,4 +145,41 @@ def test_preparation_failure_reaches_snapshot_and_close():
     with pytest.raises(RuntimeError, match='continuous trace drain failed'):
         buffered.pull().wait(1000)
     with pytest.raises(RuntimeError, match='continuous trace drain failed'):
+        buffered.close()
+
+
+def test_window_snapshot_does_not_wait_for_later_transport_read():
+    """A slow read for a later window cannot stall an already detached prefix."""
+    from threading import Event, Thread
+    from types import SimpleNamespace
+    entered, release, consumed = Event(), Event(), Event()
+    class Source:
+        def pull(self): return self
+        def wait(self, timeout_ms):
+            entered.set()
+            assert release.wait(5)
+            return None
+        def snapshot_committed(self):
+            class Snapshot:
+                remaining = 0
+                def close(self): pass
+            return Snapshot()
+    buffered = BufferedTraceConsumer(Source())
+    with buffered._condition:
+        buffered._buffer_record(SimpleNamespace(metadata={'ordinal': 0}))
+    snapshot = buffered.snapshot_committed()
+    buffered.start()
+    worker = None
+    try:
+        assert entered.wait(5)
+        def consume():
+            assert snapshot.next().metadata['ordinal'] == 0
+            consumed.set()
+        worker = Thread(target=consume)
+        worker.start()
+        assert consumed.wait(1), 'later transport read held the window buffer lock'
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(5)
         buffered.close()

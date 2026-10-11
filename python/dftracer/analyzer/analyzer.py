@@ -1477,7 +1477,10 @@ class Analyzer(abc.ABC):
 
         from .streaming.continuous import BufferedTraceConsumer, PreparedTraceRecord
         if os.environ.get("LIVEFLOW_TRANSPORT") == "liveflow":
-            continuous_trace_consumer = BufferedTraceConsumer(trace_consumer, prepare=_normalize_trace_event)
+            continuous_trace_consumer = BufferedTraceConsumer(
+                trace_consumer, prepare=_normalize_trace_event,
+                idle_wait_ms=trace_drain_timeout_ms,
+            )
             trace_consumer = continuous_trace_consumer
 
         def _append_trace_event_to_window(

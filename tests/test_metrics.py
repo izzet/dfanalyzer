@@ -845,3 +845,34 @@ def test_set_quantile_metrics_mixed_list_tuple_and_noop():
     assert "time_q25_q75_mean" in out.columns and "time_q25_q75_std" in out.columns and "time_q25_q75_count" in out.columns
     # Stats dropped
     assert "time_q25_q75_stats" not in out.columns
+
+
+def test_view_metrics_reuses_aliases_without_changing_fraction_or_slope(monkeypatch):
+    from dftracer.analyzer import metrics
+    calls = []
+    original = metrics._fraction_of_total
+    def counted(values):
+        calls.append(values.name)
+        return original(values)
+    monkeypatch.setattr(metrics, "_fraction_of_total", counted)
+    frame = pd.DataFrame({
+        "read_count_sum": [1., 9.], "read_time_sum": [4., 6.],
+        "read_size_sum": [2., 8.],
+    })
+    out = metrics.set_view_metrics(frame, {}, True)
+    assert sorted(calls) == sorted(frame.columns)
+    pd.testing.assert_series_equal(out.read_time_proc_frac_total,
+                                  out.read_time_call_frac_total, check_names=False)
+    assert out.read_ops_slope.tolist() == pytest.approx([.25, 1.5])
+    assert all(out[c].dtype == pd.Float64Dtype() for c in out if c not in frame)
+
+
+def test_view_metrics_sanitizes_overflow_after_slope_arithmetic():
+    # A tiny positive total can produce an infinite fraction. Preserve the
+    # original slope-before-final-sanitization order, including its zero slope.
+    frame = pd.DataFrame({"read_count_sum": [1., 1., 1.],
+                          "read_time_sum": [1e308, -1e308, 1e-309]})
+    out = set_view_metrics(frame, {}, True)
+    assert pd.isna(out.loc[0, "read_time_proc_frac_total"])
+    assert out.loc[0, "read_ops_slope"] == 0.
+    assert pd.isna(out.loc[1, "read_ops_slope"])

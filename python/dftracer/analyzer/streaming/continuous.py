@@ -5,7 +5,7 @@ Rank counts, timestamp fences, metadata state and window membership remain
 owned by the main analyzer.
 """
 from collections import deque
-from threading import Condition, Event, Thread
+from threading import Condition, Event, Lock, Thread
 import time
 
 import numpy as np
@@ -68,11 +68,16 @@ class _Snapshot:
 
 class BufferedTraceConsumer:
     """One serialized ring reader feeding the agent's private record buffer."""
-    def __init__(self, source, prepare=None):
+    def __init__(self, source, prepare=None, idle_wait_ms=1):
         self.source = source
         self._prepare = prepare
+        self._idle_wait_s = max(0, idle_wait_ms) / 1000
         self._prepare_queue = deque()
         self._condition = Condition()
+        # Transport reads can copy every lane and release/reacquire the GIL.
+        # They must serialize with source snapshots, but must not hold the
+        # buffer lock needed by prepared-record and window-snapshot consumers.
+        self._source_lock = Lock()
         self._buffer = deque()
         self._active_snapshot = None
         self._stop = Event()
@@ -140,15 +145,16 @@ class BufferedTraceConsumer:
             while not self._stop.is_set():
                 # Serialize source reads with boundary snapshots. Nonblocking
                 # pulls avoid holding this lock while awaiting producer data.
-                with self._condition:
+                with self._source_lock:
                     buffered = getattr(self.source, "_buf", ())
                     idle = (self._ring_heads is not None and not buffered
                             and not np.any(self._ring_heads.copy() > self._ring_tails))
                     record = None if idle else self.source.pull().wait(timeout_ms=0)
                     if record is not None:
-                        self._buffer_record(record)
+                        with self._condition:
+                            self._buffer_record(record)
                 if record is None:
-                    self._stop.wait(0.001)
+                    self._stop.wait(self._idle_wait_s)
         except Exception as exc:
             with self._condition:
                 self._error = exc
@@ -172,23 +178,32 @@ class BufferedTraceConsumer:
                 self._condition.wait(remaining)
 
     def snapshot_committed(self):
-        with self._condition:
-            self._check_error()
-            if self._active_snapshot is not None:
-                raise RuntimeError('another committed snapshot is active')
+        # Lock order is source then buffer, matching the reader. Keep the
+        # source fenced until its finite prefix has been appended, so buffered
+        # records and preparations retain exactly their original order.
+        with self._source_lock:
+            with self._condition:
+                self._check_error()
+                if self._active_snapshot is not None:
+                    raise RuntimeError('another committed snapshot is active')
             # Capture the same finite per-lane committed prefix as before.
             # Include transport records already evacuated before the boundary.
             source_snapshot = self.source.snapshot_committed()
+            committed = []
             try:
                 while source_snapshot.remaining:
-                    self._buffer_record(source_snapshot.next())
+                    committed.append(source_snapshot.next())
             finally:
                 source_snapshot.close()
-            snapshot = _Snapshot(self, self._buffer)
-            self._buffer = deque()
-            if snapshot.remaining:
-                self._active_snapshot = snapshot
-            return snapshot
+            with self._condition:
+                self._check_error()
+                for record in committed:
+                    self._buffer_record(record)
+                snapshot = _Snapshot(self, self._buffer)
+                self._buffer = deque()
+                if snapshot.remaining:
+                    self._active_snapshot = snapshot
+                return snapshot
 
     def close(self):
         self._stop.set()
