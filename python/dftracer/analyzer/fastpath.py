@@ -303,6 +303,26 @@ def _eval_mask(frame: pd.DataFrame, condition: str, term: str) -> np.ndarray:
     return np.asarray(pd.Series(result).fillna(False).astype(bool))
 
 
+def preserve_measured_stall_zeros(view: pd.DataFrame) -> pd.DataFrame:
+    """Publish exact-zero stall times only in groups with observed stall records.
+
+    Legacy aggregation encodes zero time as null; positive family event counts
+    retain its presence information. Do not fill absent families or ratios.
+    This follows liveflow_v1._measured's existing zero/presence contract.
+    """
+    for family in ("stall_storage", "stall_decode"):
+        count_col = family + "_count_sum"
+        if count_col not in view:
+            continue
+        counts = pd.to_numeric(view[count_col], errors="coerce")
+        observed = counts.notna() & np.isfinite(counts) & (counts > 0)
+        for suffix in ("time_sum", "time_proc_max", "time_proc_mean", "time_proc_min"):
+            col = family + "_" + suffix
+            if col in view:
+                view[col] = view[col].mask(observed & view[col].isna(), 0.0)
+    return view
+
+
 class FastPathPlan:
     """The set of per-layer sums a rule file needs, resolved once against a preset.
 
@@ -637,6 +657,8 @@ class FastPathPlan:
 
             index = pd.Index(group_uniques, name=view_type)
             view = pd.DataFrame(np.column_stack(blocks), index=index, columns=names)
+            if getattr(getattr(self, "preset", None), "name", None) == "liveflow-v1":
+                view = preserve_measured_stall_zeros(view)
             coherent = None
             if not is_process_based and "window_wall" in domain_mats:
                 coherent = coherent_domain_vectors(domain_mats)

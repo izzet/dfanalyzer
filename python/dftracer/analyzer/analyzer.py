@@ -567,6 +567,35 @@ def _assert_metadata_resolved(raw_stats_data: dict) -> None:
     )
 
 
+def _replace_zeros_preserving_stall_time(frame, preserve=False, by_function=False):
+    """Keep literal measured stall zeros before min/mean aggregation.
+
+    Missing input and undefined ratios stay null. Dropping zero early biases
+    mixed zero/nonzero groups even if publication restores all-zero groups.
+    """
+    result = frame.replace(0, pd.NA)
+    if not preserve:
+        return result
+    count_cols = [c for c in frame.columns if
+                  (c[0] if isinstance(c, tuple) else c) in ("count", "count_sum")]
+    if not count_cols:
+        return result
+    counts = pd.to_numeric(frame[count_cols[0]], errors="coerce")
+    observed = counts.notna() & np.isfinite(counts) & (counts > 0)
+    if by_function:
+        if "func_name" not in frame.index.names:
+            return result
+        observed &= frame.index.get_level_values("func_name").isin(("stall.storage", "stall.decode"))
+    time_stats = {"time", "time_sq", "time_sum", "time_call_min", "time_call_max",
+                  "time_call_mean", "time_call_std", "time_proc_min", "time_proc_max",
+                  "time_proc_mean", "time_proc_std"}
+    for col in frame.columns:
+        metric = col[0] if isinstance(col, tuple) else col
+        if metric in time_stats:
+            result[col] = result[col].mask(observed & frame[col].eq(0), 0.0)
+    return result
+
+
 class Analyzer(abc.ABC):
     def __init__(
         self,
@@ -3749,12 +3778,12 @@ class Analyzer(abc.ABC):
                 .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
                 .persist()
                 .repartition(partition_size=partition_size)
-                .replace(0, pd.NA)
+                .map_partitions(_replace_zeros_preserving_stall_time, preserve=self.preset.name == "liveflow-v1", by_function=True)
             )
         else:
             hlm_agg.update({col: unique_set_pd for col in view_types_diff})
             hlm = traces.groupby(hlm_groupby).agg(hlm_agg)
-            hlm = hlm.replace(0, pd.NA)
+            hlm = _replace_zeros_preserving_stall_time(hlm, preserve=self.preset.name == "liveflow-v1", by_function=True)
             hlm = fix_hlm_dtypes(hlm)
 
         hlm[bin_cols] = hlm[bin_cols].astype("Int32")
@@ -3952,13 +3981,15 @@ class Analyzer(abc.ABC):
                     hlm.groupby(list(view_types))
                     .agg(main_view_agg, split_out=hlm.npartitions)
                     .map_partitions(set_main_metrics)
-                    .replace(0, pd.NA)
+                    .map_partitions(_replace_zeros_preserving_stall_time,
+                                    preserve=self.preset.name == "liveflow-v1" and layer in ("stall_storage", "stall_decode"))
                     .map_partitions(fix_dtypes)
                     .persist()
                 )
             else:
                 main_view = hlm.groupby(list(view_types)).agg(main_view_agg)
-                main_view = set_main_metrics(main_view).replace(0, pd.NA)
+                main_view = _replace_zeros_preserving_stall_time(set_main_metrics(main_view),
+                    preserve=self.preset.name == "liveflow-v1" and layer in ("stall_storage", "stall_decode"))
                 main_view = fix_dtypes(main_view)
 
         return main_view
@@ -4059,7 +4090,13 @@ class Analyzer(abc.ABC):
                 pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
+            view = pre_view.groupby([view_type]).agg(view_agg)
+            if is_dask:
+                view = view.map_partitions(_replace_zeros_preserving_stall_time,
+                    preserve=self.preset.name == "liveflow-v1" and layer in ("stall_storage", "stall_decode"))
+            else:
+                view = _replace_zeros_preserving_stall_time(view,
+                    preserve=self.preset.name == "liveflow-v1" and layer in ("stall_storage", "stall_decode"))
 
         with log_block("flatten_column_names", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
@@ -4097,6 +4134,9 @@ class Analyzer(abc.ABC):
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
+        if self.preset.name == "liveflow-v1":
+            from .fastpath import preserve_measured_stall_zeros
+            flat_view = preserve_measured_stall_zeros(flat_view)
         with log_block("set_view_metrics", view_key=view_key):
             flat_view = set_view_metrics(
                 flat_view,
