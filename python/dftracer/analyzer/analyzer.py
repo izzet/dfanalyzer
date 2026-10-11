@@ -2123,6 +2123,7 @@ class Analyzer(abc.ABC):
                             traces, rank_pids,
                             window_horizon_metrics(pulled_events, control_event),
                             dropped_records=dropped_records,
+                            global_steps=self.fact_engine.liveflow_declaration["workload"] == "halo3d",
                         )
                         self._fact_window_context["trace_integrity"] = integrity
                         logger.info("window.trace_integrity", window=completed_window.window_index,

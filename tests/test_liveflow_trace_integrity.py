@@ -52,3 +52,12 @@ def test_invalid_integrity_overrides_available_metrics():
 def test_all_main_rows_missing_cannot_use_helper_threads():
     rows=traces(); rows.loc[rows.pid==20,'proc_name']='app#host#20#99'
     assert check(rows)['lf_v1_trace_complete'] == 0
+
+
+def test_epoch_local_coverage_uses_control_count_without_guessed_offset():
+    rows=traces(); rows['step']-=99
+    evidence=dict(step_series='v1;first=100;n=3;b=1;wall=1,1,1',completed_steps=102)
+    assert window_trace_integrity(rows,{10,20},evidence,0,global_steps=False)['lf_v1_trace_complete']==1
+    assert window_trace_integrity(rows.drop(4),{10,20},evidence,0,global_steps=False)['lf_v1_trace_complete']==0
+    rows.loc[rows.pid==20,'step']+=1
+    assert window_trace_integrity(rows,{10,20},evidence,0,global_steps=False)['lf_v1_trace_complete']==0

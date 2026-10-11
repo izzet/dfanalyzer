@@ -163,7 +163,7 @@ def _stage_service(row, proc_rows, layer, n, n_ranks, rank_pids):
     return total / n_ranks / n, 0.0
 
 
-def window_trace_integrity(traces, rank_pids, step_evidence, dropped_records=None):
+def window_trace_integrity(traces, rank_pids, step_evidence, dropped_records=None, *, global_steps=True):
     """Check every control rank against the application's completed step range.
 
     Cumulative SHM loss cannot be assigned to an exact window. Once any loss
@@ -198,10 +198,22 @@ def window_trace_integrity(traces, rank_pids, step_evidence, dropped_records=Non
     # Boundary/counter events are not per-step workload observations.
     if "cat" in rows:
         rows = rows.loc[~rows["cat"].isin(("window", "control"))]
+    local_range = None
     for pid in rank_pids:
         observed = set(rows.loc[rows["pid"] == int(pid), "step"].dropna())
-        if not expected.issubset(observed):
-            return result
+        if global_steps:
+            if not expected.issubset(observed):
+                return result
+        else:
+            # Training presets stamp epoch-local steps; the control series is
+            # cumulative. Count and contiguous coverage must agree on EVERY
+            # rank, without guessing an offset from a surviving fragment.
+            if len(observed) != count or max(observed) - min(observed) + 1 != count:
+                return result
+            bounds = (min(observed), max(observed))
+            if local_range is not None and bounds != local_range:
+                return result
+            local_range = bounds
     result["lf_v1_trace_complete"] = 1.0
     return result
 
