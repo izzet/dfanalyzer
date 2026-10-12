@@ -211,9 +211,16 @@ def window_trace_integrity(traces, rank_pids, step_evidence, dropped_records=Non
     rows = traces.loc[mask].copy()
     rows["pid"] = pd.to_numeric(rows["pid"], errors="coerce")
     rows["step"] = pd.to_numeric(rows["step"], errors="coerce")
-    # Boundary/counter events are not per-step workload observations.
+    # Boundary events are not per-step workload observations. DLIO's
+    # stall.storage/stall record is an accumulated window wait, stamped with
+    # the caller's current step (which may already be the next step at epoch
+    # end). It also cannot establish step coverage. Filter only this coverage
+    # view: the original traces still feed wait metrics and rank provenance.
     if "cat" in rows:
         rows = rows.loc[~rows["cat"].isin(("window", "control"))]
+        if "func_name" in rows:
+            rows = rows.loc[~((rows["cat"] == "stall")
+                              & (rows["func_name"] == "stall.storage"))]
     local_range = None
     for pid in rank_pids:
         observed = set(rows.loc[rows["pid"] == int(pid), "step"].dropna())

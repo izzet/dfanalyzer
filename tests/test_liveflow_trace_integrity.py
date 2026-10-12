@@ -61,3 +61,42 @@ def test_epoch_local_coverage_uses_control_count_without_guessed_offset():
     assert window_trace_integrity(rows.drop(4),{10,20},evidence,0,global_steps=False)['lf_v1_trace_complete']==0
     rows.loc[rows.pid==20,'step']+=1
     assert window_trace_integrity(rows,{10,20},evidence,0,global_steps=False)['lf_v1_trace_complete']==0
+
+
+def with_window_stalls(rows, step=103):
+    return pd.concat([rows, pd.DataFrame([
+        dict(pid=p, proc_name=f'app#host#{p}#{p}', step=step,
+             cat='stall', func_name='stall.storage', duration=50)
+        for p in (10, 20)
+    ])], ignore_index=True)
+
+
+def test_window_wait_does_not_extend_epoch_local_step_coverage():
+    rows = with_window_stalls(traces())
+    original = rows.copy(deep=True)
+    evidence = dict(step_series='v1;first=100;n=3;b=1;wall=1,1,1', completed_steps=102)
+    integrity = window_trace_integrity(rows, {10, 20}, evidence, 0, global_steps=False)
+    assert integrity['lf_v1_trace_complete'] == 1
+    pd.testing.assert_frame_equal(rows, original)
+    # Wait records remain available, including their durations and rank coverage.
+    from dftracer.analyzer.fastpath import completed_window_stall_storage_provenance
+    assert completed_window_stall_storage_provenance(rows, {10, 20})['stall_storage_rank_coverage'] == 1
+    assert rows.loc[rows.cat == 'stall', 'duration'].sum() == 100
+
+
+def test_window_wait_cannot_fill_a_real_rank_step_gap():
+    rows = traces().drop(4)  # pid20 step101 is absent
+    rows = with_window_stalls(rows, step=101)
+    evidence = dict(step_series='v1;first=100;n=3;b=1;wall=1,1,1', completed_steps=102)
+    for global_steps in (True, False):
+        assert window_trace_integrity(rows, {10, 20}, evidence, 0,
+                                      global_steps=global_steps)['lf_v1_trace_complete'] == 0
+
+
+def test_only_declared_window_wait_is_excluded_from_coverage():
+    evidence = dict(step_series='v1;first=100;n=3;b=1;wall=1,1,1', completed_steps=102)
+    for column, value in (('cat', 'compute'), ('func_name', 'real.operation')):
+        rows = with_window_stalls(traces())
+        rows.loc[rows.cat == 'stall', column] = value
+        assert window_trace_integrity(rows, {10, 20}, evidence, 0,
+                                      global_steps=False)['lf_v1_trace_complete'] == 0
