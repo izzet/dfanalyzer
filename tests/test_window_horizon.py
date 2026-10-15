@@ -105,3 +105,23 @@ def test_missing_or_disagreeing_step_epoch_stays_absent():
     assert 'verification_epoch_index' not in window_horizon_metrics([step])
     assert 'verification_epoch_index' not in window_horizon_metrics([
         dict(step, epoch_index=1), dict(step, epoch_index=2)])
+
+
+def _phys(**extra):
+    base = dict(name='window.stop', configured_total_steps=1000, completed_steps=40, configured_window_steps=20,
+                physical_applied_step=12, physical_num_workers=12, physical_prefetch_factor=2,
+                physical_bucket_cap_mb=25)
+    base.update(extra)
+    return base
+
+
+def test_rank_reporting_a_subset_of_knobs_does_not_discard_the_physical_vector():
+    # One rank of the node also carries the node-level layout knobs; the others do not report them.
+    metrics = window_horizon_metrics([_phys(physical_read_threads=1, physical_transfer_mb=0), _phys(), _phys(), _phys()])
+    assert metrics['physical_num_workers'] == 12 and metrics['physical_applied_step'] == 12
+    assert metrics['physical_read_threads'] == 1 and metrics['physical_transfer_mb'] == 0
+
+
+def test_disagreement_on_a_shared_knob_or_the_applied_step_is_still_discordant():
+    assert 'physical_num_workers' not in window_horizon_metrics([_phys(), _phys(physical_num_workers=4)])
+    assert 'physical_applied_step' not in window_horizon_metrics([_phys(), _phys(physical_applied_step=13)])

@@ -415,16 +415,33 @@ def window_horizon_metrics(events: List[dict], control_event: Optional[dict] = N
         # StorMer: num_workers/prefetch_factor/bucket_cap_mb), so the field set is read from the
         # events, not fixed here. Ranks of one node must agree exactly; otherwise nothing is
         # passed (a discordant vector is not evidence of any configuration).
+        # Ranks may report different SUBSETS of knobs: the node-level layout knobs (transfer_mb, read_threads)
+        # are held by the optimizer-context rank only, so one rank of four carries two extra fields. A rank
+        # that does not report a knob does not disagree about it. Agreement is required on every field that
+        # more than one rank reports AND on the applied step; a field with two distinct values makes the node
+        # vector discordant (nothing passed), exactly as before. Comparing whole tuples dropped the vector for
+        # every window of the compound qual and the patch16 flagship, so no per-step verdict could ever form.
         vectors = []
         for c in candidates:
             if "physical_applied_step" not in c:
                 continue
             try:
-                vectors.append(tuple(sorted((k, int(v)) for k, v in c.items()
-                                            if isinstance(k, str) and k.startswith("physical_"))))
+                vectors.append({k: int(v) for k, v in c.items()
+                                if isinstance(k, str) and k.startswith("physical_")})
             except (TypeError, ValueError):
                 continue
-        physical = dict(vectors[0]) if vectors and len(set(vectors)) == 1 else {}
+        physical = {}
+        if vectors:
+            merged, ok = {}, True
+            for vec in vectors:
+                for k, v in vec.items():
+                    if merged.setdefault(k, v) != v:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                physical = dict(sorted(merged.items()))
         # Tail of the per-step wall in the window (microseconds -> seconds is the planner's job).
         # Each rank reports its own p90; the node's value is the worst rank's, the critical path.
         tails = []
