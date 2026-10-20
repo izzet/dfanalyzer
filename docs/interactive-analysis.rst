@@ -32,6 +32,9 @@ Initialize DFAnalyzer
 ~~~~~~~~~~~~~~~~~~~~~
 
 Initialize DFAnalyzer using ``init_with_hydra``, providing configuration overrides as needed. This sets up the analyzer, such as ``dftracer`` with a specific preset like ``ai``.
+Leave out ``analyzer/preset`` to let DFAnalyzer pick the preset from the trace, as the command line does.
+The terminal shows only your own output.
+Add ``log_level=info`` or ``debug=true`` to the overrides when something goes wrong.
 
 .. code-block:: python
 
@@ -138,8 +141,21 @@ Access a specific view for a layer, grouped by a particular dimension (returns a
 
    result.get_layer_view('reader_posix_lustre', 'time_range').head()
 
-Display the raw trace data, showing individual I/O events (returns a pandas or Dask DataFrame):
+Read the raw events, one row per event (``result.traces`` is a lazy ``DaskTraceViewer`` that reads on the analyzer's Dask client, so nothing is loaded until you ask):
 
 .. code-block:: python
 
-   result.traces.head()
+   result.traces.page(10).table.to_pandas()
+
+Filter the events first, and go through all of them page by page when they do not fit in memory:
+
+.. code-block:: python
+
+   for table in result.traces.filter('cat == "POSIX"').pages():
+       df = table.to_pandas()
+
+Display the events grouped by category, function, process, file and time bucket (returns a Dask DataFrame):
+
+.. code-block:: python
+
+   result.aggregated_traces.head()

@@ -34,9 +34,9 @@ Here's an example of how to run DFAnalyzer using sample data included in the rep
    # For example, to extract the 'dftracer-ai' sample used below:
    # mkdir -p tests/data/extracted
    # tar -xzf tests/data/dftracer-ai.tar.gz -C tests/data/extracted
-   dfanalyzer analyzer/preset=ai trace_path=tests/data/extracted/dftracer-ai view_types=[time_range]
+   dfanalyzer trace_path=tests/data/extracted/dftracer-ai
 
-This command analyzes the traces and prints a high-level summary of the application's execution. Below is a sample of the "Time Period Summary" output:
+This command picks the ``ai`` preset from the trace, analyzes it and prints a high-level summary of the application's execution. Below is a sample of the "Time Period Summary" output:
 
 .. code-block:: none
 
