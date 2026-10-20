@@ -8,7 +8,8 @@ from omegaconf import OmegaConf
 from . import AnalyzerType, ClusterType, OutputType
 from .cluster import AutoClient, AutoCluster, ExternalCluster, InProcessCluster, NullClient
 from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, Config, init_hydra_config_store
-from .utils.log_utils import configure_logging, console_block, log_block
+from .utils.log_utils import configure_library_logging, configure_logging, console_block, log_block
+from .utils.preset_utils import apply_detected_preset
 from .utils.warning_utils import filter_warnings
 
 filter_warnings()
@@ -22,6 +23,8 @@ def main(cfg: Config) -> None:
     log_file = f"{hydra_config.runtime.output_dir}/{hydra_config.job.name}.log"
     log_level = "debug" if cfg.debug else "info"
     configure_logging(log_file=log_file, level=log_level)
+    library_log_level = "debug" if cfg.debug else cfg.log_level
+    configure_library_logging(library_log_level)
     log = structlog.get_logger()
     log.info("Starting dfanalyzer")
 
@@ -42,9 +45,12 @@ def main(cfg: Config) -> None:
     # Setup cluster logging
     with log_block("Configuring logging on all Dask workers"):
         client.run(configure_logging, log_file=log_file, level=log_level)
+        client.run(configure_library_logging, library_log_level)
 
     # Setup analyzer
     with console_block("Analyzer setup"):
+        with log_block("detect_preset"):
+            apply_detected_preset(cfg, hydra_config.overrides.task)
         analyzer: AnalyzerType = instantiate(
             cfg.analyzer,
             debug=cfg.debug,

@@ -440,6 +440,9 @@ class Analyzer(abc.ABC):
 
         # Attach correct traces & view types
         result._read_result = read_result
+        result._trace_files = getattr(self, "_all_files", None)
+        result._trace_index_path = getattr(self, "_index_path", None)
+        result._trace_client = getattr(self, "_dask_client", None)
         result.view_types = view_types
 
         # Return result

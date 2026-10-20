@@ -552,12 +552,23 @@ class Config:
     facts: FactsConfig = dc.field(default_factory=FactsConfig)
     exclude_characteristics: Optional[List[str]] = dc.field(default_factory=list)
     logical_view_types: Optional[bool] = False
+    # Level of the dftracer-utils logger on stderr; debug=true overrides it with "debug".
+    # dfanalyzer's own log always goes to the log file in the run directory.
+    log_level: str = "warn"
     metric_boundaries: Optional[ViewMetricBoundaries] = dc.field(default_factory=dict)
     output: OutputConfig = MISSING
     trace_path: str = MISSING
     verbose: Optional[bool] = False
     view_types: Optional[List[str]] = dc.field(default_factory=lambda: [COL_TIME_RANGE])
     unoverlapped_posix_only: Optional[bool] = False
+
+
+PRESET_CONFIGS = {
+    "posix": AnalyzerPresetConfigPOSIX,
+    "auto": AnalyzerPresetConfigAuto,
+    "dlio": AnalyzerPresetConfigDLIO,
+    "ai": AnalyzerPresetConfigAI,
+}
 
 
 def init_hydra_config_store() -> ConfigStore:

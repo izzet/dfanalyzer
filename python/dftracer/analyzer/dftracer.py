@@ -212,6 +212,24 @@ def io_columns():
     return columns
 
 
+def clear_stale_aggregation(trace_path, trace_groups, time_interval_ms):
+    directory, files = resolve_trace_inputs(trace_path, trace_groups)
+    if not directory and not files:
+        return
+    index_path = index_path_for(trace_path)
+    with Indexer(
+        directory=directory,
+        files=files,
+        index_dir=os.path.dirname(index_path),
+        require_checkpoint=True,
+        require_bloom=True,
+        require_aggregation=AggregationConfig(time_interval_ms=time_interval_ms),
+    ) as indexer:
+        held_us = indexer.resolve().aggregation_interval_us
+        if held_us and held_us != round(time_interval_ms * 1000):
+            indexer.ensure_indexed()
+
+
 class DFTracerAnalyzer(Analyzer):
     POSIX_CAT_RULES = [
         ("/data", "_reader"),
@@ -265,6 +283,7 @@ class DFTracerAnalyzer(Analyzer):
                     _bar.reset(_task, total=(total or None), description=phase)
                 _bar.update(_task, completed=done, total=(total or None), description=phase)
 
+            clear_stale_aggregation(trace_path, self.trace_groups, self.time_granularity * 1000.0)
             ensure_index(
                 trace_path,
                 self.trace_groups,
@@ -649,7 +668,8 @@ class DFTracerAnalyzer(Analyzer):
 
         with log_block("set_basic_columns"):
             traces[COL_ACC_PAT] = 0
-            traces[COL_COUNT] = 1
+            if COL_COUNT not in traces.columns:
+                traces[COL_COUNT] = 1
 
         # drop columns that are not needed
         # if COL_FILE_NAME not in view_types:

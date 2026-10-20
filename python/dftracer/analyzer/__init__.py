@@ -14,7 +14,8 @@ from .config import CLUSTER_RESTART_TIMEOUT_SECONDS, init_hydra_config_store
 from .dftracer import DFTracerAnalyzer
 from .output import ConsoleOutput, CSVOutput, JSONOutput, SQLiteOutput
 from .types import ViewType
-from .utils.log_utils import configure_logging, log_block
+from .utils.log_utils import configure_library_logging, configure_logging, log_block
+from .utils.preset_utils import apply_detected_preset
 from .utils.warning_utils import filter_warnings
 
 
@@ -78,6 +79,8 @@ def init_with_hydra(hydra_overrides: List[str]):
     log_file = f"{hydra_config.hydra.run.dir}/{hydra_config.hydra.job.name}.log"
     log_level = "debug" if hydra_config.debug else "info"
     configure_logging(log_file=log_file, level=log_level)
+    library_log_level = "debug" if hydra_config.debug else hydra_config.log_level
+    configure_library_logging(library_log_level)
     log = structlog.get_logger()
     log.info("Starting dfanalyzer")
 
@@ -98,9 +101,12 @@ def init_with_hydra(hydra_overrides: List[str]):
     # Setup cluster logging
     with log_block("Configuring logging on all Dask workers"):
         client.run(configure_logging, log_file=log_file, level=log_level)
+        client.run(configure_library_logging, library_log_level)
 
     # Setup analyzer
     with log_block("Analyzer setup"):
+        with log_block("detect_preset"):
+            apply_detected_preset(hydra_config, hydra_config.hydra.overrides.task)
         analyzer = instantiate(
             hydra_config.analyzer,
             debug=hydra_config.debug,
