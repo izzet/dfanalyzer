@@ -668,7 +668,8 @@ class DFTracerAnalyzer(Analyzer):
 
         with log_block("set_basic_columns"):
             traces[COL_ACC_PAT] = 0
-            traces[COL_COUNT] = 1
+            if COL_COUNT not in traces.columns:
+                traces[COL_COUNT] = 1
 
         # drop columns that are not needed
         # if COL_FILE_NAME not in view_types:

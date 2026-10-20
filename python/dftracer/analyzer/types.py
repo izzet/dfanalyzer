@@ -315,6 +315,9 @@ class AnalysisResult:
     _metric_boundaries: ViewMetricBoundaries
     analysis_facts: Dict[ViewKey, List[AnalysisFact]] = dc.field(default_factory=dict)
     _read_result: Optional[ReadTraceResult] = None
+    _trace_files: Optional[List[str]] = None
+    _trace_index_path: Optional[str] = None
+    _trace_client: Optional[Any] = None
 
     def get_hlm(self, layer: Layer) -> dd.DataFrame:
         return self._hlms[layer]
@@ -323,7 +326,23 @@ class AnalysisResult:
         return self._main_views[layer]
 
     @property
-    def traces(self) -> Optional[dd.DataFrame]:
+    def traces(self) -> Optional[Any]:
+        """The raw events of the analyzed traces, one row per event.
+
+        A lazy, distributed ``DaskTraceViewer`` over the analyzed files, on the
+        analyzer's Dask client. Nothing is read until a terminal call, such as
+        ``result.traces.page(10).table.to_pandas()`` or
+        ``for table in result.traces.filter('cat == "POSIX"').pages(): ...``.
+        """
+        if not self._trace_files or not self._trace_index_path:
+            return None
+        from dftracer.utils.dask import DaskTraceViewer
+
+        return DaskTraceViewer(self._trace_files, self._trace_index_path, client=self._trace_client)
+
+    @property
+    def aggregated_traces(self) -> Optional[dd.DataFrame]:
+        """The events grouped by category, function, process, file and time bucket."""
         if self._read_result is None:
             return None
         return self._read_result.traces
