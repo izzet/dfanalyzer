@@ -26,6 +26,13 @@ def current_progress() -> Optional[Callable[..., None]]:
     return _active_progress.get()
 
 
+def configure_library_logging(level: str = "warn") -> None:
+    """Set the level of the dftracer-utils C++ logger, which writes to stderr."""
+    from dftracer.utils import set_log_level
+
+    set_log_level(level)  # type: ignore[arg-type]
+
+
 def configure_logging(log_file: str, level: str = "info") -> None:
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
