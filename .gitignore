@@ -199,3 +199,7 @@ outputs/
 tmp/
 VERSION.txt
 python/dftracer/analyzer/_version.py
+
+# Local handoff materials
+/agentic-preset-2026-03.zip
+/handoff/
