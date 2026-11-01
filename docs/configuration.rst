@@ -142,6 +142,9 @@ A preset that you set always wins.
      - Workloads from the `DLIO benchmark <https://github.com/argonne-lcf/dlio_benchmark>`_.
        Its layers key off ``DLIOBenchmark.*`` function names.
      - ``reader``, ``data_loader``, ``checkpoint``, ``ai_framework`` or ``dlio_benchmark``
+   * - **agentic**
+     - Agent workflows, model calls, tools and their POSIX I/O.
+     - ``workflow``, ``step``, ``llm`` or ``tool``
    * - **posix**
      - General POSIX I/O workloads.
      - ``POSIX`` or ``STDIO``
@@ -156,6 +159,68 @@ Set a preset yourself like this:
 .. code-block:: bash
 
    dfanalyzer analyzer/preset=ai
+
+Agent workflows (``analyzer/preset=agentic``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The agentic preset keeps agent spans alongside POSIX I/O, including I/O emitted
+by tool subprocesses in separate trace files. It provides ``workflow``, ``step``,
+``llm``, ``tool``, ``data``, ``message``, ``judge`` and ``posix`` layers.
+
+.. code-block:: bash
+
+   dfanalyzer trace_path=traces analyzer/preset=agentic cluster=none
+
+The preset adds a ``step`` view to the requested views. From Python:
+
+.. code-block:: python
+
+   from dftracer.analyzer import init_with_hydra
+
+   app = init_with_hydra(hydra_overrides=[
+       "trace_path=traces", "analyzer/preset=agentic", "cluster=none",
+   ])
+   try:
+       result = app.analyze_trace()
+       steps = result.get_flat_view("step")
+       print(steps[["llm_completion_tokens_sum", "posix_read_size_sum",
+                    "bytes_read_per_output_token"]])
+   finally:
+       app.shutdown()
+
+Model spans carry ``args.prompt_tokens``, ``args.completion_tokens`` and,
+optionally, ``args.total_tokens``. When total tokens are absent from an
+aggregate, they are calculated from prompt and completion tokens. The step view
+includes bytes read/written, I/O and metadata operations, and I/O time per
+completion token, plus bytes per data operation, metadata fraction and the
+read/write ratio. Undefined ratios, including zero-token denominators, are
+reported as unavailable. I/O time per token uses summed syscall time in seconds.
+
+Each agent step needs ``args.step`` on its ``step`` spans. Give spans
+``args.workflow_id`` and ``args.agent_id`` to distinguish concurrent agents;
+``args.trace_id`` also constrains attribution when present. A step's plan, act,
+observe and reflect spans with the same identity form one window, from their
+earliest start to latest end. A reused step ID is qualified by workflow and
+agent in the step view.
+
+Attribution operates on the native index's aggregates. An aggregate belongs to
+a step only if its entire retained time interval fits one compatible window.
+The process ID may differ, allowing subprocess tool I/O to match. Overlapping
+steps without enough identity information, and aggregates crossing step
+boundaries, remain unassigned. These records stay in the run and time views;
+the step view contains assigned steps only. Reduce
+``analyzer.time_granularity`` (for example to ``0.01`` seconds) when a persistent
+tool process has calls from several steps folded into the same bucket.
+Attribution does not reconstruct individual syscalls inside an aggregate.
+
+Tracer-side aggregation must preserve agent span arguments: disable it for
+agent categories, or aggregate only POSIX/STDIO events. A tracer-side I/O counter
+whose time bucket covers several steps cannot be attributed precisely.
+
+Extra dimensions and token metrics travel through dftracer-utils' typed index
+read in both in-process and distributed modes. Agentic checkpoints include the
+preset configuration and exact time granularity in their identity, so changing
+these settings rebuilds the affected analysis views.
 
 DFTracer Analyzer (``analyzer=dftracer``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

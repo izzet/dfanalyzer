@@ -1622,6 +1622,23 @@ class Analyzer(abc.ABC):
         bin_cols = [col for col in combined_hlm.columns if "_bin_" in col]
         view_types_diff = list(set(VIEW_TYPES).difference(view_types))
         hlm_agg = dict(HLM_AGG)
+        if self.preset.group_keys or self.preset.metric_fields:
+            # The typed read's agent metrics and power sums must survive a
+            # mixed regular/profile trace just as they do a regular trace.
+            extra_metrics = [
+                'time_sq',
+                'size_sq',
+                'time_call_min',
+                'time_call_max',
+                'size_call_min',
+                'size_call_max',
+                *self.preset.metric_fields,
+            ]
+            for col in extra_metrics:
+                if col in combined_hlm.columns:
+                    hlm_agg[col] = (
+                        'min' if col.endswith('_call_min') else 'max' if col.endswith('_call_max') else 'sum'
+                    )
         hlm_agg.update({col: "sum" for col in bin_cols})
         for col in view_types_diff:
             if col in combined_hlm.columns:
@@ -1771,6 +1788,7 @@ class Analyzer(abc.ABC):
         view_key: ViewKey,
         metric_boundaries: ViewMetricBoundaries,
         system_metrics: Optional[pd.DataFrame] = None,
+        time_boundary_layer: Optional[Layer] = None,
     ):
         view_type = view_key[-1]
         is_view_process_based = self.is_view_process_based(view_key)
@@ -1788,7 +1806,7 @@ class Analyzer(abc.ABC):
                 is_view_process_based=is_view_process_based,
                 layers=self.layers,
                 layer_deps=self.preset.layer_deps,
-                time_boundary_layer=self.get_time_boundary_layer(),
+                time_boundary_layer=time_boundary_layer or self.get_time_boundary_layer(),
             )
         with log_block("set_additional_metrics", view_key=view_key):
             flat_view = self._set_additional_metrics(

@@ -31,6 +31,9 @@ HASH_CHECKPOINT_NAMES = get_bool_env_var("DFANALYZER_HASH_CHECKPOINT_NAMES", Fal
 
 @dc.dataclass
 class AnalyzerPresetConfig:
+    group_keys: List[str] = dc.field(default_factory=list)
+    metric_fields: List[str] = dc.field(default_factory=list)
+    correlate_steps: bool = False
     additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=dict)
     async_layers: Optional[List[str]] = dc.field(default_factory=list)
     # Discover distinct `cat` values at runtime and build one layer per category.
@@ -79,22 +82,92 @@ class AnalyzerPresetConfigPOSIX(AnalyzerPresetConfig):
     size_layers: Optional[List[str]] = dc.field(default_factory=lambda: ['posix'])
 
 
+AGENTIC_METRICS = {
+    'bytes_read_per_output_token': 'posix_read_size_sum / (llm_completion_tokens_sum + {epsilon})',
+    'bytes_written_per_output_token': 'posix_write_size_sum / (llm_completion_tokens_sum + {epsilon})',
+    'io_ops_per_output_token': 'posix_count_sum / (llm_completion_tokens_sum + {epsilon})',
+    'metadata_ops_per_output_token': 'posix_metadata_count_sum / (llm_completion_tokens_sum + {epsilon})',
+    'io_time_per_output_token': 'posix_time_sum / (llm_completion_tokens_sum + {epsilon})',
+    'bytes_per_io_op': 'posix_data_size_sum / (posix_data_count_sum + {epsilon})',
+    'metadata_op_frac': 'posix_metadata_count_sum / (posix_count_sum + {epsilon})',
+    'read_write_ratio': 'posix_read_size_sum / (posix_write_size_sum + {epsilon})',
+}
+
+
+@dc.dataclass
+class AnalyzerPresetConfigAgentic(AnalyzerPresetConfigPOSIX):
+    """Agent spans plus their I/O, with step-scoped token metrics."""
+
+    name: str = 'agentic'
+    correlate_steps: bool = True
+    group_keys: List[str] = dc.field(
+        default_factory=lambda: [
+            'step',
+            'workflow_id',
+            'agent_id',
+            'trace_id',
+            'span_id',
+            'parent_span_id',
+            'tool_name',
+            'model_name',
+            'operation_kind',
+            'llm_call_id',
+            'tool_call_id',
+            'format',
+        ]
+    )
+    metric_fields: List[str] = dc.field(
+        default_factory=lambda: [
+            'prompt_tokens',
+            'completion_tokens',
+            'total_tokens',
+        ]
+    )
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            **{c: f'cat == "{c}"' for c in ('workflow', 'step', 'llm', 'tool', 'data', 'message', 'judge')},
+            'posix': 'cat.str.contains("posix|stdio")',
+        }
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'workflow': None,
+            'step': 'workflow',
+            'llm': 'step',
+            'tool': 'step',
+            'data': 'tool',
+            'message': 'step',
+            'judge': 'step',
+            'posix': None,
+        }
+    )
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {
+            'workflow': {f: f'func_name == "{f}"' for f in ('run', 'resume')},
+            'step': {f: f'func_name == "{f}"' for f in ('plan', 'act', 'observe', 'reflect')},
+            'llm': {f: f'func_name == "{f}"' for f in ('call', 'stream', 'parse')},
+            'tool': {f: f'func_name == "{f}"' for f in ('call', 'result')},
+            'data': {f: f'func_name == "{f}"' for f in ('load', 'save')},
+            'message': {f: f'func_name == "{f}"' for f in ('send', 'receive', 'stream')},
+            'judge': {f: f'func_name == "{f}"' for f in ('evaluate', 'retry')},
+            'posix': DERIVED_POSIX_METRICS,
+        }
+    )
+    additional_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {v: dict(AGENTIC_METRICS) for v in ('step', 'proc_name', 'time_range')}
+    )
+
+
 @dc.dataclass
 class AnalyzerPresetConfigAuto(AnalyzerPresetConfig):
     """Catch-all preset: an ``app`` boundary layer plus one auto-discovered
     layer per distinct ``cat`` in the trace. Scored on operations/second."""
 
     auto_layers_by_category: Optional[bool] = True
-    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
-        default_factory=lambda: {'app': {}}
-    )
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(default_factory=lambda: {'app': {}})
     # None => match every event (fallback when no categories are found).
-    layer_defs: Dict[str, Optional[str]] = dc.field(
-        default_factory=lambda: {'app': None}
-    )
-    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
-        default_factory=lambda: {'app': None}
-    )
+    layer_defs: Dict[str, Optional[str]] = dc.field(default_factory=lambda: {'app': None})
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(default_factory=lambda: {'app': None})
     logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
         default_factory=lambda: {
             'proc_name': {
@@ -564,6 +637,7 @@ class Config:
 
 
 PRESET_CONFIGS = {
+    "agentic": AnalyzerPresetConfigAgentic,
     "posix": AnalyzerPresetConfigPOSIX,
     "auto": AnalyzerPresetConfigAuto,
     "dlio": AnalyzerPresetConfigDLIO,
@@ -579,6 +653,7 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer", name="dftracer", node=DFTracerAnalyzerConfig)
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="auto", node=AnalyzerPresetConfigAuto)
+    cs.store(group="analyzer/preset", name="agentic", node=AnalyzerPresetConfigAgentic)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="ai", node=AnalyzerPresetConfigAI)
     cs.store(group="cluster", name="auto", node=AutoClusterConfig)

@@ -11,6 +11,7 @@ logger = structlog.get_logger()
 AI_CATEGORIES = frozenset({"ai_root", "pipeline"})
 DLIO_CATEGORIES = frozenset({"reader", "data_loader", "checkpoint", "ai_framework", "dlio_benchmark"})
 POSIX_CATEGORIES = frozenset({"posix", "stdio"})
+AGENTIC_CATEGORIES = frozenset({"workflow", "step", "llm", "tool"})
 
 
 def preset_is_explicit(overrides: Iterable[str]) -> bool:
@@ -23,6 +24,8 @@ def classify_categories(categories: Iterable[str]) -> str:
         return "ai"
     if cats & DLIO_CATEGORIES:
         return "dlio"
+    if cats & AGENTIC_CATEGORIES:
+        return "agentic"
     if cats & POSIX_CATEGORIES:
         return "posix"
     return "auto"

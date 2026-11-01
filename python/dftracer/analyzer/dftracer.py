@@ -283,15 +283,48 @@ class DFTracerAnalyzer(Analyzer):
                     _bar.reset(_task, total=(total or None), description=phase)
                 _bar.update(_task, completed=done, total=(total or None), description=phase)
 
-            clear_stale_aggregation(trace_path, self.trace_groups, self.time_granularity * 1000.0)
+            if not self.preset.group_keys and not self.preset.metric_fields:
+                clear_stale_aggregation(trace_path, self.trace_groups, self.time_granularity * 1000.0)
             ensure_index(
                 trace_path,
                 self.trace_groups,
                 self.time_granularity * 1000.0,
                 progress=_on_progress,
+                aggregation=self._aggregation_config(),
             )
         console.print(f"[green]✓[/green] Build index [i]({time.time() - t0:.3f}s)[/i]")
+        if self.preset.correlate_steps:
+            if args:
+                args = (list(dict.fromkeys(list(args[0]) + ['step'])), *args[1:])
+            else:
+                kwargs['view_types'] = list(dict.fromkeys(list(kwargs.get('view_types', [])) + ['step']))
         return super().analyze_trace(trace_path, *args, **kwargs)
+
+    def _aggregation_config(self):
+        return AggregationConfig(
+            time_interval_ms=self.time_granularity * 1000.0,
+            compute_percentiles=False,
+            group_keys=list(self.preset.group_keys),
+            custom_metric_fields=list(self.preset.metric_fields),
+        )
+
+    def get_checkpoint_name(self, *args):
+        name = super().get_checkpoint_name(*args)
+        if not self.preset.group_keys and not self.preset.metric_fields:
+            return name
+        import hashlib
+        import json
+        from omegaconf import OmegaConf
+
+        identity = dict(
+            typed_hlm_version=1,
+            preset=OmegaConf.to_container(self.preset, resolve=True),
+            time_granularity=self.time_granularity,
+            time_resolution=self.time_resolution,
+            profile_time_granularity=self.profile_time_granularity,
+        )
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
+        return f'{name}_{digest}'
 
     @staticmethod
     def _plan_scan(file_id_to_path, file_pids, n_groups):
@@ -324,14 +357,22 @@ class DFTracerAnalyzer(Analyzer):
         The View-schema decode/relativize lives in dftracer.utils; here we only
         wrap the frames as Dask and standardize the system metrics.
         """
+        output_columns = dict(PROFILE_OUTPUT_COLUMNS)
+        output_columns.update({c: 'string' for c in self.preset.group_keys})
+        output_columns.update({c: 'float64' for c in self.preset.metric_fields})
         frames = build_read_frames(
             results,
-            PROFILE_OUTPUT_COLUMNS,
+            output_columns,
             self.time_granularity,
             self.time_resolution,
             self.profile_time_granularity,
         )
         self._time_origin = frames["time_origin"]
+
+        if self.preset.correlate_steps:
+            from .agentic import attribute_steps
+
+            frames['traces'], frames['profiles'] = attribute_steps(frames['traces'], frames['profiles'])
 
         traces_pd = frames["traces"]
         traces = dd.from_pandas(traces_pd, npartitions=max(1, len(traces_pd) // 100_000 + 1))
@@ -384,7 +425,6 @@ class DFTracerAnalyzer(Analyzer):
             ReadTraceResult with traces, profiles, and system_metrics.
         """
         with log_block("distributed_setup"):
-            time_interval_ms = self.time_granularity * 1000.0
             register_auto_thread_plugin()
 
             directory, files = resolve_trace_inputs(trace_path, self.trace_groups)
@@ -400,10 +440,7 @@ class DFTracerAnalyzer(Analyzer):
                 index_dir=os.path.dirname(index_path),
                 require_checkpoint=True,
                 require_bloom=True,
-                require_aggregation=AggregationConfig(
-                    time_interval_ms=time_interval_ms,
-                    compute_percentiles=False,
-                ),
+                require_aggregation=self._aggregation_config(),
                 force_rebuild=False,
             )
             status = indexer.ensure_indexed()
@@ -456,6 +493,8 @@ class DFTracerAnalyzer(Analyzer):
                     _rules = tuple(path for path, _ in self.POSIX_CAT_RULES)
                     _group_keys = typed_group_keys((*_ignored, *_rules))
                     _drop = _ignored
+                _group_keys = (*_group_keys, *("arg:" + c for c in self.preset.group_keys))
+                _metric_fields = tuple(self.preset.metric_fields)
                 viewer = DaskTraceViewer(all_files, index_path, client=dask_client)
 
                 # cluster=auto: aggregate in process and keep the result if it
@@ -470,16 +509,22 @@ class DFTracerAnalyzer(Analyzer):
                         except OSError:
                             pass
                     if dask_client.accepts_estimate(on_disk):
-                        event_futures, worker_addrs = viewer.collect_typed_ipc_futures(tg, tr, _group_keys, _drop)
+                        event_futures, worker_addrs = viewer.collect_typed_ipc_futures(
+                            tg, tr, _group_keys, _drop, _metric_fields
+                        )
                         gathered = dask_client.gather(event_futures)
                         nbytes = sum(len(b) for r in gathered if r for b in r.values() if b)
                         if dask_client.accepts(nbytes):
                             results = gathered
                     if results is None:
                         viewer = DaskTraceViewer(all_files, index_path, client=dask_client)
-                        event_futures, worker_addrs = viewer.collect_typed_ipc_futures(tg, tr, _group_keys, _drop)
+                        event_futures, worker_addrs = viewer.collect_typed_ipc_futures(
+                            tg, tr, _group_keys, _drop, _metric_fields
+                        )
                 else:
-                    event_futures, worker_addrs = viewer.collect_typed_ipc_futures(tg, tr, _group_keys, _drop)
+                    event_futures, worker_addrs = viewer.collect_typed_ipc_futures(
+                        tg, tr, _group_keys, _drop, _metric_fields
+                    )
 
                 worker_scan_args = [(addr, all_files, None) for addr in worker_addrs]
                 self._worker_ipc_futures = event_futures
@@ -498,7 +543,16 @@ class DFTracerAnalyzer(Analyzer):
             return self._read_result_from_ipc(results)
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
+        if self.preset.group_keys or self.preset.metric_fields:
+            return self._typed_frame_hlm(traces, view_types)
         return self._view_hlm(view_types)
+
+    def _typed_frame_hlm(self, traces, view_types):
+        from dask import delayed
+        from .agentic import reduce_typed_hlm
+
+        frame = reduce_typed_hlm(traces.compute(), view_types, self.preset.metric_fields)
+        return dd.from_delayed([delayed(frame)], meta=frame.iloc[:0])
 
     def _view_hlm(self, view_types, profiles=False):
         """Events (or, with profiles=True, profile) HLM via a
@@ -524,12 +578,40 @@ class DFTracerAnalyzer(Analyzer):
     def _compute_profile_hlm(self, profiles, view_types, partition_size):
         if profiles is None:
             return None
+        if self.preset.group_keys or self.preset.metric_fields:
+            profiles = self.postread_trace(profiles, view_types)
+            return self._typed_frame_hlm(profiles, view_types)
         return self._view_hlm(view_types, profiles=True)
+
+    def _process_flat_view(self, flat_view, view_key, metric_boundaries, system_metrics=None):
+        boundary_layer = None
+        if self.preset.correlate_steps and view_key[-1] == 'step':
+            from .agentic import UNASSIGNED_STEP
+
+            flat_view = flat_view.loc[flat_view.index != UNASSIGNED_STEP]
+            boundary_layer = 'step'
+            suffix = 'time_sum' if self.is_view_process_based(view_key) else 'time_proc_max'
+            boundary = flat_view[f'step_{suffix}'].sum()
+            metric_boundaries['step'].update({f'{layer}_{suffix}': boundary for layer in self.layers})
+        return super()._process_flat_view(
+            flat_view,
+            view_key,
+            metric_boundaries,
+            system_metrics,
+            time_boundary_layer=boundary_layer,
+        )
 
     def _compute_view(self, layer, records, view_key, view_type, view_types):
         import itertools as it
 
         from .constants import VIEW_TYPES
+
+        if self.preset.correlate_steps and view_type != COL_PROC_NAME:
+            from .agentic import coalesce_process_records
+
+            records = coalesce_process_records(
+                records.compute() if hasattr(records, 'compute') else records, view_type
+            )
 
         # `records` is a Dask frame, or a pandas one when compute_views decided
         # the layer was small enough to materialise. The algorithm below is

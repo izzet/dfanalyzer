@@ -279,6 +279,7 @@ HUMANIZED_METRICS = dict(
     time='I/O Time',
 )
 HUMANIZED_VIEW_TYPES = dict(
+    step='Agent Step',
     app_name='App',
     file_dir='File Directory',
     file_name='File',

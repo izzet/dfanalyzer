@@ -1,0 +1,13 @@
+{"ph":"M","cat":"dftracer","name":"HH","pid":1,"tid":1,"args":{"name":"node0","value":"abcd"}}
+{"ph":"X","cat":"workflow","name":"run","ts":1000000,"dur":300000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo"}}
+{"ph":"X","cat":"step","name":"plan","ts":1010000,"dur":100000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":0,"span_id":"s0-plan"}}
+{"ph":"X","cat":"step","name":"act","ts":1110000,"dur":40000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":0,"span_id":"s0-act"}}
+{"ph":"X","cat":"step","name":"observe","ts":1150000,"dur":10000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":0,"span_id":"s0-observe"}}
+{"ph":"X","cat":"llm","name":"call","ts":1011000,"dur":80000,"pid":1,"tid":1,"args":{"hhash":"abcd","step":0,"workflow_id":"demo","prompt_tokens":100,"completion_tokens":20}}
+{"ph":"X","cat":"tool","name":"call","ts":1120000,"dur":20000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","step":0,"tool_name":"read"}}
+{"ph":"X","cat":"step","name":"plan","ts":1170000,"dur":50000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":1,"span_id":"s1-plan"}}
+{"ph":"X","cat":"step","name":"act","ts":1220000,"dur":40000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":1,"span_id":"s1-act"}}
+{"ph":"X","cat":"step","name":"observe","ts":1260000,"dur":10000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","agent_id":"toy","step":1,"span_id":"s1-observe"}}
+{"ph":"X","cat":"llm","name":"call","ts":1171000,"dur":40000,"pid":1,"tid":1,"args":{"hhash":"abcd","step":1,"workflow_id":"demo","prompt_tokens":200,"completion_tokens":40,"total_tokens":240}}
+{"ph":"X","cat":"tool","name":"call","ts":1225000,"dur":20000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo","step":1,"tool_name":"write"}}
+{"ph":"X","cat":"judge","name":"evaluate","ts":1280000,"dur":5000,"pid":1,"tid":1,"args":{"hhash":"abcd","workflow_id":"demo"}}
